@@ -2167,8 +2167,125 @@ class Engine(object):
     with open(output_file, 'w') as f:
       numpy.savetxt(f, log_average_posterior, delimiter=' ')
     print("Saved prior in %r in +log space." % output_file, file=log.v1)
-
+  
   def web_server(self, port):
+    """
+    Starts a socket server 
+    (or search if the flag is set).
+
+    :param int port: for the tcp server
+    :return:
+    """
+    assert sys.version_info[0] >= 3, "only Python 3 supported"
+    # noinspection PyCompatibility
+    from GeneratingDataset import StaticDataset, Vocabulary, BytePairEncoding, ExtractAudioFeatures
+
+    if not self.use_search_flag or not self.network or self.use_dynamic_train_flag:
+      self.use_search_flag = True
+      # At the moment this is probably not intended to use search with train flag.
+      # Also see LayerBase._post_init_output() about setting size_placeholder to the target seq len,
+      # so you would have have_known_seq_len=True in the RecLayer, with the given target seq len.
+      self.use_dynamic_train_flag = False
+      if self.network:
+        print("Reinit network with search flag.", file=log.v3)
+      self.init_network_from_config(self.config)
+
+    engine = self
+    soundfile = None
+    input_data = self.network.extern_data.get_default_input_data()
+    input_vocab = input_data.vocab
+    input_audio_feature_extractor = None
+    output_data = self.network.extern_data.get_default_target_data()
+    output_vocab = output_data.vocab
+    if isinstance(self.config.typed_dict.get("dev", None), dict) and self.config.typed_dict["dev"]["class"] == "LibriWipoEUCorpus":
+      # A bit hacky. Assumes that this is a dataset description for e.g. LibriSpeechCorpus.
+      import soundfile  # pip install pysoundfile
+      bpe_opts = self.config.typed_dict["dev"]["bpe"]
+      audio_opts = self.config.typed_dict["dev"]["audio"]
+      bpe = BytePairEncoding(**bpe_opts)
+      assert output_data.sparse
+      assert bpe.num_labels == output_data.dim
+      output_vocab = bpe
+      input_audio_feature_extractor = ExtractAudioFeatures(**audio_opts)
+    else:
+      assert isinstance(input_vocab, Vocabulary)
+    assert isinstance(output_vocab, Vocabulary)
+    num_outputs = {
+      input_data.name: [input_data.dim, input_data.ndim],
+      output_data.name: [output_data.dim, output_data.ndim]}
+
+    output_layer_name = self.config.value("search_output_layer", "output")
+    output_layer = self.network.layers[output_layer_name]
+    output_t = output_layer.output.get_placeholder_as_batch_major()
+    output_seq_lens_t = output_layer.output.get_sequence_lengths()
+    out_beam_size = output_layer.output.beam_size
+    output_layer_beam_scores_t = None
+    if out_beam_size is None:
+      print("Given output %r is after decision (no beam)." % output_layer, file=log.v1)
+    else:
+      print("Given output %r has beam size %i." % (output_layer, out_beam_size), file=log.v1)
+      output_layer_beam_scores_t = output_layer.get_search_choices().beam_scores
+    
+    import socketserver
+
+    class MyTCPHandler(socketserver.StreamRequestHandler):
+      """
+      The request handler class for our server.
+
+      It is instantiated once per connection to the server, and must
+      override the handle() method to implement communication to the
+      client.
+      """
+
+      def handle(self):
+        print("received connection from {}".format(self.client_address))
+        MSGLEN=32000
+        # self.rfile is a file-like object created by the handler;
+        # we can now use e.g. readline() instead of raw recv() calls
+        while True:
+          try:
+            audio_bytes = self.rfile.read(MSGLEN)
+            print("{} wrote:".format(self.client_address[0]))
+            import struct
+            byte_pattern=str(int(int(MSGLEN)/2))+"H" #content_length bytes with L16 encoding
+            audio = struct.unpack(byte_pattern, audio_bytes)
+            sample_rate=16000
+            targets = numpy.array([], dtype="int32")  # empty...
+            features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+            dataset = StaticDataset(
+              data=[{input_data.name: features, output_data.name: targets}], output_dim=num_outputs)
+            dataset.init_seq_order(epoch=1)
+            start_time = time.time()
+            output_d = engine.run_single(dataset=dataset, seq_idx=0, output_dict={
+              "output": output_t,
+              "seq_lens": output_seq_lens_t,
+              "beam_scores": output_layer_beam_scores_t})
+            delta_time = time.time() - start_time
+            audio_len = float(len(audio)) / sample_rate
+            print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+            if audio_len:
+              print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+            output = output_d["output"]
+            seq_lens = output_d["seq_lens"]
+            beam_scores = output_d["beam_scores"]
+            assert len(output) == len(seq_lens) == (out_beam_size or 1)
+            if out_beam_size:
+              assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
+          except:
+            return
+    
+    HOST, PORT = "localhost", port
+
+    # Create the server, binding to localhost on port 9999
+    #with socketserver.TCPServer((HOST, PORT), MyTCPHandler) as server:
+    print("Socket server running on port no.  {}".format(PORT))
+    server=socketserver.TCPServer((HOST, PORT), MyTCPHandler)
+    # Activate the server; this will keep running until you
+    # interrupt the program with Ctrl-C
+    server.serve_forever()
+
+
+  def web_server_http(self, port):
     """
     Starts a web-server with a simple API to forward data through the network
     (or search if the flag is set).
@@ -2198,7 +2315,6 @@ class Engine(object):
     input_audio_feature_extractor = None
     output_data = self.network.extern_data.get_default_target_data()
     output_vocab = output_data.vocab
-    print(self.config.typed_dict.get("dev", None))
     if isinstance(self.config.typed_dict.get("dev", None), dict) and self.config.typed_dict["dev"]["class"] == "LibriWipoEUCorpus":
       # A bit hacky. Assumes that this is a dataset description for e.g. LibriSpeechCorpus.
       import soundfile  # pip install pysoundfile
@@ -2229,12 +2345,57 @@ class Engine(object):
       output_layer_beam_scores_t = output_layer.get_search_choices().beam_scores
 
     class Handler(BaseHTTPRequestHandler):
-      def do_POST(self):
+      def do_PUT(self):
         try:
-          self._do_POST()
+          self._do_PUT()
         except Exception:
           sys.excepthook(*sys.exc_info())
           raise
+
+      def _do_PUT(self):
+        print(self.rfile)
+  
+      def do_POST(self):
+        try:
+          self._do_POST_raw_audio()
+        except Exception:
+          sys.excepthook(*sys.exc_info())
+          raise
+
+      def _do_POST_raw_audio(self):
+        content_length = int(self.headers.get('Content-Length',0))
+        if content_length is not None:
+            print(self.headers)
+            #print("HTTP server, got POST.", file=log.v3)
+            audio_bytes = self.rfile.read(int(content_length))
+            import struct
+            byte_pattern=str(int(int(content_length)/2))+"H" #content_length bytes with L16 encoding
+            audio = struct.unpack(byte_pattern, audio_bytes)
+            sample_rate=16000
+            targets = numpy.array([], dtype="int32")  # empty...
+            features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+            dataset = StaticDataset(
+              data=[{input_data.name: features, output_data.name: targets}], output_dim=num_outputs)
+            dataset.init_seq_order(epoch=1)
+            start_time = time.time()
+            output_d = engine.run_single(dataset=dataset, seq_idx=0, output_dict={
+              "output": output_t,
+              "seq_lens": output_seq_lens_t,
+              "beam_scores": output_layer_beam_scores_t})
+            delta_time = time.time() - start_time
+            audio_len = float(len(audio)) / sample_rate
+            print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+            if audio_len:
+              print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+            output = output_d["output"]
+            seq_lens = output_d["seq_lens"]
+            beam_scores = output_d["beam_scores"]
+            assert len(output) == len(seq_lens) == (out_beam_size or 1)
+            if out_beam_size:
+              assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
 
       def _do_POST(self):
         import cgi
