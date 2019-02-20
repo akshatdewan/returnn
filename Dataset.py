@@ -173,6 +173,8 @@ class Dataset(object):
     For multiple target seqs, it is expected that they all have the same len.
     We support different input/target len for seq2seq/ctc and other models.
     Note: This is deprecated, better use get_seq_length().
+    Attention: Either this method or get_seq_length() needs to be redefined
+    in any subclass of Dataset! However, in new code, just override get_seq_length().
     """
     l = self.get_seq_length(sorted_seq_idx)
     targets = self.get_target_list()
@@ -183,8 +185,11 @@ class Dataset(object):
 
   def get_seq_length(self, seq_idx):
     """
+    :param int seq_idx:
     :rtype: NumbersDict
+    :returns the len of the input features and the len of the target sequence.
     """
+    assert self.__class__.get_seq_length_2d is not Dataset.get_seq_length_2d, "Override get_seq_length."
     input_len, output_len = self.get_seq_length_2d(seq_idx)
     d = {"data": input_len}
     d.update({k: output_len for k in self.get_target_list()})
@@ -271,6 +276,15 @@ class Dataset(object):
     seq_index = list(range(num_seqs)); """ :type: list[int]. the real seq idx after sorting """
     if self.seq_ordering == 'default':
       pass  # Keep order as-is.
+    elif self.seq_ordering.startswith("default_every_n:"):
+      # This order is useful if you have "initial_state": "keep_over_epoch",
+      # where num == max_seqs, batch_size = inf, max_seq_len = inf, chunking = None.
+      _, num = self.seq_ordering.split(":")
+      num = int(num)
+      seq_index = numpy.arange(num_seqs // num, dtype="int64").repeat(num)
+      for i in range(1, num):
+        seq_index[i::num] += i * (num_seqs // num)
+      seq_index = list(seq_index)
     elif self.seq_ordering == 'reverse':
       seq_index = list(reversed(seq_index))
     elif self.seq_ordering == 'sorted':
@@ -355,6 +369,15 @@ class Dataset(object):
     self.epoch = epoch
     self.rnd_seq_drop = Random(epoch or 1)
     return False
+
+  def get_current_seq_order(self):
+    """
+    :return: many datasets use self.get_seq_order_for_epoch. this function would return the current seq order
+      for the current epoch, after self.init_seq_order was called.
+      Not all datasets implement this.
+    :rtype: list[int]
+    """
+    raise NotImplementedError
 
   def _base_init(self):
     self.nbytes = 0
@@ -448,6 +471,33 @@ class Dataset(object):
     """
     return "seq-%i" % sorted_seq_idx
 
+  def get_all_tags(self):
+    """
+    :return: list of all seq tags, of the whole dataset, without partition epoch.
+      Note that this is not possible with all datasets.
+    :rtype: list[str]
+    """
+    old_partition_epoch = self.partition_epoch
+    try:
+      all_tags = [None] * self.num_seqs
+      for seq_idx in range(self.num_seqs):
+        all_tags[seq_idx] = self.get_tag(seq_idx)
+      return all_tags
+    finally:
+      self.partition_epoch = old_partition_epoch
+
+  def get_total_num_seqs(self):
+    """
+    :return: total number of seqs, without partition epoch.
+      Should be the same as len(self.get_all_tags()).
+      Note that this is not possible with all datasets.
+    :rtype: int
+    """
+    if self.partition_epoch == 1:
+      # Note: self.num_seqs might not always be set, or even be correct...
+      return self.num_seqs
+    raise NotImplementedError("%s: get_total_num_seqs with partition epoch %i" % (self, self.partition_epoch))
+
   def have_corpus_seq_idx(self):
     """
     :rtype: bool
@@ -458,7 +508,8 @@ class Dataset(object):
   def get_corpus_seq_idx(self, seq_idx):
     """
     :param int seq_idx: sorted sequence index from the current epoch, depending on seq_ordering
-    :return: the sequence index as-is in the original corpus. only defined if self.have_corpus_seq_idx()
+    :return: the sequence index as-is in the original corpus (as if you would have sorting="default").
+      only defined if self.have_corpus_seq_idx()
     :rtype: int
     """
     if self.seq_ordering == "default":
@@ -562,8 +613,9 @@ class Dataset(object):
     :return: whether the data is sparse
     :rtype: bool
     """
+    # Note: We cannot call get_data_dtype, as we would maybe result in infinite recursion.
     if key in self.num_outputs:
-      return self.num_outputs[key][1] == 1
+      return self.num_outputs[key][1] <= 1
     if key == "data":
       return False
     return True
@@ -573,6 +625,13 @@ class Dataset(object):
     :returns get_data(*, key).shape[1:], i.e. num-frames excluded
     :rtype: list[int]
     """
+    if key in self.num_outputs:
+      if self.num_outputs[key][1] <= 1:
+        return []
+      res_shape = [None] * (self.num_outputs[key][1] - 1)
+      if not self.is_data_sparse(key):
+        res_shape[-1] = self.get_data_dim(key)
+      return res_shape
     if self.is_data_sparse(key):
       return []
     return [self.get_data_dim(key)]
@@ -743,15 +802,16 @@ class Dataset(object):
     """
     :param bool recurrent_net: If True, the batch might have a batch seq dimension > 1.
       Otherwise, the batch seq dimension is always 1 and multiple seqs will be concatenated.
-    :param int batch_size: Max number of frames in one batch.
+    :param int|dict[str,int]|NumbersDict batch_size: Max number of frames in one batch.
     :param int max_seqs: Max number of seqs per batch.
     :param int max_total_num_seqs:
     :param int|dict[str,int]|NumbersDict max_seq_length:
     :param set(str)|None used_data_keys:
     """
-    if batch_size == 0:
+    if not batch_size:
       batch_size = sys.maxsize
-    assert batch_size > 0
+    batch_size = NumbersDict(batch_size)
+    assert not batch_size.any_compare(NumbersDict(0), (lambda a, b: a <= b))
     if max_seqs == -1:
       max_seqs = float('inf')
     if not max_seq_length:
@@ -791,12 +851,12 @@ class Dataset(object):
           continue
         if length.any_compare(min_seq_length, (lambda a, b: a < b)):
           continue
-        if length.max_value() > batch_size:
-          print("warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size), file=log.v4)
+        if length.any_compare(batch_size, (lambda a, b: a > b)):
+          print("warning: sequence length (%r) larger than limit (%r)" % (length, batch_size), file=log.v4)
         if self.rnd_seq_drop.random() < seq_drop:
           continue
         dt, ds = batch.try_sequence_as_slice(length)
-        if ds > 1 and ((dt * ds).max_value() > batch_size or ds > max_seqs):
+        if ds > 1 and ((dt * ds).any_compare(batch_size, (lambda a, b: a > b)) or ds > max_seqs):
           yield batch
           batch = Batch()
         batch.add_sequence_as_slice(seq_idx=seq_idx, seq_start_frame=t_start, length=length)
@@ -806,7 +866,8 @@ class Dataset(object):
           num_frames = NumbersDict.min([length, batch_size - batch.get_all_slices_num_frames()])
           assert num_frames.max_value() > 0
           batch.add_frames(seq_idx=seq_idx, seq_start_frame=t_start, length=num_frames)
-          if batch.get_all_slices_num_frames() >= batch_size or batch.get_num_seqs() > max_seqs:
+          if (NumbersDict(batch.get_all_slices_num_frames()).any_compare(batch_size, (lambda a, b: a >= b)) or
+              batch.get_num_seqs() > max_seqs):
             yield batch
             batch = Batch()
           t_start += num_frames
@@ -978,7 +1039,7 @@ def init_dataset_via_str(config_str, config=None, cache_byte_size=None, **kwargs
     if not config:
       config = get_global_config()
     data = eval(config_str[len("config:"):], config.typed_dict, config.typed_dict)
-    return init_dataset(data)
+    return init_dataset(data, extra_kwargs=kwargs)
   elif ":" in config_str:
     kwargs.update(eval("dict(%s)" % config_str[config_str.find(":") + 1:]))
     class_name = config_str[:config_str.find(":")]
@@ -1079,14 +1140,14 @@ def set_config_num_inputs_outputs_from_dataset(config, dataset):
   :param Config.Config config:
   :param Dataset dataset:
   """
-  config.set("num_inputs", dataset.num_inputs)
   from Util import BackendEngine
   if BackendEngine.is_tensorflow_selected():
     # TF supports more fine-grained specification,
     # however the dataset does not store that in num_outputs.
     from TFNetwork import ExternData
-    config.set("num_outputs", {
+    config.set("extern_data", {
       key: ExternData.data_kwargs_from_dataset_key(dataset=dataset, key=key)
       for key in dataset.get_data_keys()})
   else:
+    config.set("num_inputs", dataset.num_inputs)
     config.set("num_outputs", dataset.num_outputs)
