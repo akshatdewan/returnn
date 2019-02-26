@@ -3,6 +3,7 @@ from __future__ import print_function
 
 from Dataset import Dataset, DatasetSeq, convert_data_dims
 from CachedDataset2 import CachedDataset2
+from HDFDataset import HDFDataset
 from Util import class_idx_seq_to_1_of_k, CollectionReadCheckCovered
 from Log import log
 import numpy
@@ -2331,7 +2332,7 @@ class LibriWipoEUCorpus(CachedDataset2):
             txt = self.orth_post_process(txt)
           transs[(subdir, seq_name)] = txt
 
-    assert transs, "did not found anything %s/%s*" % (self.path, self.prefix)
+    assert transs, "did not find anything %s/%s*" % (self.path, self.prefix)
     assert transs
     return transs
 
