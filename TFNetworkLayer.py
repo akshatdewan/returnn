@@ -1941,9 +1941,9 @@ class SliceLayer(_ConcatInputLayer):
       out_type["shape"] = list(out_type["shape"])
       if out_type["shape"][axis_wo_batch] is not None:
         out_type["shape"][axis_wo_batch] = len(range(out_type["shape"][axis_wo_batch])[dim_slice])
-      if axis_wo_batch == len(out_type["shape"]) - 1 and not out_type["sparse"]:
-        assert out_type["shape"][axis_wo_batch]
-        out_type["dim"] = out_type["shape"][axis_wo_batch]
+    if not out_type["sparse"]:
+      # Let Data() automatically infer "dim".
+      out_type["dim"] = NotSpecified
     return Data(**out_type)
 
 
@@ -3590,6 +3590,8 @@ class ReduceLayer(_ConcatInputLayer):
     axes = cls.get_axes(axis=axes, input_data=x)
     y_shape = list(x.batch_shape)
     out_batch_dim_axis = x.batch_dim_axis
+    out_feature_dim_axis = x.feature_dim_axis_or_unspecified
+    out_time_dim_axis = x.time_dim_axis
     if keep_dims:
       for i in axes:
         y_shape[i] = 1
@@ -3597,14 +3599,25 @@ class ReduceLayer(_ConcatInputLayer):
     else:
       if out_batch_dim_axis in axes:
         out_batch_dim_axis = None
+      if out_time_dim_axis in axes:
+        out_time_dim_axis = None
+      if out_feature_dim_axis in axes:
+        out_feature_dim_axis = None
       for i in reversed(sorted(set(axes + [x.batch_dim_axis] if x.batch_dim_axis is not None else []))):
         del y_shape[i]
+      for i in reversed(sorted(set(axes))):
         if out_batch_dim_axis and i < out_batch_dim_axis:
           out_batch_dim_axis -= 1
+        if out_time_dim_axis and i < out_time_dim_axis:
+          out_time_dim_axis -= 1
+        if out_feature_dim_axis and out_feature_dim_axis is not NotSpecified and i < out_feature_dim_axis:
+          out_feature_dim_axis -= 1
     return Data(
       name="%s_output" % name,
       shape=y_shape,
       batch_dim_axis=out_batch_dim_axis,
+      time_dim_axis=out_time_dim_axis,
+      feature_dim_axis=out_feature_dim_axis,
       dtype=x.dtype,
       sparse=False,
       beam_size=x.beam_size)
@@ -5266,7 +5279,9 @@ class FramewiseStatisticsLayer(LayerBase):
 
 
 class PrintLayer(LayerBase):
-  """Prints the sources to console/log"""
+  """
+  Prints the sources to console/log, via :func:`tf.Print`.
+  """
   layer_class = "print"
 
   def __init__(self, **kwargs):
@@ -5278,19 +5293,103 @@ class PrintLayer(LayerBase):
       self.output.size_placeholder = source.output.size_placeholder.copy()
 
   @classmethod
-  def transform_config_dict(cls, d, network, get_layer):
+  def get_out_data_from_opts(cls, name, sources, **kwargs):
     """
-    :param dict[str] d: will modify inplace, the loss_opts
-    :param TFNetwork.TFNetwork network:
-    :param ((str) -> LayerBase) get_layer: function to get or construct another layer
+    :param str name:
+    :param list[LayerBase] sources:
+    :rtype: Data
     """
-    d["sources"] = [get_layer(d.pop("from"))]
+    assert len(sources) == 1, "PrintLayer %r: expects exactly one source, but got: %r" % (name, sources)
+    return sources[0].output.copy("%s_output" % name)
+
+
+class HDFDumpLayer(LayerBase):
+  """
+  Dumps into HDF file, compatible to :class:`HDFDataset`.
+
+  Common usage would be to add this to your network with "is_output_layer": True,
+  such that you don't need to make other layers depend on it.
+  """
+  layer_class = "hdf_dump"
+
+  def __init__(self, filename, dump_whole_batches=False, **kwargs):
+    """
+    :param str filename:
+    :param bool dump_whole_batches: dumps the whole batch as a single sequence into the HDF
+    """
+    super(HDFDumpLayer, self).__init__(**kwargs)
+    self.output = self.sources[0].output.copy("%s_output" % self.name)
+    data = self.output.copy_as_batch_major()  # need batch-major for SimpleHDFWriter
+
+    from HDFDataset import SimpleHDFWriter
+    import atexit
+    import numpy
+    import sys
+    self.filename = filename
+    self.dump_whole_batches = dump_whole_batches
+    self.num_seqs_written = 0
+    ndim = data.ndim
+    if dump_whole_batches:
+      ndim = data.ndim - len(data.size_placeholder) + 1
+    self.hdf_writer = SimpleHDFWriter(filename=filename, dim=data.dim, ndim=ndim)
+    atexit.register(self._at_exit)
+
+    def py_write(data_np, tags, *sizes):
+      """
+      :param numpy.ndarray data_np: (B,...), this is data.placeholder
+      :param list[bytes] tags:
+      :param sizes:
+      :return: unused
+      """
+      # noinspection PyBroadException
+      try:
+        n_batch = data_np.shape[0]
+        assert len(sizes) == len(data.size_placeholder)
+        seq_lens = {i: size for (i, size) in zip(sorted(data.size_placeholder.keys()), sizes)}
+        extra = {}
+        if self.dump_whole_batches:
+          # The batch dim itself becomes another axis to dump.
+          # We also want to store the individual seq lens.
+          batch_seq_sizes = numpy.zeros((1, n_batch, len(seq_lens)), dtype="int32")
+          for i, (axis, size) in enumerate(sorted(seq_lens.items())):
+            batch_seq_sizes[0, :, i] = seq_lens[axis]
+          extra["seq_sizes"] = batch_seq_sizes
+          assert sorted(seq_lens.keys()) == list(range(len(seq_lens)))
+          flat_len = numpy.prod(data_np.shape[:len(seq_lens) + 1])
+          data_np = data_np.reshape((1, flat_len) + data_np.shape[len(seq_lens) + 1:])
+          seq_lens = {0: numpy.array([flat_len], dtype="int32")}
+          tags = [b"<->".join(tags)]
+          n_batch = 1
+        assert n_batch == data_np.shape[0] == len(tags)
+        self.num_seqs_written += n_batch
+        self.hdf_writer.insert_batch(inputs=data_np, seq_tag=tags, seq_len=seq_lens, extra=extra)
+        return 0
+      # TF does not print the stacktrace, so we do it instead.
+      except Exception:
+        sys.excepthook(*sys.exc_info())
+        raise
+
+    tf_write = tf.py_func(
+      py_write,
+      [data.placeholder, self.network.get_seq_tags()] + [size for (i, size) in sorted(data.size_placeholder.items())],
+      tf.int64,
+      stateful=True)
+
+    self.network.register_post_control_dependencies([tf_write])
+
+  def _at_exit(self):
+    print("HDFDumpLayer, wrote %i seqs to file %r." % (self.num_seqs_written, self.filename))
+    self.hdf_writer.close()
 
   @classmethod
-  def get_out_data_from_opts(cls, **kwargs):
-    assert "n_out" not in kwargs, "Don't set n_out explicity in this layer"
-    kwargs["n_out"] = kwargs["sources"][0].output.dim
-    return super(PrintLayer, cls).get_out_data_from_opts(**kwargs)
+  def get_out_data_from_opts(cls, name, sources, **kwargs):
+    """
+    :param str name:
+    :param list[LayerBase] sources:
+    :rtype: Data
+    """
+    assert len(sources) == 1, "PrintLayer %r: expects exactly one source, but got: %r" % (name, sources)
+    return sources[0].output.copy("%s_output" % name)
 
 
 class ImageSummaryLayer(LayerBase):

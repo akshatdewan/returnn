@@ -31,6 +31,7 @@ class HDFDataset(CachedDataset):
     super(HDFDataset, self).__init__(**kwargs)
     self._use_cache_manager = use_cache_manager
     self.files = []; """ :type: list[str] """  # file names
+    self.h5_files = []  # type: list[h5py.File]
     self.file_start = [0]
     self.file_seq_start = []; """ :type: list[numpy.ndarray] """
     self.file_index = []; """ :type: list[int] """
@@ -73,6 +74,8 @@ class HDFDataset(CachedDataset):
       self.labels = {'classes': labels}
       assert len(self.labels['classes']) == len(labels), "expected " + str(len(self.labels['classes'])) + " got " + str(len(labels))
     self.files.append(filename)
+    if self.cache_byte_size_total_limit == 0:
+      self.h5_files.append(fin)
     print("parsing file", filename, file=log.v5)
     if 'times' in fin:
       if self.timestamps is None:
@@ -147,12 +150,14 @@ class HDFDataset(CachedDataset):
       for name in fin['targets/data']:
         self.data_dtype[str(name)] = str(fin['targets/data'][name].dtype)
         self.targets[str(name)] = None
-    else:
-      self.targets = {'classes': numpy.zeros((self._num_timesteps,), dtype="int32")}
-      self.data_dtype['classes'] = 'int32'
+        if str(name) not in self.num_outputs:
+          ndim = len(fin['targets/data'][name].shape)
+          dim = 1 if ndim == 1 else fin['targets/data'][name].shape[-1]
+          self.num_outputs[str(name)] = (dim, ndim)
     self.data_dtype["data"] = str(fin['inputs'].dtype)
     assert len(self.target_keys) == len(self._seq_lengths[0]) - 1
-    fin.close()
+    if self.cache_byte_size_total_limit > 0:
+      fin.close()  # we always reopen them
 
   def _load_seqs(self, start, end):
     """
@@ -167,6 +172,9 @@ class HDFDataset(CachedDataset):
     """
     assert start < self.num_seqs
     assert end <= self.num_seqs
+    if self.cache_byte_size_total_limit == 0:
+      # Just don't use the alloc intervals, or any of the other logic. Just load it on the fly when requested.
+      return
     selection = self.insert_alloc_interval(start, end)
     assert len(selection) <= end - start, "DEBUG: more sequences requested (" + str(len(selection)) + ") as required (" + str(end-start) + ")"
     self.preload_set |= set(range(start,end)) - set(selection)
@@ -203,6 +211,39 @@ class HDFDataset(CachedDataset):
         self.preload_set.add(idc)
       fin.close()
     gc.collect()
+
+  def get_data(self, seq_idx, key):
+    if self.cache_byte_size_total_limit > 0:  # Use the cache?
+      return super(HDFDataset, self).get_data(seq_idx, key)
+
+    # Otherwise, directly read it from file now.
+    real_seq_idx = self._seq_index[seq_idx]
+    file_idx = self.file_index[real_seq_idx]
+    fin = self.h5_files[file_idx]
+
+    real_file_seq_idx = real_seq_idx - self.file_start[file_idx]
+    pos = self.file_seq_start[file_idx][real_file_seq_idx]
+    seq_len = self._seq_lengths[real_seq_idx]
+
+    if key == "data":
+      inputs = fin['inputs']
+      data = inputs[pos[0]:pos[0] + seq_len[0]]
+    else:
+      assert 'targets' in fin
+      targets = fin['targets/data/' + key]
+      ldx = self.target_keys.index(key) + 1
+      data = targets[pos[ldx]:pos[ldx] + seq_len[ldx]]
+    return data
+
+  def get_input_data(self, sorted_seq_idx):
+    if self.cache_byte_size_total_limit > 0:  # Use the cache?
+      return super(HDFDataset, self).get_input_data(sorted_seq_idx)
+    return self.get_data(sorted_seq_idx, "data")
+
+  def get_targets(self, target, sorted_seq_idx):
+    if self.cache_byte_size_total_limit > 0:  # Use the cache?
+      return super(HDFDataset, self).get_targets(target, sorted_seq_idx)
+    return self.get_data(sorted_seq_idx, target)
 
   def _get_tag_by_real_idx(self, real_idx):
     s = self._tags[real_idx]
@@ -832,11 +873,12 @@ class SimpleHDFWriter:
     hdf_data = self._datasets[name]
     hdf_data[offset:] = raw_data
 
-  def insert_batch(self, inputs, seq_len, seq_tag):
+  def insert_batch(self, inputs, seq_len, seq_tag, extra=None):
     """
     :param numpy.ndarray inputs: shape=(n_batch,time,data) (or (n_batch,time), or (n_batch,time1,time2), ...)
-    :param list[int]|dict[int,list[int]|numpy.ndarray] seq_len: sequence lengths (per axis)
-    :param list[str] seq_tag: sequence tags of length n_batch
+    :param list[int]|dict[int,list[int]|numpy.ndarray] seq_len: sequence lengths (per axis, excluding batch axis)
+    :param list[str|bytes] seq_tag: sequence tags of length n_batch
+    :param dict[str,numpy.ndarray]|None extra:
     """
     n_batch = len(seq_tag)
     assert n_batch == inputs.shape[0]
@@ -852,6 +894,8 @@ class SimpleHDFWriter:
     assert all([max(value) == inputs.shape[key + 1] for (key, value) in seq_len.items()])
     if self.dim:
       assert self.dim == inputs.shape[-1]
+    if extra:
+      assert all([n_batch == value.shape[0] for value in extra.values()])
 
     seqlen_offset = self._seq_lengths.shape[0]
     self._seq_lengths.resize(seqlen_offset + n_batch, axis=0)
@@ -878,9 +922,13 @@ class SimpleHDFWriter:
         # However, we keep it consistent to how we handled it in our 2D MDLSTM experiments.
         self._insert_h5_other(
           "sizes", [seq_len[axis][i] for axis in range(ndim_with_seq_len)], add_time_dim=False, dtype="int32")
+      if extra:
+        assert len(seq_len) == 1  # otherwise you likely will get trouble with seq len mismatch
+        for key, value in extra.items():
+          self._insert_h5_other(key, value[i])
 
   def close(self):
-    max_tag_len = max([len(d) for d in self._tags])
+    max_tag_len = max([len(d) for d in self._tags]) if self._tags else 0
     self._file.create_dataset('seqTags', shape=(len(self._tags),), dtype="S%i" % (max_tag_len + 1))
     for i, tag in enumerate(self._tags):
       self._file['seqTags'][i] = numpy.array(tag, dtype="S%i" % (max_tag_len + 1))
