@@ -2256,6 +2256,8 @@ class LibriWipoEUCorpus(CachedDataset2):
     import Util
     self.path = path
     self.prefix = prefix
+    #use_zip is not implemented for LibriWipoEUCorpus
+    #use_ogg is not implemented for LibriWipoEUCorpus
     self.use_zip = use_zip
     self.use_ogg = use_ogg
     self._zip_files = None
@@ -2288,8 +2290,10 @@ class LibriWipoEUCorpus(CachedDataset2):
     self._audio_random = numpy.random.RandomState(1)
     self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
     self.num_inputs = self.feature_extractor.get_feature_dimension()
+    #self.num_outputs = {
+    #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
     self.num_outputs = {
-      "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
+      "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1]}
     self.transs = self._collect_trans()
     self._reference_seq_order = sorted(self.transs.keys())
     if fixed_random_subset:
@@ -2496,7 +2500,8 @@ class LibriWipoEUCorpus(CachedDataset2):
     raw = numpy.array(txt, dtype="object")
     return DatasetSeq(
       features=features,
-      targets={"classes": targets, "raw": raw},
+      #targets={"classes": targets, "raw": raw},
+      targets={"classes": targets},
       seq_idx=seq_idx,
       seq_tag=self.get_tag(seq_idx))
 
