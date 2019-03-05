@@ -2202,6 +2202,7 @@ class Engine(object):
       import soundfile  # pip install pysoundfile
       bpe_opts = self.config.typed_dict["dev"]["bpe"]
       audio_opts = self.config.typed_dict["dev"]["audio"]
+      print(audio_opts)
       bpe = BytePairEncoding(**bpe_opts)
       assert output_data.sparse
       assert bpe.num_labels == output_data.dim
@@ -2244,11 +2245,14 @@ class Engine(object):
         # we can now use e.g. readline() instead of raw recv() calls
         while True:
           try:
+            print("processing data")
             audio_bytes = self.rfile.read(MSGLEN)
-            print("{} wrote:".format(self.client_address[0]))
             import struct
-            byte_pattern=str(int(int(MSGLEN)/2))+"H" #content_length bytes with L16 encoding
+            byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
             audio = struct.unpack(byte_pattern, audio_bytes)
+            #import pickle
+            #with open('gst_audio.pkl','wb') as f:
+            #  pickle.dump(audio, f)
             sample_rate=16000
             targets = numpy.array([], dtype="int32")  # empty...
             features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
@@ -2271,7 +2275,11 @@ class Engine(object):
             assert len(output) == len(seq_lens) == (out_beam_size or 1)
             if out_beam_size:
               assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
+            first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
+            print("Best output: %s" % first_best_txt, file=log.v4)
+
           except:
+            raise
             return
     
     HOST, PORT = "localhost", port
@@ -2357,7 +2365,7 @@ class Engine(object):
   
       def do_POST(self):
         try:
-          self._do_POST_raw_audio()
+          self._do_POST()
         except Exception:
           sys.excepthook(*sys.exc_info())
           raise
@@ -2411,6 +2419,9 @@ class Engine(object):
         if input_audio_feature_extractor:
           try:
             audio, sample_rate = soundfile.read(f)
+            import pickle
+            with open('file_load_audio.pkl','wb') as f:
+              pickle.dump(audio, f)
           except Exception as exc:
             print("Error reading audio (%s). Invalid format? Size %i, first few bytes %r." % (exc, f.getbuffer().nbytes, f.getbuffer().tobytes()[:20]), file=log.v2)
             raise
