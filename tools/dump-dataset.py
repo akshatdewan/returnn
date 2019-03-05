@@ -14,9 +14,7 @@ import rnn
 from Log import log
 import argparse
 import numpy
-import better_exchook
-from better_exchook import pretty_print
-from Util import Stats, hms
+from Util import Stats, hms, pretty_print
 import Util
 
 
@@ -71,6 +69,12 @@ def dump_dataset(dataset, options):
     print("Dump files: %r*%r" % (options.dump_prefix, options.dump_postfix), file=log.v3)
   elif options.type == "stdout":
     print("Dump to stdout", file=log.v3)
+    if options.stdout_limit is not None:
+      Util.set_pretty_print_default_limit(options.stdout_limit)
+      numpy.set_printoptions(
+        threshold=sys.maxsize if options.stdout_limit == float("inf") else int(options.stdout_limit))
+    if options.stdout_as_bytes:
+      Util.set_pretty_print_as_bytes(options.stdout_as_bytes)
   elif options.type == "print_shape":
     print("Dump shape to stdout", file=log.v3)
   elif options.type == "plot":
@@ -119,7 +123,7 @@ def dump_dataset(dataset, options):
         numpy.savetxt("%s%i.targets.%s%s" % (options.dump_prefix, seq_idx, target, options.dump_postfix), targets, fmt='%i')
       elif options.type == "stdout":
         extra = ""
-        if target in dataset.labels:
+        if target in dataset.labels and len(dataset.labels[target]) > 1:
           labels = dataset.labels[target]
           if len(labels) < 1000 and all([len(l) == 1 for l in labels]):
             join_str = ""
@@ -153,16 +157,20 @@ def init(config_str):
   """
   rnn.initBetterExchook()
   rnn.initThreadJoinHack()
+  datasetDict = None
+  configFilename = None
   if config_str.strip().startswith("{"):
     print("Using dataset %s." % config_str)
     datasetDict = eval(config_str.strip())
-    configFilename = None
+  elif config_str.endswith(".hdf"):
+    datasetDict = {"class": "HDFDataset", "files": [config_str]}
+    print("Using dataset %r." % datasetDict)
+    assert os.path.exists(config_str)
   else:
-    datasetDict = None
     configFilename = config_str
     print("Using config file %r." % configFilename)
     assert os.path.exists(configFilename)
-  rnn.initConfig(configFilename=configFilename, commandLineOptions=[])
+  rnn.initConfig(configFilename=configFilename, default_config={"cache_size": "0"})
   global config
   config = rnn.config
   config.set("log", None)
@@ -186,6 +194,8 @@ def main(argv):
   argparser.add_argument('--endseq', type=int, default=10, help='end seq idx (inclusive) or -1 (default: 10)')
   argparser.add_argument('--get_num_seqs', action="store_true")
   argparser.add_argument('--type', default='stdout', help="'numpy', 'stdout', 'plot', 'null' (default 'stdout')")
+  argparser.add_argument("--stdout_limit", type=float, default=None, help="e.g. inf to disable")
+  argparser.add_argument("--stdout_as_bytes", action="store_true")
   argparser.add_argument('--dump_prefix', default='/tmp/crnn.dump-dataset.')
   argparser.add_argument('--dump_postfix', default='.txt.gz')
   argparser.add_argument("--key", default="data", help="data-key, e.g. 'data' or 'classes'. (default: 'data')")
