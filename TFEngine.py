@@ -2332,6 +2332,8 @@ class Engine(object):
             first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
             print("Best output: %s" % first_best_txt, file=log.v4)
 
+          except struct.error as err:
+            return
           except:
             raise
             return
