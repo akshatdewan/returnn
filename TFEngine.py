@@ -1931,7 +1931,7 @@ class Engine(object):
       assert all(dataset.can_serialize_data(target_key) for target_key in target_keys)
       assert not os.path.exists(output_file)
       print("Will write outputs to: %s" % output_file, file=log.v2)
-      output_file = open(output_file, "w")
+      output_file = open(output_file, "w", encoding="utf-8")
       # corpus-seq-idx -> str|list[(float,str)]|dict[str -> str|list[(float,str)]],
       # depending on output_is_dict and whether output is after decision
       out_cache = {}
