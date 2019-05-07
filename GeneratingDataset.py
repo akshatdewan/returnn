@@ -2560,9 +2560,9 @@ class CernCorpus(CachedDataset2):
     self.use_ogg = use_ogg
     self._zip_files = None
 
-    assert prefix.split("-")[0] in ["train", "dev", "test"]
+    assert prefix.split("-")[0] in ["train", "dev", "test", "demo"]
     assert os.path.exists(path + "/train/")
-    assert os.path.exists(path + "/dev/") #wav_val
+    assert os.path.exists(path + "/dev/")
 
     self.orth_post_process = None
     if orth_post_process:
@@ -2617,6 +2617,8 @@ class CernCorpus(CachedDataset2):
         fn_list = glob("%s/%s/*.trans.txt" % (self.path, subdir))
       elif self.prefix=="dev":
         fn_list = [self.path + '/' + subdir + '/dev.trans.txt']
+      elif self.prefix=="demo":
+        fn_list = [self.path + '/' + subdir + '/demo.trans.txt']
       for fn in fn_list:
         subsubdir = os.path.basename(os.path.dirname(fn))
         for l in open(fn,encoding='utf-8').read().splitlines():
