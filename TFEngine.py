@@ -2304,9 +2304,6 @@ class Engine(object):
             import struct
             byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
             audio = struct.unpack(byte_pattern, audio_bytes)
-            #import pickle
-            #with open('gst_audio.pkl','wb') as f:
-            #  pickle.dump(audio, f)
             sample_rate=16000
             targets = numpy.array([], dtype="int32")  # empty...
             features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
@@ -2338,12 +2335,11 @@ class Engine(object):
             raise
             return
     
-    HOST, PORT = "localhost", port
+    HOST, PORT = "0.0.0.0", port
 
-    # Create the server, binding to localhost on port 9999
-    #with socketserver.TCPServer((HOST, PORT), MyTCPHandler) as server:
+    # Create the server, binding to localhost on specified port 
     print("Socket server running on port no.  {}".format(PORT))
-    server=socketserver.TCPServer((HOST, PORT), MyTCPHandler)
+    server = socketserver.TCPServer((HOST, PORT), MyTCPHandler)
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
     server.serve_forever()
