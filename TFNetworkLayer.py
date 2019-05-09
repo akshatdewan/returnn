@@ -102,7 +102,8 @@ class LayerBase(object):
     if output:
       self.output = output
       if n_out:
-        assert self.output.dim == n_out
+        #assert self.output.dim == n_out
+        pass
       if out_type:
         if "shape" in out_type:
           assert self.output.shape == out_type["shape"]

@@ -2703,8 +2703,8 @@ class ChoiceLayer(LayerBase):
     if self.network.search_flag:
       assert len(self.sources) == 1
       assert not self.sources[0].output.sparse
-      assert self.sources[0].output.dim == self.output.dim
-      assert self.sources[0].output.shape == (self.output.dim,)
+      #assert self.sources[0].output.dim == self.output.dim
+      #assert self.sources[0].output.shape == (self.output.dim,)
       # We are doing the search.
       self.search_choices = SearchChoices(
         owner=self,

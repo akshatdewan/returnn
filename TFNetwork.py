@@ -813,6 +813,7 @@ class TFNetwork(object):
       initializer_op = tf.variables_initializer(var_list=var_list)
     session.run(initializer_op)
     for var in var_list:
+      print("var is :", var)
       # Some of our code could set this, e.g. the SubnetworkLayer.
       # See :func:`set_custom_post_init`
       custom_post_init = getattr(var, "custom_post_init", None)

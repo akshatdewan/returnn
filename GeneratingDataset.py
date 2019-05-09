@@ -1749,6 +1749,319 @@ class BlissDataset(CachedDataset2):
     raise NotImplementedError  # TODO...
 
 
+class LibriWipoEUCorpus(CachedDataset2):
+  """
+  LibriSpeech + WIPO + EUParl. http://www.openslr.org/12/
+
+  "train-*" Seq-length 'data' Stats (default MFCC, every 10ms):
+    720706 seqs
+    Mean: 
+    Std dev: 
+    Min/max: 
+  "train-*" Seq-length 'classes' Stats (BPE with 10k symbols):
+    720706 seqs
+    Mean: 
+    Std dev: 
+    Min/max: 
+  "train-*" mean transcription len:  (chars), i.e. ~ chars per BPE label
+  """
+  def __init__(self, path, prefix, audio,
+               orth_post_process=None,
+               targets=None, chars=None, bpe=None,
+               use_zip=False, use_ogg=False, use_cache_manager=False,
+               partition_epoch=None, fixed_random_seed=None, fixed_random_subset=None,
+               epoch_wise_filter=None,
+               name=None,
+               **kwargs):
+    """
+    :param str path: dir, should contain "train-*/*/*/{*.flac,*.trans.txt}", or "train-*.zip"
+    :param str prefix: "train", "dev", ...
+    :param str|list[str]|None orth_post_process: :func:`get_post_processor_function`, applied on orth
+    :param str|None targets: "bpe" or "chars" currently, if `None`, then "bpe"
+    :param dict[str] audio: options for :class:`ExtractAudioFeatures`
+    :param dict[str] bpe: options for :class:`BytePairEncoding`
+    :param dict[str] chars: options for :class:`CharacterTargets`
+    :param bool use_zip: whether to use the ZIP files instead (better for NFS)
+    :param bool use_ogg: add .ogg postfix to all files
+    :param bool use_cache_manager: uses :func:`Util.cf`
+    :param int|None partition_epoch:
+    :param int|None fixed_random_seed: for the shuffling, e.g. for seq_ordering='random'. otherwise epoch will be used
+    :param float|int|None fixed_random_subset:
+      Value in [0,1] to specify the fraction, or integer >=1 which specifies number of seqs.
+      If given, will use this random subset. This will be applied initially at loading time,
+      i.e. not dependent on the epoch. It will use an internally hardcoded fixed random seed, i.e. its deterministic.
+    :param dict|None epoch_wise_filter: see init_seq_order
+    """
+    if not name:
+      name = "prefix:" + prefix
+    super(LibriWipoEUCorpus, self).__init__(name=name, **kwargs)
+    import os
+    from glob import glob
+    import zipfile
+    import Util
+    self.path = path
+    self.prefix = prefix
+    self.use_zip = use_zip
+    self.use_ogg = use_ogg
+    self._zip_files = None
+
+    assert prefix.split("-")[0] in ["train", "dev", "test", "new_test_video_extracted_audio", "demo"]
+    assert os.path.exists(path + "/train/libri")
+    assert os.path.exists(path + "/train/wipo_train")
+    assert os.path.exists(path + "/dev/") #wav_val
+    assert os.path.exists(path + "/train/eu_parl")
+    self.orth_post_process = None
+    if orth_post_process:
+      from LmDataset import get_post_processor_function
+      self.orth_post_process = get_post_processor_function(orth_post_process)
+    assert bpe or chars
+    if targets == "bpe" or (targets is None and bpe is not None):
+      assert bpe is not None and chars is None
+      self.bpe = BytePairEncoding(**bpe)
+      self.targets = self.bpe
+      self.labels = {"classes": self.bpe.labels}
+    elif targets == "chars" or (targets is None and chars is not None):
+      assert bpe is None and chars is not None
+      self.chars = CharacterTargets(**chars)
+      self.labels = {"classes": self.chars.labels}
+      self.targets = self.chars
+    else:
+      raise Exception("invalid targets %r. provide bpe or chars" % targets)
+    self._fixed_random_seed = fixed_random_seed
+    self._audio_random = numpy.random.RandomState(1)
+    self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
+    self.num_inputs = self.feature_extractor.get_feature_dimension()
+    self.num_outputs = {
+      "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
+    self.partition_epoch = partition_epoch
+    self.transs = self._collect_trans()
+    self._reference_seq_order = sorted(self.transs.keys())
+    if fixed_random_subset:
+      if 0 < fixed_random_subset < 1:
+        fixed_random_subset = int(len(self._reference_seq_order) * fixed_random_subset)
+      assert isinstance(fixed_random_subset, int) and fixed_random_subset > 0
+      rnd = numpy.random.RandomState(42)
+      seqs = self._reference_seq_order
+      rnd.shuffle(seqs)
+      seqs = seqs[:fixed_random_subset]
+      self._reference_seq_order = seqs
+      self.transs = {s: self.transs[s] for s in seqs}
+    self.epoch_wise_filter = epoch_wise_filter
+    self.init_seq_order()
+
+  def _collect_trans(self):
+    from glob import glob
+    import os
+    import zipfile
+    transs = {}  # type: dict[(str,int,int,int),str]  # (subdir, speaker-id, chapter-id, seq-id) -> transcription
+    for subdir in glob("%s/%s*" % (self.path, self.prefix)):
+      if not os.path.isdir(subdir):
+        continue
+      subdir = os.path.basename(subdir)  # e.g. "train-clean-100"
+      if self.prefix=="train":
+        fn_list = glob("%s/%s/*/*.trans.txt" % (self.path, subdir))+[self.path+'/'+subdir+'/libri/train/wav/libri_train.trans.txt']
+        #fn_list = [self.path+'/'+subdir+'/libri/train/wav/libri_train.trans.txt'] # test the inf ctc during train
+      elif self.prefix=="dev":
+        fn_list = [self.path + '/' + subdir + '/wipo_val.trans.txt']
+      elif self.prefix=="test":
+        fn_list = [self.path + '/' + subdir + '/wipo_test.trans.txt']
+      elif self.prefix=="new_test_video_extracted_audio":
+        fn_list = [self.path + '/' + subdir + '/new_test_video_extracted_audio.trans.txt']
+      elif self.prefix=="demo":
+        print(subdir)
+        fn_list = [self.path + '/' + subdir + '/demo.trans.txt']
+      for fn in fn_list:
+      #for fn in glob("%s/%s/*/*.trans.txt" % (self.path, subdir)):
+        subsubdir = os.path.basename(os.path.dirname(fn))
+        for l in open(fn).read().splitlines():
+          seq_name, txt = l.split(" ", 1)
+          #speaker_id, chapter_id, seq_id = map(int, seq_name.split("-"))
+          if self.orth_post_process:
+            txt = self.orth_post_process(txt)
+          #transs[(subdir, speaker_id, chapter_id, seq_id)] = txt
+          transs[(subdir, seq_name)] = txt
+    assert transs, "did not find anything %s/%s*" % (self.path, self.prefix)
+    assert transs
+    return transs
+
+  def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    If random_shuffle_epoch1, for epoch 1 with "random" ordering, we leave the given order as is.
+    Otherwise, this is mostly the default behavior.
+
+    :param int|None epoch:
+    :param list[str]|None seq_list: In case we want to set a predefined order.
+    :rtype: bool
+    :returns whether the order changed (True is always safe to return)
+    """
+    import Util
+    super(LibriWipoEUCorpus, self).init_seq_order(epoch=epoch, seq_list=seq_list)
+    if not epoch:
+      epoch = 1
+    self._audio_random.seed(self._fixed_random_seed or epoch or 1)
+    if self.partition_epoch:
+      real_epoch = (epoch - 1) // self.partition_epoch + 1  # count starting from epoch 1
+    else:
+      real_epoch = epoch
+    if seq_list is not None:
+      seqs = [i for i in range(len(self._reference_seq_order)) if self._get_tag(i) in seq_list]
+      seqs = {self._get_tag(i): i for i in seqs}
+      for seq_tag in seq_list:
+        assert seq_tag in seqs, "did not found all requested seqs. we have eg: %s" % (self._get_tag(0),)
+      self._seq_order = [seqs[seq_tag] for seq_tag in seq_list]
+      self._num_seqs = len(self._seq_order)
+    else:
+      num_seqs = len(self._reference_seq_order)
+      self._seq_order = self.get_seq_order_for_epoch(
+        epoch=real_epoch, num_seqs=num_seqs, get_seq_len=lambda i: len(self.transs[self._reference_seq_order[i]]))
+      self._num_seqs = num_seqs
+    if self.partition_epoch:
+      partition_epoch_num_seqs = [self._num_seqs // self.partition_epoch] * self.partition_epoch
+      i = 0
+      while sum(partition_epoch_num_seqs) < self._num_seqs:
+        partition_epoch_num_seqs[i] += 1
+        i += 1
+        assert i < self.partition_epoch
+      assert sum(partition_epoch_num_seqs) == self._num_seqs
+      self._num_seqs = partition_epoch_num_seqs[(self.epoch - 1) % self.partition_epoch]
+      i = 0
+      for n in partition_epoch_num_seqs[:(epoch - 1) % self.partition_epoch]:
+        i += n
+      self._seq_order = self._seq_order[i:i + self._num_seqs]
+    if self.epoch_wise_filter:
+      old_num_seqs = self._num_seqs
+      any_filter = False
+      for (ep_start, ep_end), value in sorted(self.epoch_wise_filter.items()):
+        assert isinstance(ep_start, int) and isinstance(ep_end, int) and 1 <= ep_start <= ep_end
+        assert isinstance(value, dict)
+        if ep_start <= epoch <= ep_end:
+          any_filter = True
+          opts = CollectionReadCheckCovered(value)
+          if opts.get("subdirs") is not None:
+            subdirs = opts.get("subdirs", None)
+            assert isinstance(subdirs, list)
+            self._seq_order = [idx for idx in self._seq_order if self._reference_seq_order[idx][0] in subdirs]
+            assert self._seq_order, "subdir filter %r invalid?" % (subdirs,)
+          if opts.get("max_mean_len"):
+            max_mean_len = opts.get("max_mean_len")
+            seqs = numpy.array(
+              sorted([(len(self.transs[self._reference_seq_order[idx]]), idx) for idx in self._seq_order]))
+            num = Util.binary_search_any(
+              cmp=lambda num: numpy.mean(seqs[:num, 0]) > max_mean_len, low=1, high=len(seqs) + 1)
+            assert num is not None
+            self._seq_order = list(seqs[:num, 1])
+            print("%s, epoch %i. Old mean seq len (transcription) is %f, new is %f." % (
+              self, epoch, float(numpy.mean(seqs[:, 0])), float(numpy.mean(seqs[:num, 0]))), file=log.v4)
+          self._num_seqs = len(self._seq_order)
+      if any_filter:
+        print("%s, epoch %i. Old num seqs %i, new num seqs %i." % (
+          self, epoch, old_num_seqs, self._num_seqs), file=log.v4)
+      else:
+        print("%s, epoch %i. No filter for this epoch." % (self, epoch), file=log.v4)
+    return True
+
+  def _get_ref_seq_idx(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: idx in self._reference_seq_order
+    :rtype: int
+    """
+    return self._seq_order[seq_idx]
+
+  def have_corpus_seq_idx(self):
+    return True
+
+  def get_corpus_seq_idx(self, seq_idx):
+    return self._get_ref_seq_idx(seq_idx)
+
+  def _get_tag(self, ref_seq_idx):
+    """
+    :param int ref_seq_idx:
+    :rtype: str
+    """
+    #subdir, speaker_id, chapter_id, seq_id = self._reference_seq_order[ref_seq_idx]
+    subdir, seq_name = self._reference_seq_order[ref_seq_idx]
+    #return "%(sd)s-%(sp)i-%(ch)i-%(i)04i" % {
+    #  "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
+    return "%(sd)s-%(sn)s" % {
+      "sd": subdir, "sn": seq_name}
+
+  def get_tag(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: str
+    """
+    return self._get_tag(self._get_ref_seq_idx(seq_idx))
+
+  def _get_transcription(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: (bpe, txt)
+    :rtype: (list[int], str)
+    """
+    seq_key = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
+    targets_txt = self.transs[seq_key]
+    return self.targets.get_seq(targets_txt), targets_txt
+
+  def _open_audio_file(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: io.FileIO
+    """
+    import io
+    import os
+    import zipfile
+    #subdir, speaker_id, chapter_id, seq_id = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
+    subdir, seq_name = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
+    #audio_fn = "%(sd)s/%(sp)i/%(ch)i/%(sp)i-%(ch)i-%(i)04i.flac" % {
+    #  "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
+    audio_fn = "%(sn)s.wav" % {
+      "sn": seq_name}
+    if self.use_ogg:
+      audio_fn += ".ogg"
+    else:
+      if "train" in subdir:
+        if "VODChapter" in audio_fn:
+          audio_fn = "%s/%s/%s" % (subdir, "eu_parl", audio_fn)
+        elif "ENGLISH_" in audio_fn:
+          audio_fn = "%s/%s/%s" % (subdir, "wipo_train", audio_fn)
+        else:
+          audio_fn = "%s/%s/%s" % (subdir, "libri/train/wav", audio_fn)
+      if "dev" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn) 
+      if "test" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn) 
+      if "demo" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn) 
+    audio_fn = "%s/%s" % (self.path, audio_fn)
+    assert os.path.exists(audio_fn)
+    return open(audio_fn, "rb")
+
+  def _collect_single_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
+    # Don't use librosa.load which internally uses audioread which would use Gstreamer as a backend,
+    # which has multiple issues:
+    # https://github.com/beetbox/audioread/issues/62
+    # https://github.com/beetbox/audioread/issues/63
+    # Instead, use PySoundFile, which is also faster. See here for discussions:
+    # https://github.com/beetbox/audioread/issues/64
+    # https://github.com/librosa/librosa/issues/681
+    import soundfile  # pip install pysoundfile
+    with self._open_audio_file(seq_idx) as audio_file:
+      audio, sample_rate = soundfile.read(audio_file)
+    features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+    bpe, txt = self._get_transcription(seq_idx)
+    targets = numpy.array(bpe, dtype="int32")
+    raw = numpy.array(txt, dtype="object")
+    return DatasetSeq(
+      features=features,
+      targets={"classes": targets, "raw": raw},
+      seq_idx=seq_idx,
+      seq_tag=self.get_tag(seq_idx))
+
 class LibriSpeechCorpus(CachedDataset2):
   """
   LibriSpeech. http://www.openslr.org/12/
