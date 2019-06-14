@@ -902,6 +902,7 @@ class ExtractAudioFeatures:
       feature_data -= self.norm_mean[None, :]
     if self.norm_std_dev is not None:
       feature_data /= self.norm_std_dev[None, :]
+    print(feature_data)
     return feature_data
 
   def get_feature_dimension(self):
@@ -2278,7 +2279,7 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     self._fixed_random_seed = fixed_random_seed
     self._audio_random = numpy.random.RandomState(1)
     self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
-    self.num_inputs = self.feature_extractor.get_feature_dimension()
+    self.num_inputs = self.feature_extractor.get_feature_dimension() + 3 #AD: Hack for domain tag embedding
     #self.num_outputs = {
     #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
     self.num_outputs = {
@@ -2494,6 +2495,19 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     # Instead, use PySoundFile, which is also faster. See here for discussions:
     # https://github.com/beetbox/audioread/issues/64
     # https://github.com/librosa/librosa/issues/681
+    #AD: Hack for domain tag embedding
+    subdir, seq_name = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
+    audio_fn = "%(sn)s.wav" % {"sn": seq_name}
+    if "VODChapter" in audio_fn:
+      domain_tag = '000' #"%s/%s/%s" % (subdir, "eu_parl", audio_fn)
+    elif "ENGLISH_" in audio_fn:
+      domain_tag = '001' #"%s/%s/%s" % (subdir, "wipo", audio_fn)
+    elif "UNOG" in audio_fn:
+      domain_tag = '010' #audio_fn = "%s/%s/%s" % (subdir, "unog", audio_fn)
+    elif "-VR-" in audio_fn:
+      domain_tag = '011' #"%s/%s/%s" % (subdir, "unesco", audio_fn)
+    elif "CERN" in audio_fn:
+      domain_tag = '100' #"%s/%s/%s" % (subdir, "cern", audio_fn)
     import soundfile  # pip install pysoundfile
     with self._open_audio_file(seq_idx) as audio_file:
       audio, sample_rate = soundfile.read(audio_file)
