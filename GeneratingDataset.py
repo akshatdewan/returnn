@@ -902,7 +902,6 @@ class ExtractAudioFeatures:
       feature_data -= self.norm_mean[None, :]
     if self.norm_std_dev is not None:
       feature_data /= self.norm_std_dev[None, :]
-    print(feature_data)
     return feature_data
 
   def get_feature_dimension(self):
@@ -2488,6 +2487,7 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     :param int seq_idx:
     :rtype: DatasetSeq
     """
+    import numpy as np
     # Don't use librosa.load which internally uses audioread which would use Gstreamer as a backend,
     # which has multiple issues:
     # https://github.com/beetbox/audioread/issues/62
@@ -2499,19 +2499,23 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     subdir, seq_name = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
     audio_fn = "%(sn)s.wav" % {"sn": seq_name}
     if "VODChapter" in audio_fn:
-      domain_tag = '000' #"%s/%s/%s" % (subdir, "eu_parl", audio_fn)
+      domain_tag = [[0,0,0]] #"%s/%s/%s" % (subdir, "eu_parl", audio_fn)
     elif "ENGLISH_" in audio_fn:
-      domain_tag = '001' #"%s/%s/%s" % (subdir, "wipo", audio_fn)
+      domain_tag = [[0,0,1]] #"%s/%s/%s" % (subdir, "wipo", audio_fn)
     elif "UNOG" in audio_fn:
-      domain_tag = '010' #audio_fn = "%s/%s/%s" % (subdir, "unog", audio_fn)
+      domain_tag = [[0,1,0]] #audio_fn = "%s/%s/%s" % (subdir, "unog", audio_fn)
     elif "-VR-" in audio_fn:
-      domain_tag = '011' #"%s/%s/%s" % (subdir, "unesco", audio_fn)
+      domain_tag = [[0,1,1]] #"%s/%s/%s" % (subdir, "unesco", audio_fn)
     elif "CERN" in audio_fn:
-      domain_tag = '100' #"%s/%s/%s" % (subdir, "cern", audio_fn)
+      domain_tag = [[1,0,0]] #"%s/%s/%s" % (subdir, "cern", audio_fn)
+    else:
+      domain_tag = [[1,0,1]] #"%s/%s/%s" % (subdir, "libri/train/wav", audio_fn)
     import soundfile  # pip install pysoundfile
     with self._open_audio_file(seq_idx) as audio_file:
       audio, sample_rate = soundfile.read(audio_file)
     features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+    domain_tag_array = np.repeat(np.array(domain_tag, dtype=features.dtype), features.shape[0], axis=0)
+    features = np.concatenate((domain_tag_array, features), 1)
     bpe, txt = self._get_transcription(seq_idx)
     targets = numpy.array(bpe, dtype="int32")
     raw = numpy.array(txt, dtype="object")
