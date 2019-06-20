@@ -2279,6 +2279,8 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     self._audio_random = numpy.random.RandomState(1)
     self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
     self.num_inputs = self.feature_extractor.get_feature_dimension()
+    #self.num_outputs = {
+    #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
     self.num_outputs = {
       "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
     #self.num_outputs = {
@@ -2487,6 +2489,7 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     :param int seq_idx:
     :rtype: DatasetSeq
     """
+    import numpy as np
     # Don't use librosa.load which internally uses audioread which would use Gstreamer as a backend,
     # which has multiple issues:
     # https://github.com/beetbox/audioread/issues/62
@@ -2498,6 +2501,8 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     with self._open_audio_file(seq_idx) as audio_file:
       audio, sample_rate = soundfile.read(audio_file)
     features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+    domain_tag_array = np.repeat(np.array(domain_tag, dtype=features.dtype), features.shape[0], axis=0)
+    features = np.concatenate((domain_tag_array, features), 1)
     bpe, txt = self._get_transcription(seq_idx)
     targets = numpy.array(bpe, dtype="int32")
     raw = numpy.array(txt, dtype="object")
