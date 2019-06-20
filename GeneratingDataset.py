@@ -2245,7 +2245,7 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     self.path = path
     self.prefix = prefix
 
-    assert prefix.split("-")[0] in ["train", "dev", "test", "demo"]
+    assert prefix.split("-")[0] in ["train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
     assert os.path.exists(path + "/train/libri")
     assert os.path.exists(path + "/train/wipo_train")
     assert os.path.exists(path + "/train/eu_parl")
@@ -2279,10 +2279,10 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     self._audio_random = numpy.random.RandomState(1)
     self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
     self.num_inputs = self.feature_extractor.get_feature_dimension()
-    #self.num_outputs = {
-    #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
     self.num_outputs = {
-      "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1]}
+      "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
+    #self.num_outputs = {
+    #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1]}
     self.transs = self._collect_trans()
     self._reference_seq_order = sorted(self.transs.keys())
     if fixed_random_subset:
@@ -2318,8 +2318,8 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
       for fn in fn_list:
         subsubdir = os.path.basename(os.path.dirname(fn))
         for l in open(fn, encoding='utf-8').read().splitlines():
-          utf8stdout = open(1, 'w', encoding='utf-8', closefd=False) # fd 1 is stdout
-          print(l, file=utf8stdout)
+          #utf8stdout = open(1, 'w', encoding='utf-8', closefd=False) # fd 1 is stdout
+          #print(l, file=utf8stdout)
           seq_name, txt = l.split(" ", 1)
           if self.orth_post_process:
             txt = self.orth_post_process(txt)
@@ -2503,8 +2503,8 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     raw = numpy.array(txt, dtype="object")
     return DatasetSeq(
       features=features,
-      #targets={"classes": targets, "raw": raw},
-      targets={"classes": targets},
+      targets={"classes": targets, "raw": raw},
+      #targets={"classes": targets},
       seq_idx=seq_idx,
       seq_tag=self.get_tag(seq_idx))
 

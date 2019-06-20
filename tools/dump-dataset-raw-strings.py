@@ -114,6 +114,7 @@ def main(argv):
 
   init(config_filename=args.config, log_verbosity=args.verbosity)
   if args.dataset:
+    print(args.dataset)
     dataset = init_dataset(args.dataset)
   elif config.value("dump_data", "eval") in ["train", "dev", "eval"]:
     dataset = init_dataset(config.opt_typed_value(config.value("search_data", "eval")))
@@ -122,7 +123,7 @@ def main(argv):
   dataset.init_seq_order(epoch=1)
 
   try:
-    with open(args.out, "w") as output_file:
+    with open(args.out, "w", encoding='utf-8') as output_file:
       refs = get_raw_strings(dataset=dataset, options=args)
       output_file.write("{\n")
       for seq_tag, ref in refs:
