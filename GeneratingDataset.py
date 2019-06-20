@@ -2501,8 +2501,6 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     with self._open_audio_file(seq_idx) as audio_file:
       audio, sample_rate = soundfile.read(audio_file)
     features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
-    domain_tag_array = np.repeat(np.array(domain_tag, dtype=features.dtype), features.shape[0], axis=0)
-    features = np.concatenate((domain_tag_array, features), 1)
     bpe, txt = self._get_transcription(seq_idx)
     targets = numpy.array(bpe, dtype="int32")
     raw = numpy.array(txt, dtype="object")
