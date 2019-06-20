@@ -2204,6 +2204,330 @@ class LibriSpeechCorpus(CachedDataset2):
       seq_tag=self.get_tag(seq_idx))
 
 
+class CernEULibriUnescoUnogWipoCorpus_with_domain_tags(CachedDataset2):
+  """
+  LibriSpeech + WIPO + EUParl. + CERN + UNESCO + UNOG http://www.openslr.org/12/
+
+  "train-*" Seq-length 'data' Stats (default MFCC, every 10ms):
+    798849 seqs
+  """
+
+  def __init__(self, path, prefix, audio,
+               orth_post_process=None,
+               targets=None, chars=None, bpe=None,
+               use_zip=False, use_ogg=False, use_cache_manager=False,
+               fixed_random_seed=None, fixed_random_subset=None,
+               epoch_wise_filter=None,
+               name=None,
+               **kwargs):
+    """
+    :param str path: dir, should contain "train-*/*/*/{*.flac,*.trans.txt}", or "train-*.zip"
+    :param str prefix: "train", "dev", "test", "dev-clean", "dev-other", ...
+    :param str|list[str]|None orth_post_process: :func:`get_post_processor_function`, applied on orth
+    :param str|None targets: "bpe" or "chars" currently, if `None`, then "bpe"
+    :param dict[str] audio: options for :class:`ExtractAudioFeatures`
+    :param dict[str] bpe: options for :class:`BytePairEncoding`
+    :param dict[str] chars: options for :class:`CharacterTargets`
+    :param bool use_cache_manager: uses :func:`Util.cf`
+    :param int|None fixed_random_seed: for the shuffling, e.g. for seq_ordering='random'. otherwise epoch will be used
+    :param float|int|None fixed_random_subset:
+      Value in [0,1] to specify the fraction, or integer >=1 which specifies number of seqs.
+      If given, will use this random subset. This will be applied initially at loading time,
+      i.e. not dependent on the epoch. It will use an internally hardcoded fixed random seed, i.e. its deterministic.
+    :param dict|None epoch_wise_filter: see init_seq_order
+    """
+    if not name:
+      name = "prefix:" + prefix
+    super(CernEULibriUnescoUnogWipoCorpus_with_domain_tags, self).__init__(name=name, **kwargs)
+    import os
+    from glob import glob
+    import Util
+    self.path = path
+    self.prefix = prefix
+
+    assert prefix.split("-")[0] in ["train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
+    assert os.path.exists(path + "/train/libri")
+    assert os.path.exists(path + "/train/wipo_train")
+    assert os.path.exists(path + "/train/eu_parl")
+    assert os.path.exists(path + "/train/cern")
+    assert os.path.exists(path + "/train/unog")
+    assert os.path.exists(path + "/train/unesco")
+    assert os.path.exists(path + "/dev/")
+    assert os.path.exists(path + "/dev/unog")
+    assert os.path.exists(path + "/dev/unesco")
+    assert os.path.exists(path + "/dev/wipo")
+    assert os.path.exists(path + "/dev/cern")
+
+    self.orth_post_process = None
+    if orth_post_process:
+      from LmDataset import get_post_processor_function
+      self.orth_post_process = get_post_processor_function(orth_post_process)
+    assert bpe or chars
+    if targets == "bpe" or (targets is None and bpe is not None):
+      assert bpe is not None and chars is None
+      self.bpe = BytePairEncoding(**bpe)
+      self.targets = self.bpe
+      self.labels = {"classes": self.bpe.labels}
+    elif targets == "chars" or (targets is None and chars is not None):
+      assert bpe is None and chars is not None
+      self.chars = CharacterTargets(**chars)
+      self.labels = {"classes": self.chars.labels}
+      self.targets = self.chars
+    else:
+      raise Exception("invalid targets %r. provide bpe or chars" % targets)
+    self._fixed_random_seed = fixed_random_seed
+    self._audio_random = numpy.random.RandomState(1)
+    self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
+    self.num_inputs = self.feature_extractor.get_feature_dimension() + 3 #AD: Hack for domain tag embedding
+    #self.num_outputs = {
+    #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
+    self.num_outputs = {
+      "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
+    #self.num_outputs = {
+    #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1]}
+    self.transs = self._collect_trans()
+    self._reference_seq_order = sorted(self.transs.keys())
+    if fixed_random_subset:
+      if 0 < fixed_random_subset < 1:
+        fixed_random_subset = int(len(self._reference_seq_order) * fixed_random_subset)
+      assert isinstance(fixed_random_subset, int) and fixed_random_subset > 0
+      rnd = numpy.random.RandomState(42)
+      seqs = self._reference_seq_order
+      rnd.shuffle(seqs)
+      seqs = seqs[:fixed_random_subset]
+      self._reference_seq_order = seqs
+      self.transs = {s: self.transs[s] for s in seqs}
+    self.epoch_wise_filter = epoch_wise_filter
+    self.init_seq_order()
+
+  def _collect_trans(self):
+    from glob import glob
+    import os
+    transs = {}
+    for subdir in glob("%s/%s*" % (self.path, self.prefix)):
+      if not os.path.isdir(subdir):
+        continue
+      subdir = os.path.basename(subdir)  # e.g. "train-clean-100"
+      if self.prefix=="train":
+        fn_list = glob("%s/%s/*/*.trans.txt" % (self.path, subdir)) + [self.path+'/'+subdir+'/libri/train/wav/libri_train.trans.txt']
+      elif self.prefix=="dev":
+        fn_list = glob("%s/%s/*/*.trans.txt" % (self.path, subdir))
+        #fn_list = [self.path + '/' + subdir + '/wipo_val.trans.txt']
+      elif self.prefix=="test":
+        fn_list = [self.path + '/' + subdir + '/wipo_test.trans.txt']
+      elif self.prefix=="demo":
+        fn_list = [self.path + '/' + subdir + '/demo.trans.txt']
+      for fn in fn_list:
+        subsubdir = os.path.basename(os.path.dirname(fn))
+        for l in open(fn, encoding='utf-8').read().splitlines():
+          #utf8stdout = open(1, 'w', encoding='utf-8', closefd=False) # fd 1 is stdout
+          #print(l, file=utf8stdout)
+          seq_name, txt = l.split(" ", 1)
+          if self.orth_post_process:
+            txt = self.orth_post_process(txt)
+          transs[(subdir, seq_name)] = txt
+
+    assert transs, "did not find anything %s/%s*" % (self.path, self.prefix)
+    return transs
+
+  def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    If random_shuffle_epoch1, for epoch 1 with "random" ordering, we leave the given order as is.
+    Otherwise, this is mostly the default behavior.
+
+    :param int|None epoch:
+    :param list[str]|None seq_list: In case we want to set a predefined order.
+    :rtype: bool
+    :returns whether the order changed (True is always safe to return)
+    """
+    import Util
+    super(CernEULibriUnescoUnogWipoCorpus, self).init_seq_order(epoch=epoch, seq_list=seq_list)
+    if not epoch:
+      epoch = 1
+    self._audio_random.seed(self._fixed_random_seed or epoch or 1)
+    if seq_list is not None:
+      seqs = [i for i in range(len(self._reference_seq_order)) if self._get_tag(i) in seq_list]
+      seqs = {self._get_tag(i): i for i in seqs}
+      for seq_tag in seq_list:
+        assert seq_tag in seqs, "did not found all requested seqs. we have eg: %s" % (self._get_tag(0),)
+      self._seq_order = [seqs[seq_tag] for seq_tag in seq_list]
+      self._num_seqs = len(self._seq_order)
+    else:
+      num_seqs = len(self._reference_seq_order)
+      self._seq_order = self.get_seq_order_for_epoch(
+        epoch=epoch, num_seqs=num_seqs, get_seq_len=lambda i: len(self.transs[self._reference_seq_order[i]]))
+      self._num_seqs = len(self._seq_order)
+    if self.epoch_wise_filter:
+      # Note: A more generic variant of this code is :class:`MetaDataset.EpochWiseFilter`.
+      old_num_seqs = self._num_seqs
+      any_filter = False
+      print(self.epoch_wise_filter)
+      for (ep_start, ep_end), value in sorted(self.epoch_wise_filter.items()):
+        if ep_start is None:
+          ep_start = 1
+        if ep_end is None or ep_end == -1:
+          ep_end = sys.maxsize
+        assert isinstance(ep_start, int) and isinstance(ep_end, int) and 1 <= ep_start <= ep_end
+        assert isinstance(value, dict)
+        if ep_start <= epoch <= ep_end:
+          any_filter = True
+          opts = CollectionReadCheckCovered(value)
+          print(value)
+          if opts.get("subdirs") is not None:
+            subdirs = opts.get("subdirs", None)
+            assert isinstance(subdirs, list)
+            self._seq_order = [idx for idx in self._seq_order if self._reference_seq_order[idx][0] in subdirs]
+            assert self._seq_order, "subdir filter %r invalid?" % (subdirs,)
+          if opts.get("max_mean_len"):
+            max_mean_len = opts.get("max_mean_len")
+            seqs = numpy.array(
+              sorted([(len(self.transs[self._reference_seq_order[idx]]), idx) for idx in self._seq_order]))
+            # Note: This is somewhat incorrect. But keep the behavior, such that old setups are reproducible.
+            num = Util.binary_search_any(
+              cmp=lambda num: numpy.mean(seqs[:num, 0]) > max_mean_len, low=1, high=len(seqs) + 1)
+            assert num is not None
+            self._seq_order = list(seqs[:num, 1])
+            print(
+              ("%s, epoch %i. Old mean seq len (transcription) is %f, new is %f, requested max is %f."
+               " Old num seqs is %i, new num seqs is %i.") %
+              (self, epoch, float(numpy.mean(seqs[:, 0])), float(numpy.mean(seqs[:num, 0])), max_mean_len,
+               len(seqs), num),
+              file=log.v4)
+          opts.assert_all_read()
+          self._num_seqs = len(self._seq_order)
+      if any_filter:
+        print("%s, epoch %i. Old num seqs %i, new num seqs %i." % (
+          self, epoch, old_num_seqs, self._num_seqs), file=log.v4)
+      else:
+        print("%s, epoch %i. No filter for this epoch." % (self, epoch), file=log.v4)
+    return True
+
+  def _get_ref_seq_idx(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: idx in self._reference_seq_order
+    :rtype: int
+    """
+    return self._seq_order[seq_idx]
+
+  def have_corpus_seq_idx(self):
+    return True
+
+  def get_corpus_seq_idx(self, seq_idx):
+    return self._get_ref_seq_idx(seq_idx)
+
+  def _get_tag(self, ref_seq_idx):
+    """
+    :param int ref_seq_idx:
+    :rtype: str
+    """
+    subdir, seq_name = self._reference_seq_order[ref_seq_idx]
+    return "%(sd)s-%(sn)s" % {
+      "sd": subdir, "sn": seq_name}
+
+  def get_tag(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: str
+    """
+    return self._get_tag(self._get_ref_seq_idx(seq_idx))
+
+  def _get_transcription(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: (bpe, txt)
+    :rtype: (list[int], str)
+    """
+    seq_key = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
+    targets_txt = self.transs[seq_key]
+    return self.targets.get_seq(targets_txt), targets_txt
+
+  def _open_audio_file(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: io.FileIO
+    """
+    import os
+    import zipfile
+    subdir, seq_name = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
+    audio_fn = "%(sn)s.wav" % {"sn": seq_name}
+    if "train" in subdir:
+      if "VODChapter" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "eu_parl", audio_fn)
+      elif "ENGLISH_" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "wipo_train", audio_fn)
+      elif "UNOG" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "unog", audio_fn)
+      elif "-VR-" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "unesco", audio_fn)
+      elif "CERN" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "cern", audio_fn)
+      else:
+        audio_fn = "%s/%s/%s" % (subdir, "libri/train/wav", audio_fn)
+    if "dev" in subdir:
+      if "VODChapter" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "eu_parl", audio_fn)
+      elif "ENGLISH_" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "wipo", audio_fn)
+      elif "UNOG" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "unog", audio_fn)
+      elif "-VR-" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "unesco", audio_fn)
+      elif "CERN" in audio_fn:
+        audio_fn = "%s/%s/%s" % (subdir, "cern", audio_fn)
+    if "test" in subdir:
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    if "demo" in subdir:
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    audio_fn = "%s/%s" % (self.path, audio_fn)
+    assert os.path.exists(audio_fn.encode('utf-8')) #filenames with utf-8
+    return open(audio_fn.encode('utf-8'), "rb")
+
+
+  def _collect_single_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
+    import numpy as np
+    # Don't use librosa.load which internally uses audioread which would use Gstreamer as a backend,
+    # which has multiple issues:
+    # https://github.com/beetbox/audioread/issues/62
+    # https://github.com/beetbox/audioread/issues/63
+    # Instead, use PySoundFile, which is also faster. See here for discussions:
+    # https://github.com/beetbox/audioread/issues/64
+    # https://github.com/librosa/librosa/issues/681
+    #AD: Hack for domain tag embedding
+    subdir, seq_name = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
+    audio_fn = "%(sn)s.wav" % {"sn": seq_name}
+    if "VODChapter" in audio_fn:
+      domain_tag = [[0,0,0]] #"%s/%s/%s" % (subdir, "eu_parl", audio_fn)
+    elif "ENGLISH_" in audio_fn:
+      domain_tag = [[0,0,1]] #"%s/%s/%s" % (subdir, "wipo", audio_fn)
+    elif "UNOG" in audio_fn:
+      domain_tag = [[0,1,0]] #audio_fn = "%s/%s/%s" % (subdir, "unog", audio_fn)
+    elif "-VR-" in audio_fn:
+      domain_tag = [[0,1,1]] #"%s/%s/%s" % (subdir, "unesco", audio_fn)
+    elif "CERN" in audio_fn:
+      domain_tag = [[1,0,0]] #"%s/%s/%s" % (subdir, "cern", audio_fn)
+    else:
+      domain_tag = [[1,0,1]] #"%s/%s/%s" % (subdir, "libri/train/wav", audio_fn)
+    import soundfile  # pip install pysoundfile
+    with self._open_audio_file(seq_idx) as audio_file:
+      audio, sample_rate = soundfile.read(audio_file)
+    features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+    domain_tag_array = np.repeat(np.array(domain_tag, dtype=features.dtype), features.shape[0], axis=0)
+    features = np.concatenate((domain_tag_array, features), 1)
+    bpe, txt = self._get_transcription(seq_idx)
+    targets = numpy.array(bpe, dtype="int32")
+    raw = numpy.array(txt, dtype="object")
+    return DatasetSeq(
+      features=features,
+      targets={"classes": targets, "raw": raw},
+      #targets={"classes": targets},
+      seq_idx=seq_idx,
+      seq_tag=self.get_tag(seq_idx))
+
 class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
   """
   LibriSpeech + WIPO + EUParl. + CERN + UNESCO + UNOG http://www.openslr.org/12/
