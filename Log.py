@@ -74,7 +74,7 @@ class Log:
       assert v <= 5, "invalid verbosity: " + str(v)
       f = fmt['default'] if i >= len(formatter) or not fmt.has_key(formatter[i]) else fmt[formatter[i]]
       if t == 'stdout':
-        handler = logging.StreamHandler(sys.stdout)
+        handler = logging.StreamHandler(open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1))
         handler.setLevel(logging.DEBUG)
       elif t.startswith("|"):  # pipe-format
         proc_cmd = t[1:].strip()

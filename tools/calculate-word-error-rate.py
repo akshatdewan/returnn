@@ -173,7 +173,7 @@ def load_hyps_refs(filename):
   :return: dict of seq_tag -> ref
   :rtype: dict[str,str]
   """
-  content = eval(open(filename).read())
+  content = eval(open(filename,encoding='utf-8').read())
   # See dump-dataset-raw-strings.py.
   # We expect that it is stored as a dict.
   assert isinstance(content, dict)
