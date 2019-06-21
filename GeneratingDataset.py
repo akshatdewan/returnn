@@ -2904,7 +2904,7 @@ class LibriWipoEUCorpus(CachedDataset2):
     self.use_ogg = use_ogg
     self._zip_files = None
 
-    assert prefix.split("-")[0] in ["train", "dev", "test", "new_test_video_extracted_audio", "demo"]
+    assert prefix.split("-")[0] in ["train", "dev", "test", "demo",  "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
     assert os.path.exists(path + "/train/libri")
     assert os.path.exists(path + "/train/wipo_train")
     assert os.path.exists(path + "/dev/") #wav_val
@@ -2966,10 +2966,14 @@ class LibriWipoEUCorpus(CachedDataset2):
         fn_list = [self.path + '/' + subdir + '/wipo_val.trans.txt']
       elif self.prefix=="test":
         fn_list = [self.path + '/' + subdir + '/wipo_test.trans.txt']
-      elif self.prefix=="new_test_video_extracted_audio":
-        fn_list = [self.path + '/' + subdir + '/new_test_video_extracted_audio.trans.txt']
       elif self.prefix=="demo":
         fn_list = [self.path + '/' + subdir + '/demo.trans.txt']
+      elif self.prefix=="dev_cern":
+        fn_list = [self.path + '/dev_cern' + '/cern_dev.trans.txt']
+      elif self.prefix=="dev_unesco":
+        fn_list = [self.path + '/dev_unesco' + '/unesco_dev.trans.txt']
+      elif self.prefix=="dev_unog":
+        fn_list = [self.path + '/dev_unog' + '/unog_dev.trans.txt']
       for fn in fn_list:
         subsubdir = os.path.basename(os.path.dirname(fn))
         for l in open(fn,encoding='utf-8').read().splitlines():
@@ -3115,6 +3119,12 @@ class LibriWipoEUCorpus(CachedDataset2):
     if "test" in subdir:
       audio_fn = "%s/%s" % (subdir, audio_fn)
     if "demo" in subdir:
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev_cern":
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev_unog":
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev_unesco":
       audio_fn = "%s/%s" % (subdir, audio_fn)
     audio_fn = "%s/%s" % (self.path, audio_fn)
     assert os.path.exists(audio_fn)
