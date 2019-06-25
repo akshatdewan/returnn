@@ -2570,17 +2570,8 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     self.prefix = prefix
 
     assert prefix.split("-")[0] in ["train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
-    assert os.path.exists(path + "/train/libri")
-    assert os.path.exists(path + "/train/wipo_train")
-    assert os.path.exists(path + "/train/eu_parl")
-    assert os.path.exists(path + "/train/cern")
-    assert os.path.exists(path + "/train/unog")
-    assert os.path.exists(path + "/train/unesco")
-    assert os.path.exists(path + "/dev/")
-    assert os.path.exists(path + "/dev/unog")
-    assert os.path.exists(path + "/dev/unesco")
-    assert os.path.exists(path + "/dev/wipo")
-    assert os.path.exists(path + "/dev/cern")
+    assert os.path.exists(path + "/train")
+    assert os.path.exists(path + "/dev")
 
     self.orth_post_process = None
     if orth_post_process:
