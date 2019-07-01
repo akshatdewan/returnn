@@ -2033,7 +2033,8 @@ class LibriSpeechCorpus(CachedDataset2):
         if not os.path.isdir(subdir):
           continue
         subdir = os.path.basename(subdir)  # e.g. "train-clean-100"
-        for fn in glob("%s/%s/*/*/*.trans.txt" % (self.path, subdir)):
+        #for fn in glob("%s/%s/*/*/*.trans.txt" % (self.path, subdir)):
+        for fn in [self.path+'/'+subdir+'/libri/train/wav/libri_train.trans.txt']:
           for l in open(fn).read().splitlines():
             seq_name, txt = l.split(" ", 1)
             speaker_id, chapter_id, seq_id = map(int, seq_name.split("-"))
@@ -2172,7 +2173,7 @@ class LibriSpeechCorpus(CachedDataset2):
     import os
     import zipfile
     subdir, speaker_id, chapter_id, seq_id = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
-    audio_fn = "%(sd)s/%(sp)i/%(ch)i/%(sp)i-%(ch)i-%(i)04i.flac" % {
+    audio_fn = "%(sd)s/libri/train/wav/%(sp)i-%(ch)i-%(i)04i.wav" % {
       "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
     if self.use_ogg:
       audio_fn += ".ogg"
