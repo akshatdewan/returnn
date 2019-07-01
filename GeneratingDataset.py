@@ -2034,13 +2034,17 @@ class LibriSpeechCorpus(CachedDataset2):
           continue
         subdir = os.path.basename(subdir)  # e.g. "train-clean-100"
         #for fn in glob("%s/%s/*/*/*.trans.txt" % (self.path, subdir)):
-        for fn in [self.path+'/'+subdir+'/libri/train/wav/libri_train.trans.txt']:
-          for l in open(fn).read().splitlines():
-            seq_name, txt = l.split(" ", 1)
-            speaker_id, chapter_id, seq_id = map(int, seq_name.split("-"))
-            if self.orth_post_process:
-              txt = self.orth_post_process(txt)
-            transs[(subdir, speaker_id, chapter_id, seq_id)] = txt
+        if self.prefix=="train":
+            fn_list = [self.path+'/'+subdir+'/libri/train/wav/libri_train.trans.txt']
+        elif self.prefix=="dev":
+            fn_list = [self.path+'/'+subdir+'/libri/val/wav/libri_dev.trans.txt']
+        for fn in fn_list:
+            for l in open(fn).read().splitlines():
+              seq_name, txt = l.split(" ", 1)
+              speaker_id, chapter_id, seq_id = map(int, seq_name.split("-"))
+              if self.orth_post_process:
+                txt = self.orth_post_process(txt)
+              transs[(subdir, speaker_id, chapter_id, seq_id)] = txt
       assert transs, "did not found anything %s/%s*" % (self.path, self.prefix)
     assert transs
     return transs
@@ -2173,8 +2177,12 @@ class LibriSpeechCorpus(CachedDataset2):
     import os
     import zipfile
     subdir, speaker_id, chapter_id, seq_id = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
-    audio_fn = "%(sd)s/libri/train/wav/%(sp)i-%(ch)i-%(i)04i.wav" % {
-      "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
+    if self.prefix=="train":
+        audio_fn = "%(sd)s/libri/train/wav/%(sp)i-%(ch)i-%(i)04i.wav" % {
+          "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
+    if self.prefix=="dev":
+        audio_fn = "%(sd)s/libri/val/wav/%(sp)i-%(ch)i-%(i)04i.wav" % {
+          "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
     if self.use_ogg:
       audio_fn += ".ogg"
     if self.use_zip:
