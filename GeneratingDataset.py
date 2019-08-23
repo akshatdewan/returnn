@@ -2290,7 +2290,7 @@ class CernEULibriUnescoUnogWipoCorpus_with_domain_tags_op(CachedDataset2):
     self._fixed_random_seed = fixed_random_seed
     self._audio_random = numpy.random.RandomState(1)
     self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
-    self.num_inputs = self.feature_extractor.get_feature_dimension() + 3 #AD: Hack for domain tag embedding
+    self.num_inputs = self.feature_extractor.get_feature_dimension() 
     #self.num_outputs = {
     #  "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
     self.num_outputs = {
