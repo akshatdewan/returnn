@@ -3168,7 +3168,13 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     import soundfile  # pip install pysoundfile
     with self._open_audio_file(seq_idx) as audio_file:
       audio, sample_rate = soundfile.read(audio_file)
-    features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+      zero_padding = 0.2 #in seconds
+      zero_pad = np.zeros((int(zero_padding*sample_rate),))
+      audio_padded = np.append(audio, zero_pad)
+      print("DEBUG",type(audio), audio.shape, len(audio) ,sample_rate)
+      print("DEBUG",type(audio_padded), audio_padded.shape, len(audio_padded) ,sample_rate)
+    #features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+    features = self.feature_extractor.get_audio_features(audio=audio_padded, sample_rate=sample_rate)
     bpe, txt = self._get_transcription(seq_idx)
     targets = numpy.array(bpe, dtype="int32")
     raw = numpy.array(txt, dtype="object")
