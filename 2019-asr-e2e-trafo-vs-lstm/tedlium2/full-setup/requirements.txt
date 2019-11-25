@@ -1,6 +1,0 @@
-better_exchook
-numpy
-librosa
-pysoundfile
-h5py
-tensorflow-gpu
