@@ -71,7 +71,7 @@ def init_returnn(config_fn, args):
   :param str config_fn:
   :param args: arg_parse object
   """
-  rnn.initBetterExchook()
+  rnn.init_better_exchook()
   config_updates = {
     "log": [],
     "task": "eval",
@@ -88,7 +88,7 @@ def init_returnn(config_fn, args):
       })
 
   rnn.init(
-    configFilename=config_fn,
+    config_filename=config_fn,
     config_updates=config_updates, extra_greeting="RETURNN get-attention-weights starting up.")
   global config
   config = rnn.config

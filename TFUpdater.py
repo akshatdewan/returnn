@@ -1,6 +1,12 @@
 
+"""
+This module covers the optimizer (SGD, Adam, etc) logic,
+and model param update logic in general.
+"""
+
 from __future__ import print_function
 
+import typing
 import tensorflow as tf
 from tensorflow.python.training.optimizer import Optimizer
 from tensorflow.python.ops import resource_variable_ops
@@ -10,33 +16,59 @@ from TFNetwork import TFNetwork
 from TFUtil import tf_version_tuple, assert_min_tf_version, CustomUpdate, add_check_numerics_ops, \
   get_non_deterministic_ops_from_graph
 
-_OptimizerClassesDict = {}  # type: dict[str,()->Optimizer]
+_OptimizerClassesDictInitialized = False
+_OptimizerClassesDict = {}  # type: typing.Dict[str,typing.Callable[[],Optimizer]]
+
+
+def _init_optimizer_classes_dict():
+  global _OptimizerClassesDictInitialized
+  if _OptimizerClassesDictInitialized:
+    return
+  _OptimizerClassesDictInitialized = True
+  potential_list = list(vars(tf.train).items())
+  if tf_version_tuple() >= (1, 2, 0):
+    from tensorflow.contrib import opt
+    potential_list += list(vars(opt).items())
+  potential_list += list(globals().items())
+  for name, v in potential_list:
+    assert isinstance(name, str)
+    if v is Optimizer:
+      continue
+    if not isinstance(v, type) or not issubclass(v, Optimizer):
+      continue
+    register_optimizer_class(v, name=name)
+
+
+def register_optimizer_class(cls, name=None):
+  """
+  :param type[Optimizer] cls:
+  :param str|None name:
+  """
+  _init_optimizer_classes_dict()
+  assert issubclass(cls, Optimizer)
+  if not name:
+    name = cls.__name__
+  assert name.lower() not in _OptimizerClassesDict
+  _OptimizerClassesDict[name.lower()] = cls
+  if name.endswith("Optimizer"):
+    name = name[:-len("Optimizer")]
+    assert name.lower() not in _OptimizerClassesDict
+    _OptimizerClassesDict[name.lower()] = cls
 
 
 def get_optimizer_class(class_name):
   """
-  :param str class_name: e.g. "adam"
+  :param str|function|type[Optimizer] class_name: e.g. "adam"
   :return: the class
   :rtype: type[Optimizer]|()->Optimizer
   """
-  if not _OptimizerClassesDict:
-    potential_list = list(vars(tf.train).items())
-    if tf_version_tuple() >= (1, 2, 0):
-      from tensorflow.contrib import opt
-      potential_list += list(vars(opt).items())
-    potential_list += list(globals().items())
-    for name, v in potential_list:
-      assert isinstance(name, str)
-      if v is Optimizer:
-        continue
-      if not isinstance(v, type) or not issubclass(v, Optimizer):
-        continue
-      assert name.lower() not in _OptimizerClassesDict
-      _OptimizerClassesDict[name.lower()] = v
-      if name.endswith("Optimizer"):
-        name = name[:-len("Optimizer")]
-        assert name.lower() not in _OptimizerClassesDict
-        _OptimizerClassesDict[name.lower()] = v
+  _init_optimizer_classes_dict()
+  if callable(class_name):
+    class_name = class_name()
+  if isinstance(class_name, type):
+    assert issubclass(class_name, Optimizer)
+    return class_name
+  assert isinstance(class_name, str)
   return _OptimizerClassesDict[class_name.lower()]
 
 
@@ -89,7 +121,7 @@ class Updater(object):
     """
     self.config = config
     self.learning_rate_var = tf.Variable(name="learning_rate", initial_value=0.0, trainable=False, dtype="float32")
-    self.trainable_vars = []  # type: list[tf.Variable]
+    self.trainable_vars = []  # type: typing.List[tf.Variable]
     self.network = network
     self.use_locking = self.config.bool("optimizer_use_locking", False)
     self.initial_learning_rate = initial_learning_rate
@@ -100,11 +132,11 @@ class Updater(object):
     else:
       self.loss = network.get_objective()
       self.constraints = None
-    self.optimizer = None  # type: WrapOptimizer
-    self.optim_op = None  # type: tf.Operation
-    self.optim_meta_losses = None  # type: dict[str,tf.Tensor]
-    self.optimizer_vars = []  # type: list[tf.Variable]
-    self.optimizer_init_vars_op = None  # type: tf.Operation
+    self.optimizer = None  # type: typing.Optional[WrapOptimizer]
+    self.optim_op = None  # type: typing.Optional[tf.Operation]
+    self.optim_meta_losses_dict = None  # type: typing.Optional[typing.Dict[str,tf.Tensor]]
+    self.optimizer_vars = []  # type: typing.List[tf.Variable]
+    self.optimizer_init_vars_op = None  # type: typing.Optional[tf.Operation]
 
     # After graph was build: look if it only uses deterministic ops
     if self.config.is_true('deterministic_train'):
@@ -117,7 +149,7 @@ class Updater(object):
     Call this if sth is changed which the optim_op depends on.
     See self.create_optim_op().
     """
-    self.optim_op = None  # type: tf.Operation
+    self.optim_op = None  # type: typing.Optional[tf.Operation]
 
   def set_trainable_vars(self, trainable_vars):
     """
@@ -155,22 +187,28 @@ class Updater(object):
         lr *= factor
         opts.assert_all_read()
     if self.config.is_true("use_horovod") and self.config.is_true("horovod_scale_lr"):
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
       import horovod.tensorflow as hvd
       lr *= hvd.size()
     return lr
 
   def create_optim_op(self):
-    assert self.loss is not None
+    """
+    Creates the optimize TF op.
+
+    :return: nothing, will just set self.optim_op
+    """
+    assert isinstance(self.loss, tf.Tensor), "no loss defined?"
     assert self.trainable_vars, "no variables to update/optimize"
-    from TFUtil import SyntheticGradient
+    from TFUtil import MetaLosses
 
     # Keep track of all current available vars.
     # The optimizer could add some, even some which are not so-called "slot-vars",
     # and we want to keep track about them.
-    all_prev_existing_vars = tf.global_variables()  # type: list[tf.Variable]
+    all_prev_existing_vars = tf.global_variables()  # type: typing.List[tf.Variable]
 
     trainable_vars_for_gradients = list(self.trainable_vars)
-    trainable_vars_custom_update = []  # type: list[tf.Variable]
+    trainable_vars_custom_update = []  # type: typing.List[tf.Variable]
     for v in self.trainable_vars:
       if hasattr(v, "returnn_custom_update"):
         trainable_vars_custom_update.append(v)
@@ -185,17 +223,16 @@ class Updater(object):
       self.optimizer.create_all_needed_optimizers(trainable_vars_for_gradients)
 
     with tf.variable_scope("optimize"):
-      synthetic_gradient_scope = SyntheticGradient.enter_gradient_scope()
+      meta_losses_scope = MetaLosses.enter_gradient_scope()
       apply_grads = self.optimizer.get_apply_grads_op(self.loss, trainable_vars_for_gradients)
-      synthetic_gradient_scope.exit()
-      self.optim_meta_losses = synthetic_gradient_scope.as_fetch_dict()
-      if synthetic_gradient_scope.losses:
+      meta_losses_scope.exit()
+      self.optim_meta_losses_dict = meta_losses_scope.losses_as_fetch_dict()
+      if meta_losses_scope.losses:
         with tf.name_scope("meta_loss"):
-          meta_loss = tf.add_n(synthetic_gradient_scope.losses)
+          meta_loss = meta_losses_scope.summed_loss_for_optimization()
           meta_apply_grads = self.optimizer.get_apply_grads_op(meta_loss, trainable_vars_for_gradients)
         apply_grads = tf.group(apply_grads, meta_apply_grads)
-      incr_step_op = tf.assign_add(self.network.global_train_step, 1, name="global_train_step_increment")
-      self.optim_op = tf.group(apply_grads, incr_step_op, name="optim_and_step_incr")
+      self.optim_op = apply_grads
 
     if trainable_vars_custom_update:
       with tf.variable_scope("custom_update"):
@@ -288,6 +325,11 @@ class Updater(object):
     if self.config.bool("debug_add_check_numerics_ops", False):  # also see debug_add_check_numerics_on_output
       print("Adding checks for inf/nan.", file=log.v3)
       self.optim_op = tf.group(self.optim_op, add_check_numerics_ops([self.optim_op]))
+
+    # Do this at the very end.
+    with tf.control_dependencies([self.optim_op]):
+      incr_step_op = tf.assign_add(self.network.global_train_step, 1, name="global_train_step_increment")
+    self.optim_op = tf.group(self.optim_op, incr_step_op, name="optim_and_step_incr")
 
     if self.config.bool("debug_save_updater_vars", False):
       print("Save updater/optimizer vars:", file=log.v3)
@@ -394,6 +436,7 @@ class WrapOptimizer:
     optimizer_opts = updater_opts.get("optimizer", None)
     if not optimizer_opts:
       return self.get_default_optimizer_item(auto_create_new=auto_create_new)
+    assert isinstance(optimizer_opts, dict)
     return self._get_optimizer_item_for_opts(optimizer_opts, auto_create_new=auto_create_new)
 
   def _get_optimizer_item_for_opts(self, optimizer_opts, auto_create_new):
@@ -820,6 +863,7 @@ class WrapOptimizer:
 
     grads_and_vars = self._compute_gradients(loss, var_list=var_list)
     if self.config.is_true("use_horovod") and self.config.value("horovod_reduce_type", "") == "grad":
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
       import horovod.tensorflow as hvd
       grads_and_vars = [
         (hvd.allreduce(grad, average=self.config.is_true("horovod_avg_grad")) if grad is not None else None, var)
@@ -848,10 +892,12 @@ class WrapOptimizer:
     return tf.group(*all_apply_grads)
 
 
-class _BaseCustomOptimizer(Optimizer):
+class BaseCustomOptimizer(Optimizer):
   """
   Base class for our own optimizer implementations.
   This simplifies the interface to be implemented a bit from :class:`Optimizer`.
+  You just have to implement :func:`_apply` here.
+  See :class:`CustomGradientDescentOptimizer` or :class:`CustomAdamOptimizer` for as an example.
   """
 
   def __init__(self, learning_rate, use_locking=False, name=None):
@@ -866,7 +912,7 @@ class _BaseCustomOptimizer(Optimizer):
     """
     if name is None:
       name = self.__class__.__name__
-    super(_BaseCustomOptimizer, self).__init__(use_locking, name)
+    super(BaseCustomOptimizer, self).__init__(use_locking, name)
     self._learning_rate = learning_rate
 
   def _prepare(self):
@@ -900,6 +946,18 @@ class _BaseCustomOptimizer(Optimizer):
   def _apply_sparse(self, grad, var):
     return self._apply_sparse_duplicate_indices(grad=grad, var=var)
 
+  def _assign(self, ref, updates, indices=None):
+    if indices is not None:
+      if isinstance(ref, tf.Variable):
+        return tf.scatter_update(ref, indices, updates, use_locking=self._use_locking)
+      elif isinstance(ref, resource_variable_ops.ResourceVariable):
+        with tf.control_dependencies([resource_variable_ops.resource_scatter_update(ref.handle, indices, updates)]):
+          return ref.value()
+      else:
+        raise TypeError("did not expect type %r" % type(ref))
+    else:
+      return tf.assign(ref, updates, use_locking=self._use_locking)
+
   def _assign_add(self, ref, updates, indices=None):
     if indices is not None:
       if isinstance(ref, tf.Variable):
@@ -924,13 +982,21 @@ class _BaseCustomOptimizer(Optimizer):
     else:
       return tf.assign_sub(ref, updates, use_locking=self._use_locking)
 
+  # noinspection PyMethodMayBeStatic
   def _gather(self, dense, indices=None):
+    """
+    This is a simple helper to implement :func:`_apply`.
+
+    :param tf.Tensor dense:
+    :param tf.Tensor|None indices: if this is a sparse update, the indices of the grad values
+    :rtype: tf.Tensor
+    """
     if indices is not None:
       return tf.gather(dense, indices=indices)
     return dense
 
 
-class CustomGradientDescentOptimizer(_BaseCustomOptimizer):
+class CustomGradientDescentOptimizer(BaseCustomOptimizer):
   """
   Just an example implementation for simple gradient descent.
   """
@@ -964,7 +1030,7 @@ class NormalizedSGD(CustomGradientDescentOptimizer):
     return super(NormalizedSGD, self)._apply(grad=tf.nn.l2_normalize(grad, None), var=var, indices=indices)
 
 
-class NeuralOptimizer1(_BaseCustomOptimizer):
+class NeuralOptimizer1(BaseCustomOptimizer):
   """
   Via Neural Optimizer Search with Reinforcement Learning (http://proceedings.mlr.press/v70/bello17a/bello17a.pdf).
 
@@ -1012,7 +1078,7 @@ class NeuralOptimizer1(_BaseCustomOptimizer):
     return tf.group(*[var_update, m_t])
 
 
-class GradVarianceScaledOptimizer(_BaseCustomOptimizer):
+class GradVarianceScaledOptimizer(BaseCustomOptimizer):
   """
   Let m be the running average of g.
   Calculation of m: m_t <- beta1 * m_{t-1} + (1 - beta1) * g
@@ -1068,14 +1134,91 @@ class GradVarianceScaledOptimizer(_BaseCustomOptimizer):
       v_t = self._assign_add(v, updates=v_scaled_new_values, indices=indices)
     v_gathered = self._gather(v_t, indices=indices)
 
-    # update = lr * grad * v / (variance + eps)
     factor = v_gathered / (variance + epsilon_t)
-    # with tf.get_default_graph().colocate_with(None, True):
-    #   with tf.control_dependencies([tf.Print(factor, [tf.reduce_min(factor), tf.reduce_max(factor), tf.reduce_mean(factor)])]):
-    #     factor = tf.identity(factor)
     update = lr * grad * tf.minimum(factor, 1.0)
     var_update = self._assign_sub(ref=var, updates=update, indices=indices)
     return tf.group(*[var_update, m_t])
+
+
+class CustomAdamOptimizer(BaseCustomOptimizer):
+  """
+  Reimplementation of Adam.
+  See also :class:`tf.train.AdamOptimizer`.
+
+  ```
+  t <- t + 1
+  lr_t <- learning_rate * sqrt(1 - beta2^t) / (1 - beta1^t)
+
+  m_t <- beta1 * m_{t-1} + (1 - beta1) * g
+  v_t <- beta2 * v_{t-1} + (1 - beta2) * g * g
+  variable <- variable - lr_t * m_t / (sqrt(v_t) + epsilon)
+  ```
+  """
+
+  def __init__(self, beta1=0.9, beta2=0.999, epsilon=1e-8, **kwargs):
+    """
+    :param float beta1: used for the running average of g (m)
+    :param float beta2: used for the running average of g*g (v)
+    :param float epsilon:
+    """
+    super(CustomAdamOptimizer, self).__init__(**kwargs)
+    self._beta1 = beta1
+    self._beta2 = beta2
+    self._epsilon = epsilon
+
+  def _prepare(self):
+    super(CustomAdamOptimizer, self)._prepare()
+    self._beta1_t = tf.convert_to_tensor(self._beta1, name="beta1")
+    self._beta2_t = tf.convert_to_tensor(self._beta2, name="beta2")
+    self._epsilon_t = tf.convert_to_tensor(self._epsilon, name="epsilon")
+
+  def _create_slots(self, var_list):
+    first_var = min(var_list, key=lambda x: x.name)
+    self._beta1_power = tf.Variable(
+      initial_value=self._beta1, name="beta1_power")
+    self._beta2_power = tf.Variable(
+      initial_value=self._beta2, name="beta2_power")
+    for v in var_list:
+      self._zeros_slot(v, "m", self._name)
+      self._zeros_slot(v, "v", self._name)
+
+  def _apply(self, grad, var, indices=None):
+    """
+    :param tf.Tensor grad:
+    :param tf.Variable|resource_variable_ops.ResourceVariable var:
+    :param tf.Tensor|None indices: if this is a sparse update, the indices of the grad values
+    :return: update
+    :rtype: tf.Tensor|tf.Operation
+    """
+    lr = tf.cast(self._learning_rate_tensor, var.dtype.base_dtype)
+    beta1_t = tf.cast(self._beta1_t, var.dtype.base_dtype)
+    beta2_t = tf.cast(self._beta2_t, var.dtype.base_dtype)
+    epsilon_t = tf.cast(self._epsilon_t, var.dtype.base_dtype)
+    m = self.get_slot(var, "m")
+    v = self.get_slot(var, "v")
+
+    # lr_t <- learning_rate * sqrt(1 - beta2^t) / (1 - beta1^t)
+    lr *= tf.sqrt(1. - self._beta2_power) / (1. - self._beta1_power)
+
+    # m_t <- beta1 * m_{t-1} + (1 - beta1) * g
+    # v_t <- beta2 * v_{t-1} + (1 - beta2) * g * g
+    m = self._assign(
+      m, updates=beta1_t * self._gather(m, indices) + (1. - beta1_t) * grad, indices=indices)
+    v = self._assign(
+      v, updates=beta2_t * self._gather(v, indices) + (1. - beta2_t) * (grad * grad), indices=indices)
+
+    # variable <- variable - lr_t * m_t / (sqrt(v_t) + epsilon)
+    update = lr * (self._gather(m, indices) / (tf.sqrt(self._gather(v, indices)) + epsilon_t))
+    var_update = self._assign_sub(ref=var, updates=update, indices=indices)
+    return tf.group(*[var_update, m, v])
+
+  def _finish(self, update_ops, name_scope):
+    with tf.control_dependencies(update_ops), tf.colocate_with(self._beta1_power):
+      update_beta1 = self._beta1_power.assign(
+        self._beta1_power * self._beta1_t, use_locking=self._use_locking)
+      update_beta2 = self._beta2_power.assign(
+        self._beta2_power * self._beta2_t, use_locking=self._use_locking)
+    return tf.group(*update_ops + [update_beta1, update_beta2], name=name_scope)
 
 
 class AMSGradOptimizer(tf.train.Optimizer):
@@ -1086,8 +1229,9 @@ class AMSGradOptimizer(tf.train.Optimizer):
   http://ruder.io/deep-learning-optimization-2017/index.html#fixingtheexponentialmovingaverage
   https://github.com/taki0112/AMSGrad-Tensorflow
   """
-  def __init__(self, learning_rate=0.001, decay=False, beta1=0.9, beta2=0.99,
-               epsilon=0.0, var_list=[]):
+
+  def __init__(self, learning_rate=0.001, decay=False, beta1=0.9, beta2=0.99, epsilon=0.0, var_list=()):
+    super(AMSGradOptimizer, self).__init__(name="AMSGradOptimizer", use_locking=False)
     self.learning_rate = learning_rate
     self.decay = decay
     self.beta1 = beta1
@@ -1105,7 +1249,12 @@ class AMSGradOptimizer(tf.train.Optimizer):
       self.v[var] = tf.Variable(tf.zeros(tf.shape(var.initial_value)), trainable=False)
       self.v_hat[var] = tf.Variable(tf.zeros(tf.shape(var.initial_value)), trainable=False)
 
+  # noinspection PyMethodOverriding
   def apply_gradients(self, gradient_variables):
+    """
+    :param list[(tf.Tensor,tf.Variable)] gradient_variables:
+    :rtype: tf.Operation
+    """
     with tf.control_dependencies([self.t.assign_add(1.0)]):
       learning_rate = self.learning_rate
       if self.decay:
@@ -1121,3 +1270,15 @@ class AMSGradOptimizer(tf.train.Optimizer):
         update_ops.append(var.assign_add(update))
 
       return tf.group(*update_ops)
+
+  def _apply_dense(self, grad, var):
+    raise NotImplementedError
+
+  def _resource_apply_dense(self, grad, handle):
+    raise NotImplementedError
+
+  def _resource_apply_sparse(self, grad, handle, indices):
+    raise NotImplementedError
+
+  def _apply_sparse(self, grad, var):
+    raise NotImplementedError

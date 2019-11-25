@@ -38,9 +38,8 @@ class CachedDataset(Dataset):
     self.alloc_intervals = None  # type: list
     self._seq_start = []  # [numpy.array([0,0])]  # uses sorted seq idx, see set_batching()
     self._seq_index = []; """ :type: list[int] """  # Via init_seq_order(). seq_index idx -> hdf seq idx
+    self._seq_index_inv = {}; """ :type: dict[int,int] """  # Via init_seq_order(). hdf seq idx -> seq_index idx
     self._index_map = range(len(self._seq_index))  # sorted seq idx -> seq_index idx
-    self._seq_lengths = numpy.zeros((0, 0))  # real seq idx -> tuple of len of data and all targets
-    self._tags = []; """ :type: list[str|bytes] """  # uses real seq idx. access via _get_tag_by_real_idx
     self._tag_idx = {}; ":type: dict[str,int] "  # map of tag -> real-seq-idx. call _update_tag_idx
     self.targets = {}
     self.target_keys = []
@@ -72,7 +71,7 @@ class CachedDataset(Dataset):
       self._update_tag_idx()
       seq_index = [self._tag_idx[tag] for tag in seq_list]
     else:
-      seq_index = self.get_seq_order_for_epoch(epoch, self._num_seqs, lambda s: self._seq_lengths[s][0])
+      seq_index = self.get_seq_order_for_epoch(epoch, self._num_seqs, lambda s: self._get_seq_length_by_real_idx(s)[0])
 
     old_index_map = self._index_map[:]
     self._index_map = range(len(seq_index))  # sorted seq idx -> seq_index idx
@@ -84,21 +83,29 @@ class CachedDataset(Dataset):
       # Give some hint to the user in case he is wondering why the cache is reloading.
       print("Reinitialize dataset seq order for epoch %i." % epoch, file=log.v4)
 
-    if self.num_seqs_cached_at_start != len(seq_index) or not self.start_cache_initialized:
+    if (self.cache_byte_size_limit_at_start == 0
+        or self.num_seqs_cached_at_start != len(seq_index)
+        or not self.start_cache_initialized):
       self._seq_index = seq_index
-      self._seq_index_inv = dict(zip(seq_index, range(len(seq_index))))  # hdf seq idx -> seq_index idx
+      self._seq_index_inv = {}  # reset, create later if needed
       self._init_seq_starts()
       self._init_alloc_intervals()
       self._init_start_cache()
       self.start_cache_initialized = True
     else:
+      if not self._seq_index_inv:
+        self._seq_index_inv = dict(zip(self._seq_index, range(len(self._seq_index))))  # hdf seq idx -> seq_index idx
       self._index_map = [self._seq_index_inv[i] for i in seq_index]  # sorted seq idx -> seq_index idx
       if self._index_map == old_index_map:
         return False
     return True
 
+  def get_current_seq_order(self):
+    assert self.cache_byte_size_limit_at_start == 0  # not implemented otherwise, we ignore _index_map
+    return self._seq_index
+
   def _get_tag_by_real_idx(self, real_idx):
-    return self._tags[real_idx]
+    raise NotImplementedError
 
   def _update_tag_idx(self):
     if self._tag_idx:
@@ -129,7 +136,7 @@ class CachedDataset(Dataset):
     self._seq_start = [self._seq_start[0] * 0]  # idx like in seq_index, *not* real idx
     for i in range(self.num_seqs):
       ids = self._seq_index[i]
-      self._seq_start.append(self._seq_start[-1] + self._seq_lengths[ids])
+      self._seq_start.append(self._seq_start[-1] + self._get_seq_length_by_real_idx(ids))
 
   def _init_start_cache(self):
     if self.cache_byte_size_limit_at_start == 0:
@@ -143,7 +150,7 @@ class CachedDataset(Dataset):
     cached_bytes = 0
     for i in range(self.num_seqs):
       if i == num_cached:
-        nbytes = self.get_seq_length_2d(i)[0] * self.nbytes
+        nbytes = self.get_seq_length_nd(i)[0] * self.nbytes
         if self.cache_byte_size_limit_at_start >= cached_bytes + nbytes:
           num_cached = i + 1
           cached_bytes += nbytes
@@ -199,7 +206,7 @@ class CachedDataset(Dataset):
       gc.collect()
       # Preload as much as we can so that we fill up the cache.
       while end < self.num_seqs:
-        num_needed_cache_frames = self.get_seq_length_2d(end)[0]
+        num_needed_cache_frames = self.get_seq_length_nd(end)[0]
         if self.cache_num_frames_free - num_needed_cache_frames < 0:
           break
         self.cache_num_frames_free -= num_needed_cache_frames
@@ -416,7 +423,7 @@ class CachedDataset(Dataset):
       if ai[1] > self.num_seqs_cached_at_start and ai[0] < ai[1]:
         removed = self.remove_alloc_interval(max(ai[0],self.num_seqs_cached_at_start), ai[1])
         self.preload_set -= set(removed)
-        deleted += sum([self._seq_lengths[self._seq_index[i]][0] for i in removed])
+        deleted += sum([self._get_seq_length_by_real_idx(self._seq_index[i])[0] for i in removed])
       else:
         i += 1
     return deleted
@@ -446,19 +453,27 @@ class CachedDataset(Dataset):
       return True
     return set(range(start,end)) <= self.preload_set
 
-  def get_seq_length_2d(self, sorted_seq_idx):
+  def _get_seq_length_by_real_idx(self, real_seq_idx):
+    """
+    :param int real_seq_idx:
+    :returns length of the sequence with index 'real_seq_idx'
+    :rtype: numpy.ndarray
+    """
+    raise NotImplementedError
+
+  def get_seq_length_nd(self, sorted_seq_idx):
     """
     :type sorted_seq_idx: int
-    :rtype: (int,int)
+    :rtype: numpy.ndarray
     """
     real_seq_idx = self._seq_index[self._index_map[sorted_seq_idx]]
-    return self._seq_lengths[real_seq_idx]
+    return self._get_seq_length_by_real_idx(real_seq_idx)
 
   def get_seq_length(self, seq_idx):
     """
     :rtype: NumbersDict
     """
-    lengths = self.get_seq_length_2d(seq_idx)
+    lengths = self.get_seq_length_nd(seq_idx)
     d = {"data": lengths[0]}
     for k, l in zip(self.target_keys, lengths[1:]):
       d[k] = l
@@ -473,7 +488,7 @@ class CachedDataset(Dataset):
 
   def get_times(self, sorted_seq_idx):
     seq_start = self.get_seq_start(sorted_seq_idx)[0]
-    seq_len = self.get_seq_length_2d(sorted_seq_idx)[0]
+    seq_len = self.get_seq_length_nd(sorted_seq_idx)[0]
     return self.timestamps[seq_start:seq_start + seq_len]
 
   def get_input_data(self, sorted_seq_idx):
@@ -483,7 +498,7 @@ class CachedDataset(Dataset):
     alloc_start_seq, alloc_end_seq, alloc_data = self.alloc_intervals[idi]
     o = self.get_seq_start(seq_idx)[0] - self.get_seq_start(alloc_start_seq)[0]
     assert o >= 0
-    l = self.get_seq_length_2d(sorted_seq_idx)[0]
+    l = self.get_seq_length_nd(sorted_seq_idx)[0]
     assert alloc_data.shape[0] >= o + l
     return alloc_data[o:o + l]
 
@@ -496,7 +511,7 @@ class CachedDataset(Dataset):
     seq_idx = self._index_map[sorted_seq_idx]
     idx = self.target_keys.index(target) + 1
     seq_start = self.get_seq_start(seq_idx)[idx]
-    seq_len = self.get_seq_length_2d(sorted_seq_idx)[idx]
+    seq_len = self.get_seq_length_nd(sorted_seq_idx)[idx]
     return self.targets[target][seq_start:seq_start + seq_len]
 
   def get_target_list(self):
@@ -521,6 +536,4 @@ class CachedDataset(Dataset):
     :return: the sequence index as-is in the original corpus. only defined if self.have_corpus_seq_idx()
     :rtype: int
     """
-    if self.seq_ordering == "default":
-      return seq_idx
     return self._seq_index[self._index_map[seq_idx]]

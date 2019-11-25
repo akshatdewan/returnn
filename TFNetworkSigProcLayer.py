@@ -147,7 +147,7 @@ class ComplexToAlternatingRealLayer(_ConcatInputLayer):
     self.output.placeholder = _interleaveVectors(real_value, imag_value)
     self.output.size_placeholder = {0: self.input_data.size_placeholder[self.input_data.time_dim_axis_excluding_batch]}
 
-    
+
 class MaskBasedGevBeamformingLayer(LayerBase):
   """
   This layer applies GEV beamforming to a multichannel signal. The different
@@ -403,8 +403,9 @@ class MultiChannelMultiResolutionStftLayer(_ConcatInputLayer):
     return input_placeholder.shape[2]
 
   def _apply_stft_to_input(self):
+    from TFUtil import get_shape
     def _cropStftOutputToReferenceFrameSizeLength(channel_concatenated_stft, crop_size):
-      return tf.slice(channel_concatenated_stft, [0, 0, 0], [tf.shape(channel_concatenated_stft)[0], crop_size, tf.shape(channel_concatenated_stft)[2]])
+      return tf.slice(channel_concatenated_stft, [0, 0, 0], [get_shape(channel_concatenated_stft)[0], crop_size, get_shape(channel_concatenated_stft)[2]])
 
     input_placeholder = self.input_data.get_placeholder_as_batch_major()
     channel_wise_stft_res_list = list()
@@ -421,10 +422,10 @@ class MultiChannelMultiResolutionStftLayer(_ConcatInputLayer):
         return window
       def _padTimeSignal(input_placeholder, frame_size):
         if frame_size > self._reference_frame_size:
-          return tf.concat([input_signal, tf.ones([tf.shape(input_signal)[0], frame_size-self._reference_frame_size, tf.shape(input_signal)[2]])*1e-7], axis=1)
+          return tf.concat([input_signal, tf.ones([get_shape(input_signal)[0], frame_size-self._reference_frame_size, get_shape(input_signal)[2]])*1e-7], axis=1)
         else:
           return input_placeholder
-    
+
       input_signal = _padTimeSignal(input_placeholder, frame_size)
       if self._use_rfft:
         channel_wise_stft = tf.contrib.signal.stft(
@@ -441,7 +442,7 @@ class MultiChannelMultiResolutionStftLayer(_ConcatInputLayer):
         concat_feature_dim = channel_wise_stft.shape[2] * channel_wise_stft.shape[3]
         channel_concatenated_stft = tf.reshape(channel_wise_stft, (batch_dim, time_dim, concat_feature_dim))
         if channel_wise_stft_res_list:
-          channel_concatenated_stft = _cropStftOutputToReferenceFrameSizeLength(channel_concatenated_stft, tf.shape(channel_wise_stft_res_list[0])[1])
+          channel_concatenated_stft = _cropStftOutputToReferenceFrameSizeLength(channel_concatenated_stft, get_shape(channel_wise_stft_res_list[0])[1])
         channel_wise_stft_res_list.append(channel_concatenated_stft)
     output_placeholder = tf.concat(channel_wise_stft_res_list, axis=2)
     return output_placeholder
@@ -460,7 +461,9 @@ class MultiChannelMultiResolutionStftLayer(_ConcatInputLayer):
     n_out = np.sum([cls._get_n_out_by_fft_config(fft_size, use_rfft, nr_of_channels) for fft_size in fft_sizes])
     if 'n_out' not in kwargs:
       kwargs['n_out'] = n_out
-    return super(MultiChannelMultiResolutionStftLayer, cls).get_out_data_from_opts(**kwargs)
+    return (super(MultiChannelMultiResolutionStftLayer, cls)
+            .get_out_data_from_opts(**kwargs)
+            .copy_template(dtype="complex64"))
 
 
 class MultiChannelStftLayer(MultiChannelMultiResolutionStftLayer):
@@ -472,7 +475,7 @@ class MultiChannelStftLayer(MultiChannelMultiResolutionStftLayer):
 
   def __init__(self, frame_shift, frame_size, fft_size, window="hanning", use_rfft=True, nr_of_channels=1, pad_last_frame=False, **kwargs):
     kwargs['frame_shift'] = frame_shift
-    kwargs['window'] = window 
+    kwargs['window'] = window
     kwargs['use_rfft'] = use_rfft
     kwargs['nr_of_channels'] = nr_of_channels
     kwargs['pad_last_frame'] = pad_last_frame
@@ -480,7 +483,9 @@ class MultiChannelStftLayer(MultiChannelMultiResolutionStftLayer):
 
   @classmethod
   def get_out_data_from_opts(cls, fft_size, use_rfft=True, nr_of_channels=1, **kwargs):
-    return super(MultiChannelStftLayer, cls).get_out_data_from_opts(fft_sizes=[fft_size], use_rfft=use_rfft, nr_of_channels=nr_of_channels, **kwargs)
+    return (super(MultiChannelStftLayer, cls)
+            .get_out_data_from_opts(fft_sizes=[fft_size], use_rfft=use_rfft, nr_of_channels=nr_of_channels, **kwargs)
+            .copy_template(dtype="complex64"))
 
 
 class NoiseEstimationByFirstTFramesLayer(_ConcatInputLayer):

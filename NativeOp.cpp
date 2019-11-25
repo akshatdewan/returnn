@@ -4,23 +4,135 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <typeinfo>
 #include <string.h>
 #include <vector>
+#include <cmath>
+
 
 #define ARRAY_LEN(x) (sizeof(x) / sizeof(x[0]))
-
-
-#define assert_cmp(a, cmp, b) \
-    if(!((a) cmp (b))) { \
-        std::cerr << "Assertion failed: " << a << " " << #cmp << " " << b << std::endl; \
-        assert((a) cmp (b)); \
-    }
-
-
 
 #ifndef TENSORFLOW
 #define TENSORFLOW 0
 #endif
+
+#ifndef _ns
+#define _ns
+#endif
+
+#if CUDA
+#define DEF_KERNEL __global__
+#define DEV_FUNC __device__
+#define HOST_FUNC __host__
+#else
+#define DEF_KERNEL
+#define DEV_FUNC
+#define HOST_FUNC
+#endif
+
+#ifdef isinf
+#undef isinf
+#endif
+#ifdef isnan
+#undef isnan
+#endif
+
+
+#define assert_cmp(a, cmp, b) \
+    if(!((a) cmp (b))) { \
+        printf("Assertion failed: "); \
+        printf(_ns::_format_for_type(a), a); \
+        printf(" " #cmp " "); \
+        printf(_ns::_format_for_type(b), b); \
+        printf("\n"); \
+        assert((a) cmp (b)); \
+    }
+
+
+template<typename T> DEV_FUNC HOST_FUNC const char* _format_for_type(const T&) {
+    printf("ERROR: _format_for_type(%s) not implemented, aborting\n", typeid(T).name());
+    abort();
+}
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const char&) { return "%c"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const unsigned char&) { return "%u"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const short&) { return "%hi"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const unsigned short&) { return "%hu"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const int&) { return "%i"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const unsigned int&) { return "%u"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const long&) { return "%li"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const unsigned long&) { return "%lu"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const long long&) { return "%lli"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const unsigned long long&) { return "%llu"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const float&) { return "%f"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const double&) { return "%f"; }
+template<> DEV_FUNC HOST_FUNC const char* _format_for_type(const long double&) { return "%Lf"; }
+
+
+
+#if CUDA
+#define elem_atomic_add(x, v) atomicAdd(x, v)
+#define elem_atomic_min(x, v) atomicMin(x, v)
+#define elem_atomic_cas(a, c, v) atomicCAS(a, c, v)
+
+#define int_as_float __int_as_float
+#define float_as_int __float_as_int
+
+#define INF_F CUDART_INF_F
+#define NAN_F CUDART_NAN_F
+
+#else  // no CUDA
+
+#define elem_atomic_add(x, v) (*x += v)  // ignore atomic for now...
+#define elem_atomic_min(x, v) (*x = (v < *x) ? v : *x)  // ignore atomic for now...
+
+#define elem_atomic_cas _host_elem_atomic_cas
+template<typename T>
+static inline T _host_elem_atomic_cas(T* address, T compare, T val) {
+    T old = *address;
+    if(old == compare)
+        *address = val;
+    return old;
+}
+
+#define int_as_float _host_int_as_float
+static inline float _host_int_as_float(int x) {
+    union {
+      int i;
+      float f;
+    } u;
+    u.i = x;
+    return u.f;
+}
+
+#define float_as_int _host_float_as_int
+static inline int _host_float_as_int(float x) {
+    union {
+      int i;
+      float f;
+    } u;
+    u.f = x;
+    return u.i;
+}
+
+#define INF_F int_as_float(0x7f800000)
+#define NAN_F int_as_float(0x7fffffff)
+
+#endif
+
+
+
+#if !GOOGLE_CUDA
+// GOOGLE_CUDA is defined <=> CUDA headers are included
+// CUDA headers define all the math functions, also for host code.
+// I.e., here, we don't have the math functions.
+
+// Now, for isnan/isinf, we might have another problem with name collisions in some cases,
+// see here: https://bugs.webkit.org/show_bug.cgi?id=59249
+// Thus, we define it as a macro instead.
+#define isnan std::isnan
+#define isinf std::isinf
+#endif
+
 
 /*
 Reference: https://en.wikipedia.org/wiki/Row-_and_column-major_order
@@ -140,6 +252,7 @@ static perftools::gputools::blas::Transpose get_transpose(char t) {
         return perftools::gputools::blas::Transpose::kNoTranspose;
     default:
         assert("invalid transpose option" || 0);
+        return perftools::gputools::blas::Transpose::kNoTranspose;
     }
 }
 #endif  // GOOGLE_CUDA
@@ -321,7 +434,6 @@ static void tf_cuda_sgemm_batched(
 
 #if CUDA
 
-#define elem_atomic_add(x, v) atomicAdd(x, v)
 
 #if TENSORFLOW
 // Ndarray and friends already declared above, they are same for CUDA and non-CUDA
@@ -380,10 +492,13 @@ typedef Ndarray_DIM_Type const* Ndarray_DIMS_Type;
 #define DIM_GRID 128
 #define DIM_BLOCK 512
 
-#define DEF_KERNEL __global__
 // <<<DimGrid,DimBlock,ShmemSize|0,Stream|0>>>. http://docs.nvidia.com/cuda/cuda-c-programming-guide/#execution-configuration
 #define start_dev_kernel(kernel, args) \
 	(kernel<<<DIM_GRID,DIM_BLOCK,0,CUDA_CUR_STREAM>>>  args);
+#define start_dev_kernel2(kernel, dim_grid, dim_block, shared_size, args) \
+	(kernel<<<dim_grid,dim_block,shared_size,CUDA_CUR_STREAM>>>  args);
+
+#define DEF_SHARED(type, name) extern __shared__ type name[];
 
 static const char *_cudaGetErrorEnum(cublasStatus_t error) {
 	switch (error) {
@@ -434,7 +549,6 @@ static void _cudaHandleError(cublasStatus_t status, const char *file, int line) 
 
 #else   // not CUDA
 
-#define elem_atomic_add(x, v) (*x += v)  // ignore atomic for now...
 
 #if !TENSORFLOW
 // Numpy, see: http://docs.scipy.org/doc/numpy/reference/c-api.array.html
@@ -472,21 +586,39 @@ typedef Ndarray_DIM_Type const* Ndarray_DIMS_Type;
 		sgemm_(&transa, &transb, \
 			&m_, &n_, &k_, alpha, (float*) A, &lda_, (float*) B, &ldb_, beta, C, &ldc_); \
 	}
+
+static inline void* device_malloc(size_t size) { return malloc(size); }
+static inline void device_free(void* ptr) { free(ptr); }
 #endif
+
+#define HANDLE_LAST_ERROR() (0)
 
 #define Ndarray_memcpy(y, x, size) (memcpy(y, x, size))
 #define Ndarray_memset(s, c, size) (memset(s, c, size))
 
-#define DEF_KERNEL
+#define DEF_SHARED(type, name) assert_cmp(_shared_size, >, 0); std::vector<type> name(_shared_size / sizeof(type));
+
+
+// Call without dim assumes that the kernel is written in a way that it works correct with any dim.
 #define start_dev_kernel(kernel, args) \
 	{ for(_KernelLoop loop; !loop.finished(); loop.next()) { kernel args; } }
+// This call assumes that the dims are important.
+#define start_dev_kernel2(kernel, dim_grid, dim_block, shared_size, args) \
+	{ for(_KernelLoop loop(dim_grid, dim_block, shared_size); !loop.finished(); loop.next()) { kernel args; } }
 
 struct _int3 {
     int x, y, z;
+    _int3(int _x=1, int _y=1, int _z=1) : x(_x), y(_y), z(_z) {}
 };
 
 struct _uint3 {
+    /*
+    Like CUDA dim3.
+    This type is an integer vector type based on uint3 that is used to specify dimensions.
+    When defining a variable of type dim3, any component left unspecified is initialized to 1.
+    */
     unsigned int x, y, z;
+    _uint3(unsigned int _x=1, unsigned int _y=1, unsigned int _z=1) : x(_x), y(_y), z(_z) {}
 };
 
 template<typename T>
@@ -494,10 +626,15 @@ static void resetVec3(T& v) {
     v.x = v.y = v.z = 0;
 }
 
-static _uint3 _threadIdx;
-static _uint3 _blockIdx;
-static _int3 _blockDim;
-static _int3 _gridDim;
+#if __cplusplus <= 199711L
+#define thread_local static
+#endif
+
+thread_local size_t _shared_size;
+thread_local _uint3 _threadIdx;
+thread_local _uint3 _blockIdx;
+thread_local _int3 _blockDim;
+thread_local _int3 _gridDim;
 // We need those as macros to not infer with the CUDA versions if CUDA was also included.
 #define threadIdx _threadIdx
 #define blockIdx _blockIdx
@@ -505,22 +642,28 @@ static _int3 _gridDim;
 #define gridDim _gridDim
 
 struct _KernelLoop {
-	_KernelLoop() {
+	_KernelLoop(unsigned int dim_grid = 1, unsigned int dim_block = 1, size_t shared_size = 0) {
+	    _shared_size = shared_size;
+	    if(shared_size > 0)
+	        assert_cmp(dim_block, ==, 1); // otherwise not supported currently, see DEF_SHARED
 		// When we can choose whatever we want here, this loops becomes trivial,
 		// there will only be one iteration.
-		resetVec3(gridDim); gridDim.x = 1;
-		resetVec3(blockDim); blockDim.x = 1;
-		resetVec3(threadIdx);
+		resetVec3(gridDim); gridDim.x = dim_grid; // numBlocks
+		resetVec3(blockDim); blockDim.x = dim_block; // threadsPerBlock
 		resetVec3(blockIdx);
+		resetVec3(threadIdx);
 	}
 	bool finished() {
-		// TODO: Also block idx but doesn't matter with the constants above.
-		// TODO: Also y/z but doesn't matter with the constants above.
-		return threadIdx.x >= blockDim.x;
+		// TODO: y/z
+		return blockIdx.x >= gridDim.x;
 	}
 	void next() {
-		// TODO: Also blockIdx and y/z, but doesn't matter with the constants above.
+		// TODO: y/z
 		threadIdx.x++;
+		if(threadIdx.x == blockDim.x) {
+		    threadIdx.x = 0;
+		    blockIdx.x++;
+		}
 	}
 };
 
@@ -797,9 +940,9 @@ void check_inf_or_nan_cpu(tensorflow::Tensor* v, const std::string& name) {
     int fp_props =
         std::accumulate(data, data + size, 0, [](const int& x, const T& y) {
           int result = x;
-          if (Eigen::numext::isinf(y)) {
+          if (isinf(y)) {
             result |= kInfBit;
-          } else if (Eigen::numext::isnan(y)) {
+          } else if (isnan(y)) {
             result |= kNaNBit;
           }
           return result;

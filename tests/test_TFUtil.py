@@ -3,9 +3,12 @@
 
 from __future__ import print_function
 
-
+import os
+#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
 import logging
 logging.getLogger('tensorflow').disabled = True
+#logging.getLogger("tensorflow").setLevel(logging.INFO)
+
 import tensorflow as tf
 import sys
 sys.path += ["."]  # Python 3 hack
@@ -55,6 +58,12 @@ def test_Data_dim():
   assert_equal(data.sparse, False)
 
 
+def test_Data_default_time_no_time():
+  # This is new behavior.
+  data = Data(name='merge_dims_test_output', shape=(3, 5))
+  assert data.time_dim_axis is None and data.feature_dim_axis == 2
+
+
 def test_Data_copy_time_major():
   data = Data(name="my_data", dim=13)
   assert_equal(data.batch_dim_axis, 0)
@@ -79,6 +88,16 @@ def test_Data_copy_batch_major():
   assert_equal(data2.time_dim_axis, 1)
   assert_equal(data2.feature_dim_axis, 2)
   assert_equal(data2.batch_ndim, 3)
+
+
+def test_Data_copy_as_batch_major_no_extra_feat():
+  data = Data(name='att_weights_output', shape=(None,), batch_dim_axis=1)
+  print("data", data, "feat axis:", data.feature_dim_axis_or_unspecified, data.feature_dim_axis)
+  assert_equal(data.time_dim_axis, 0)
+  data2 = data.copy_as_batch_major()
+  assert_equal(data2.batch_dim_axis, 0)
+  assert_equal(data2.time_dim_axis, 1)
+  # No check for feature_dim_axis, as this behavior does not matter here.
 
 
 def test_Data_spatial_batch_axes():
@@ -132,6 +151,34 @@ def test_Data_copy_template_adding_time_dim_no_feature():
   # assert d2.feature_dim_axis is None  # not sure what we would want here...
 
 
+def test_Data_copy_template_adding_time_dim_no_batch():
+  d1 = Data(name="d1", shape=(), dtype='int32', batch_dim_axis=None, time_dim_axis=None)
+  assert d1.batch_dim_axis is None and d1.batch_shape == ()
+  assert d1.feature_dim_axis is None
+  d2 = d1.copy_template_adding_time_dim()
+  assert d2.batch_dim_axis is None and d2.time_dim_axis == 0 and d2.batch_shape == (None,)
+
+
+def test_Data_get_axes_from_description_except_time_ext():
+  data = Data(name='merge_dims_test_output', shape=(3, None, 5), time_dim_axis=2)
+  axes = data.get_axes_from_description("except_time")
+  assert axes == [1, 3], "data %r 'except_time' axes %r unexpected" % (data, axes)
+
+
+def test_Data_get_axes_from_description_except_time_no_time():
+  data = Data(name='merge_dims_test_output', shape=(3, 5))
+  assert data.time_dim_axis is None
+  axes = data.get_axes_from_description("except_time")
+  assert axes == [1, 2], "data %r 'except_time' axes %r unexpected" % (data, axes)
+
+
+def test_Data_copy_template_excluding_time_dim_two_time_dims():
+  data = Data(name='ref_att_weights_output', shape=(None, None, 1), auto_create_placeholders=True)
+  assert set(data.size_placeholder.keys()) == {0, 1}
+  data_wo_time = data.copy_template_excluding_time_dim()
+  assert data_wo_time.shape == (None, 1) and data_wo_time.have_time_axis()
+
+
 def test_Data_time_no_feature():
   d1 = Data(name="d1", shape=(None,), batch_dim_axis=0, time_dim_axis=1, dim=None)
   assert d1.time_dim_axis == 1
@@ -141,6 +188,13 @@ def test_Data_unknown_feature_no_time():
   d1 = Data(name="d1", shape=(None,), batch_dim_axis=0, time_dim_axis=None, dim=None)
   assert d1.batch_dim_axis == 0 and d1.time_dim_axis is None and d1.feature_dim_axis == 1
   assert d1.batch_shape == (None, None)
+
+
+def test_Data_time_end():
+  data = Data(name='att_weights_output', shape=(1, None), time_dim_axis=2)
+  print("data:", data, "feature axis:", data.feature_dim_axis)
+  assert data.shape == (1, None) and data.batch_dim_axis == 0 and data.time_dim_axis == 2
+  # No test for feature axis, as it does not really matter.
 
 
 def test_Data_copy_with_feature_dim_axis_case_1():
@@ -259,6 +313,32 @@ def test_Data_copy_template_excluding_spatial_dim():
   assert rem_enc_time.shape == (None, 1) and rem_enc_time.batch_dim_axis == 1
 
 
+def test_Data_copy_template_excluding_axis():
+  data = Data(name="data", shape=(None, 8), batch_dim_axis=0, time_dim_axis=1, feature_dim_axis=2)
+  data_wo_batch = data.copy_template_excluding_axis(data.batch_dim_axis)
+  assert data_wo_batch.shape == (None, 8) and data_wo_batch.feature_dim_axis == 1 and data_wo_batch.time_dim_axis == 0
+  data_wo_time = data.copy_template_excluding_axis(data.time_dim_axis)
+  assert data_wo_time.shape == (8,) and data_wo_time.feature_dim_axis == 1 and data_wo_time.batch_dim_axis == 0
+  data_wo_feature = data.copy_template_excluding_axis(data.feature_dim_axis)
+  assert data_wo_feature.shape == (None,) and data_wo_feature.time_dim_axis == 1 and data_wo_feature.batch_dim_axis == 0
+
+
+def test_Data_copy_squeeze_axes():
+  weights = Data(name='att_weights_output', shape=(1, None), time_dim_axis=2, auto_create_placeholders=True)
+  squeezed = weights.copy_squeeze_axes([1])
+  print("orig:", weights, "squeezed:", squeezed)
+  assert squeezed.shape == (None,) and squeezed.time_dim_axis == 1
+  assert weights.size_placeholder[1] is squeezed.size_placeholder[0]
+
+
+def test_Data_copy_squeeze_axes_feature_axis():
+  weights = Data(name='att_weights_output', shape=(None, 1), auto_create_placeholders=True)
+  squeezed = weights.copy_squeeze_axes([2])
+  print("orig:", weights, "squeezed:", squeezed)
+  assert squeezed.shape == (None,) and squeezed.time_dim_axis == 1
+  assert weights.size_placeholder[0] is squeezed.size_placeholder[0]
+
+
 def test_ExternData_via_config():
   # Like ExternData.init_from_config.
   from Config import Config
@@ -351,6 +431,304 @@ def test_Data_copy_compatible_to_src_no_batch():
   d2.placeholder = tf.zeros([d if (d is not None) else 1 for d in d2.batch_shape])
   d3 = d2.copy_compatible_to(d1)
   assert d3.batch_shape == (None, 1, 1)
+
+
+def test_Data_copy_compatible_to_add_batch_dim():
+  common_data = Data(name='accum_att_weights_output', shape=(None, 1))
+  d1 = Data(name='att_weights_avg_output', shape=(1,), batch_dim_axis=None)
+  d2 = d1.copy_compatible_to(common_data)
+  assert d2.batch_dim_axis is not None and d2.batch_shape == (None, 1, 1)
+
+
+def test_Data_copy_compatible_to_time_axis_at_end():
+  data = Data(name='att_weights_output', shape=(1, None), time_dim_axis=2, feature_dim_axis=1)
+  common_data = Data(name='accum_att_weights_output', shape=(None, 1))
+  data2 = data.copy_compatible_to(common_data)
+  assert data2.batch_dim_axis == common_data.batch_dim_axis == 0
+  assert data2.time_dim_axis == common_data.time_dim_axis == 1
+  assert data2.feature_dim_axis == common_data.feature_dim_axis == 2
+  assert data2.shape == common_data.shape == (None, 1)
+  assert data2.dim == common_data.dim == 1
+
+
+def test_Data_copy_compatible_to_batch_axis1_time_axis_at_end():
+  beam = SearchBeam(beam_size=12)
+  data = Data(name='att_weights_output', shape=(1, None), time_dim_axis=2, feature_dim_axis=1, beam=beam)
+  common_data = Data(name='accum_att_weights_output', shape=(None, 1), batch_dim_axis=1)
+  data2 = data.copy_compatible_to(common_data)
+  assert data2.time_dim_axis == common_data.time_dim_axis == 0
+  assert data2.batch_dim_axis == common_data.batch_dim_axis == 1
+  assert data2.feature_dim_axis == common_data.feature_dim_axis == 2
+  assert data2.shape == common_data.shape == (None, 1)
+  assert data2.dim == common_data.dim == 1
+
+
+def test_Data_copy_compatible_to_batch_feature_is_dynamic():
+  # Enc/dec for proper time dim tags.
+  enc = Data(name="enc", shape=(None, 1), auto_create_placeholders=True)
+  dec = Data(name="dec", shape=(None, 1), auto_create_placeholders=True)
+  print("enc:", enc)
+  print("dec:", dec)
+  # start: batch_shape_meta=[T|'time-with-postfix:0_data_target0',B]
+  start = Data(name='t_start_output', shape=(None,), dtype='int32', sparse=True, dim=None, batch_dim_axis=1)
+  start.size_placeholder = {0: dec.size_placeholder[0]}
+  print("start:", start)
+  assert_equal(start.get_time_dim_tag(), dec.get_time_dim_tag())
+  # energy: batch_shape_meta=[F|'time-with-postfix:0_data_target0',B,T|'time-with-postfix:encoder']
+  energy = Data(name='energy2_output', shape=(None, None), batch_dim_axis=1, time_dim_axis=2, feature_dim_axis=0)
+  energy.size_placeholder = {0: dec.size_placeholder[0], 1: enc.size_placeholder[0]}
+  print("energy:", energy)
+  assert_equal(energy.get_size_dim_tag(0), dec.get_time_dim_tag())
+  assert_equal(energy.get_size_dim_tag(1), enc.get_time_dim_tag())
+  assert_equal(energy.get_time_dim_tag(), enc.get_time_dim_tag())
+  t = start.copy_compatible_to(energy, check_sparse=False, check_dtype=False)
+  print("t:", t)
+  assert t.shape == (None, 1) and t.time_dim_axis == energy.time_dim_axis
+  assert t.batch_dim_axis == energy.batch_dim_axis
+  assert t.sparse and t.feature_dim_axis is None  # because it is sparse
+  assert set(t.size_placeholder.keys()) == {0}
+  assert t.size_placeholder[0] is dec.size_placeholder[0]
+  assert_equal(t.get_size_dim_tag(0), dec.get_time_dim_tag())
+
+
+def test_Data_get_common_data_extra_static_spatial():
+  d1 = Data(name='t', shape=(None, 32, 128), dtype='float32', auto_create_placeholders=True)
+  d2 = Data(name='r', shape=(None, 32, 128), dtype='float32', auto_create_placeholders=True)
+  d2.get_size_dim_tag(0).declare_same_as(d1.get_size_dim_tag(0))
+  common = Data.get_common_data([d1, d2], warnings_out=sys.stdout)
+  assert d1.shape == common.shape
+
+
+def test_Data_get_common_data_extra2_static_spatial():
+  d1 = Data(name='t', shape=(None, 32, 32, 128), dtype='float32', auto_create_placeholders=True)
+  d2 = Data(name='r', shape=(None, 32, 32, 128), dtype='float32', auto_create_placeholders=True)
+  d2.get_size_dim_tag(0).declare_same_as(d1.get_size_dim_tag(0))
+  common = Data.get_common_data([d1, d2], warnings_out=sys.stdout)
+  assert d1.shape == common.shape
+
+
+def test_Data_get_common_data_one_undefined_time():
+  # Data(name='accum_output', shape=(None, 1), batch_shape_meta=[B,T|?,F|1])
+  a = Data(name="a", shape=(None, 1))  # undefined time-dim-tag
+  print("a:", a)
+  # Data(name='enc0_output', shape=(None,), batch_shape_meta=[B,T|F|'time:var:extern_data:encoder'])
+  b = Data(name="b", shape=(None,), auto_create_placeholders=True)
+  print("b:", b)
+  # Data(name='enc1_output', shape=(None, 1), batch_shape_meta=[B,T|'time:var:extern_data:encoder',F|1])
+  c = Data(name="c", shape=(None, 1))
+  c.size_placeholder = b.size_placeholder.copy()
+  print("c:", c)
+  assert_equal(b.get_time_dim_tag(), c.get_time_dim_tag())
+  from Util import StringIO
+  warnings = StringIO()
+  out = Data.get_common_data([a, b, c], warnings_out=warnings)
+  warnings = warnings.getvalue()
+  print("out:", out)
+  assert not warnings, "got warnings:\n%s" % warnings
+  assert out.shape == (None, 1) and out.batch_dim_axis == 0
+  assert_equal(out.get_time_dim_tag(), b.get_time_dim_tag())
+
+
+def test_Data_get_common_data_copy_compatible_to_different_time_dim():
+  a = Data(name='a', shape=(None, 3, 5), auto_create_placeholders=True)
+  b = Data(name='b', shape=(None, 3, 5), auto_create_placeholders=True)
+  print("a:", a)
+  print("b:", b)
+  common_data = Data.get_common_data([a, b], warnings_out=sys.stdout)
+  print("common:", common_data)
+  assert common_data.shape == (None, None, 3, 5) and common_data.batch_dim_axis == 0
+  assert_equal(common_data.get_size_dim_tag(0), a.get_time_dim_tag())
+  assert_equal(common_data.get_size_dim_tag(1), b.get_time_dim_tag())
+  aa = a.copy_compatible_to(common_data)
+  bb = b.copy_compatible_to(common_data)
+  print("aa:", aa)
+  print("bb:", bb)
+  assert aa.batch_ndim == bb.batch_ndim
+  for i in range(aa.batch_ndim):
+    d1 = aa.batch_shape[i]
+    d2 = bb.batch_shape[i]
+    if d1 == 1 or d2 == 1:
+      continue  # it's fine, that will broadcast
+    assert d1 == d2, "mismatch in axis %i" % i
+  assert_equal(aa.get_dim_tag(axis=1), a.get_time_dim_tag())
+  assert aa.batch_shape[2] == 1
+  assert_equal(bb.get_dim_tag(axis=2), b.get_time_dim_tag())
+  assert bb.batch_shape[1] == 1
+  x = aa.placeholder + bb.placeholder
+  session.run(
+    x, feed_dict={
+      a.placeholder: numpy.zeros((2, 7, 3, 5), "float32"),
+      b.placeholder: numpy.zeros((2, 11, 3, 5), "float32")})
+
+
+def test_Data_get_common_data_copy_compatible_to_different_time_dim_different_static_order():
+  a = Data(name='a', shape=(None, 3, 5), auto_create_placeholders=True)
+  b = Data(name='b', shape=(3, None, 5), auto_create_placeholders=True)
+  print("a:", a)
+  print("b:", b)
+  assert_not_equal(a.get_time_dim_tag(), b.get_time_dim_tag())
+  common_data = Data.get_common_data([a, b], warnings_out=sys.stdout)
+  print("common:", common_data)
+  assert common_data.shape.count(None) == 2 and 3 in common_data.shape and 5 in common_data.shape
+  assert common_data.batch_ndim == 5
+  assert_equal(common_data.get_size_dim_tag(0), a.get_time_dim_tag())
+  assert_equal(common_data.get_size_dim_tag(1), b.get_time_dim_tag())
+  common_tags, _ = DimensionTag.get_all_dimension_tags([common_data])
+  print("common dim tags:")
+  pprint(common_tags)
+  assert len(common_tags) == common_data.batch_ndim  # all unique
+  assert_in(a.get_time_dim_tag(), common_tags)
+  assert_in(b.get_time_dim_tag(), common_tags)
+  aa = a.copy_compatible_to(common_data)
+  bb = b.copy_compatible_to(common_data)
+  print("aa:", aa)
+  print("bb:", bb)
+  assert aa.batch_ndim == bb.batch_ndim
+  for i in range(aa.batch_ndim):
+    d1 = aa.batch_shape[i]
+    d2 = bb.batch_shape[i]
+    if d1 == 1 or d2 == 1:
+      continue  # it's fine, that will broadcast
+    assert d1 == d2, "mismatch in axis %i" % i
+  assert_equal(aa.get_size_dim_tag(0), a.get_time_dim_tag())
+  assert_equal(bb.get_size_dim_tag(0), b.get_time_dim_tag())
+  x = aa.placeholder + bb.placeholder
+  session.run(
+    x, feed_dict={
+      a.placeholder: numpy.zeros((2, 7, 3, 5), "float32"),
+      b.placeholder: numpy.zeros((2, 3, 11, 5), "float32")})
+
+
+def test_Data_copy_compatible_to_get_common_data_auto_feature_non_sparse():
+  d1 = Data(name='t', shape=(None,), dtype='int32', batch_dim_axis=None, feature_dim_axis=None,
+            auto_create_placeholders=True)  # placeholder for specific spatial dim-tag
+  d2 = Data(name='r', shape=(6,), dtype='int32', batch_dim_axis=None, time_dim_axis=None)
+  common = Data.get_common_data([d1, d2], warnings_out=sys.stdout)
+  print("common:", common)
+  d1a = d1.copy_compatible_to(common)
+  print("d1':", d1a)
+  d2a = d2.copy_compatible_to(common)
+  print("d2':", d2a)
+  assert common.feature_dim_axis_or_unspecified is NotSpecified
+  assert d1a.feature_dim_axis_or_unspecified is NotSpecified
+  assert d2a.feature_dim_axis_or_unspecified is NotSpecified
+
+
+def test_Data_copy_compatible_to_get_common_data_no_feature_sparse():
+  d1 = Data(name="t", shape=(), dtype='int32', sparse=True, dim=None, time_dim_axis=None)
+  d2 = Data(name="r", shape=(6,), dtype='int32', sparse=True, dim=6, batch_dim_axis=None, time_dim_axis=None)
+  common = Data.get_common_data([d1, d2], warnings_out=sys.stdout)
+  print("common:", common)
+  d1a = d1.copy_compatible_to(common)
+  print("d1':", d1a)
+  d2a = d2.copy_compatible_to(common)
+  print("d2':", d2a)
+  assert common.sparse and d1a.sparse and d2a.sparse
+  assert common.feature_dim_axis_or_unspecified is NotSpecified
+  assert d1a.feature_dim_axis_or_unspecified is NotSpecified
+  assert d2a.feature_dim_axis_or_unspecified is NotSpecified
+  assert common.feature_dim_axis is None
+  assert d1a.feature_dim_axis is None
+  assert d2a.feature_dim_axis is None
+
+
+def test_Data_copy_compatible_to_add_dummy_time_also_feature_dim():
+  start = Data(
+    name="start", shape=(), dtype='int32', sparse=True, dim=None,
+    batch_dim_axis=0, time_dim_axis=None, feature_dim_axis=None)
+  print("start:", start)
+  assert start.batch_ndim == 1
+  energy = Data(
+    name='energy', shape=(None,), dtype='float32', sparse=False, dim=None,
+    batch_dim_axis=0, time_dim_axis=1, feature_dim_axis=1)
+  print("energy:", energy)
+  assert energy.batch_ndim == 2
+  assert energy.time_dim_axis == energy.feature_dim_axis
+  x = start.copy_compatible_to(energy, check_sparse=False, check_dtype=False)
+  print("start copy_compatible_to energy result:", x)
+  assert x.sparse
+  assert x.batch_ndim == energy.batch_ndim
+  assert x.batch_dim_axis == energy.batch_dim_axis
+  assert x.feature_dim_axis is None  # it's sparse, thus by definition it does not have a feature axis
+  assert x.time_dim_axis == energy.time_dim_axis
+
+
+def test_Data_copy_compatible_to_keep_feature_new_time():
+  start = Data(name='start', shape=(1,), time_dim_axis=None)
+  print("start:", start)
+  assert start.batch_ndim == 2 and start.feature_dim_axis == 1
+  energy = Data(name='energy', shape=(7, 4), time_dim_axis=2, feature_dim_axis=1)
+  print("energy:", energy)
+  assert energy.batch_ndim == 3
+  x = start.copy_compatible_to(energy, check_sparse=False, check_dtype=False)
+  print("start copy_compatible_to energy result:", x)
+  assert x.batch_ndim == energy.batch_ndim
+  assert x.batch_dim_axis == energy.batch_dim_axis
+  assert x.feature_dim_axis == 1
+  assert x.time_dim_axis == energy.time_dim_axis
+
+
+def test_Data_copy_compatible_to_sparse_to_dense():
+  source = Data(name="start", shape=(), dtype='int32', sparse=True, dim=1, time_dim_axis=None)
+  print("source:", source)
+  target = Data(name='energy', shape=(None,))
+  print("target:", target)
+  dest = source.copy_compatible_to(target, check_sparse=False, check_dtype=False)
+  print("dest:", dest)
+  assert dest.shape == (1,) and dest.dtype == "int32" and dest.sparse and dest.dim == 1 and dest.time_dim_axis == 1
+
+
+def test_Data_copy_compatible_to_move_spatial_axes():
+  common = Data(name="common", shape=(None, 3, 5), auto_create_placeholders=True)
+  print("common:", common)
+  a = Data(name="a", shape=(3, None, 5))
+  a.size_placeholder = {1: common.size_placeholder[0]}
+  print("a:", a)
+  assert_equal(common.get_time_dim_tag(), a.get_time_dim_tag())
+  b = a.copy_compatible_to(common)
+  print("b:", b)
+  assert b.shape == common.shape
+  assert_equal(b.get_time_dim_tag(), a.get_time_dim_tag())
+
+
+def test_Data_copy_add_spatial_dim_added_time_at_end():
+  d = Data(name='start', shape=(1,), time_dim_axis=None)
+  print("d:", d)
+  assert d.batch_shape == (None, 1) and d.feature_dim_axis == 1 and d.time_dim_axis is None
+  assert d.feature_dim_axis_or_unspecified is NotSpecified
+  d2 = d.copy_add_spatial_dim(2)
+  print("d2:", d2)
+  assert d2.batch_shape == (None, 1, 1) and d2.feature_dim_axis == 1 and d2.time_dim_axis == 2
+  assert d2.feature_dim_axis_or_unspecified is NotSpecified
+
+
+def test_Data_get_common_data_tbf_and_bf():
+  sources = [
+    Data(name='target', shape=(None, 13), batch_dim_axis=1, time_dim_axis=0),
+    Data(name='encoder', shape=(11,), time_dim_axis=None, batch_dim_axis=0)]
+  pprint(sources)
+  common = Data.get_common_data(sources=sources, warnings_out=sys.stdout)
+  print("common:", common)
+  assert common.batch_ndim == 3
+
+
+def test_Data_get_common_data_beam_size():
+  condition = Data(name="cond", shape=(), dtype='bool', sparse=True, dim=2, time_dim_axis=None)
+  true_from = Data(name="true", shape=(), dtype='int32', sparse=True, dim=19, time_dim_axis=None)
+  beam = SearchBeam(beam_size=3)
+  false_from = Data(name="false", shape=(), dtype='int32', sparse=True, dim=19, time_dim_axis=None, beam=beam)
+  print("cond:", condition)
+  print("true:", true_from)
+  print("false:", false_from)
+  common = Data.get_common_data([true_from, false_from, condition])
+  print("common:", common)
+  assert common.shape == () and common.sparse
+  assert common.beam == beam
+
+
+def test_Data_no_feature_dim():
+  d = Data(name="x", shape=(6,), dtype='int32', sparse=True, dim=6, batch_dim_axis=None, time_dim_axis=None)
+  assert d.feature_dim_axis is None
 
 
 def test_Data_feature_dim_axis_btd():
@@ -482,6 +860,28 @@ def test_Data_copy_template_excluding_time_dim_explicit_feature():
   assert d2.batch_shape == (None, 12) and d2.time_dim_axis is None and d2.feature_dim_axis == 1
 
 
+def test_Data_copy_template_excluding_time_dim_multiple_time():
+  d = Data(
+    name='energy_in_t_rel_var_output', shape=(None, None, 13), batch_dim_axis=2, time_dim_axis=0,
+    auto_create_placeholders=True)  # placeholders to have proper dim tags
+  print("d:", d)
+  print("sizes:", d.size_placeholder)
+  assert set(d.size_placeholder.keys()) == {0, 1}
+  assert d.feature_dim_axis == 3
+  size1tag = d.get_size_dim_tag(0)
+  size2tag = d.get_size_dim_tag(1)
+  print("size tags:", size1tag, size2tag)
+  assert size1tag.dyn_size is not None and size2tag.dyn_size is not None
+  d2 = d.copy_template_excluding_time_dim()
+  print("excluding time:", d2)
+  assert d2.shape == (None, 13) and (d2.time_dim_axis, d2.batch_dim_axis, d2.feature_dim_axis) == (0, 1, 2)
+  print("sizes:", d2.size_placeholder)
+  assert set(d2.size_placeholder.keys()) == {0}
+  assert d2.size_placeholder[0] is d.size_placeholder[1]
+  new_size_tag = d2.get_time_dim_tag()
+  assert new_size_tag is size2tag
+
+
 def test_Data_copy_add_spatial_dim_no_batch():
   d1 = Data(name='d1', shape=(3,), batch_dim_axis=None, time_dim_axis=None)
   assert d1.batch_dim_axis is None and d1.time_dim_axis is None and d1.feature_dim_axis == 0
@@ -498,6 +898,99 @@ def test_Data_copy_add_spatial_dim_no_batch_explicit_feature():
   d2 = d1.copy_add_spatial_dim(0)
   assert d2.batch_dim_axis is None and d2.time_dim_axis == 0 and d2.feature_dim_axis == 1
   assert d2.batch_shape == (1, 3) and d2.dim == 3
+
+
+def test_Data_copy_add_spatial_dim_becomes_new_feature():
+  d1 = Data(name='att_weights_avg_output', shape=(None,), batch_dim_axis=None, time_dim_axis=None)
+  d2 = d1.copy_add_spatial_dim(0)
+
+
+def test_Data_copy_add_spatial_dim_most_right():
+  d1 = Data(name='att_weights_avg_output', shape=(1,))
+  print(d1, "spatial axes:", d1.get_spatial_batch_axes())
+  d2 = d1.copy_add_spatial_dim(1)
+  print(d2, "spatial axes:", d2.get_spatial_batch_axes())
+  assert_equal(d2.get_spatial_batch_axes(), [1])
+
+
+def test_Data_copy_add_spatial_dim_no_batch_end():
+  d = Data(name='t', shape=(None,), dtype='int32', sparse=True, dim=None,
+           batch_dim_axis=None, time_dim_axis=None, feature_dim_axis=None)
+  assert d.batch_shape == (None,)
+  d2 = d.copy_add_spatial_dim(spatial_dim_axis=1, dim=1)
+  assert d2.batch_shape == (None, 1)
+
+
+def test_Data_copy_add_spatial_dim_default_after_last_spatial():
+  d1 = Data(name="x", shape=(2, 1337), batch_dim_axis=0, time_dim_axis=1)
+  assert d1.batch_shape == (None, 2, 1337)
+  d2 = d1.copy_add_spatial_dim(dim=3)
+  assert d2.batch_shape == (None, 2, 3, 1337)
+  d3 = d2.copy_add_spatial_dim(dim=4)
+  assert d3.batch_shape == (None, 2, 3, 4, 1337)
+
+
+def test_Data_copy_add_spatial_dim_before_time():
+  a = Data(name='a', shape=(None, 3, 5), auto_create_placeholders=True)
+  print("a:", a)
+  b = a.copy_add_spatial_dim(spatial_dim_axis=1, auto_time_dim_axis=False)
+  print("b:", b)
+  assert b.shape == (1, None, 3, 5) and (b.batch_dim_axis, b.time_dim_axis) == (0, 2)
+  assert b.size_placeholder[1] is a.size_placeholder[0]
+
+
+def test_Data_copy_add_dim_by_tag_unbroadcast_feature_non_specific_feature_dim():
+  d = Data(name='t', shape=(None,), dtype='int32', batch_dim_axis=None, time_dim_axis=None, feature_dim_axis=None)
+  tag = DimensionTag(kind='feature', description='feature:r', dimension=6)
+  d2 = d.copy_add_dim_by_tag(tag, unbroadcast=True)
+  print("d2:", d2)
+  assert d2.batch_shape == (None, 6)
+  assert d2.feature_dim_axis_or_unspecified is NotSpecified and d2.feature_dim_axis == 1
+
+
+def test_Data_copy_add_dim_by_tag_unbroadcast_spatial_sparse():
+  d = Data(name='t', shape=(None,), dtype='int32', sparse=True, dim=None, batch_dim_axis=None, feature_dim_axis=None)
+  tag = DimensionTag(kind='spatial', description='spatial:0:range', dimension=6)
+  d2 = d.copy_add_dim_by_tag(tag, unbroadcast=True)
+  print("d2:", d2)
+  assert d2.batch_shape == (None, 6)
+  assert d2.sparse
+  assert d2.feature_dim_axis_or_unspecified is d.feature_dim_axis_or_unspecified
+
+
+def test_Data_copy_add_dim_by_tag_unbroadcast_spatial():
+  d = Data(name='ts', shape=(None,), time_dim_axis=None)
+  tag = DimensionTag(kind='spatial', description='spatial:0:ts', dimension=6)
+  d2 = d.copy_add_dim_by_tag(tag, unbroadcast=True, axis=-1)
+  assert d2.shape == (None, 6)
+
+
+def test_Data_copy_add_dim_by_tag_sparse_unbroadcast_feature():
+  d = Data(name='t', shape=(), dtype='int32', sparse=True, dim=None, time_dim_axis=None)
+  tag = DimensionTag(kind='feature', description='feature:t', dimension=6)
+  d2 = d.copy_add_dim_by_tag(tag, unbroadcast=True)
+  # The feature axis should become a spatial axis in this case.
+  assert d2.shape == (6,) and d2.sparse and d2.dim is None and d2.feature_dim_axis is None
+
+
+def test_Data_copy_move_axis_time_to_end():
+  d1 = Data(name="att_weights", shape=(None, None, 4))
+  d2 = d1.copy_move_axis(d1.time_dim_axis, -1)
+  assert d2.shape == (None, 4, None) and d2.feature_dim_axis == 2 and d2.time_dim_axis == 3
+
+
+def test_sequence_mask_len_via_loop():
+  seq_len = tf.while_loop(
+    cond=lambda x: tf.less(x[0], 2),
+    body=lambda x: x + 1,
+    loop_vars=[tf.convert_to_tensor([1, 2])])
+  assert not has_control_flow_context(seq_len)
+  mask = sequence_mask_time_major(seq_len)
+  seq_len_v, mask_v = session.run((seq_len, mask))
+  print(seq_len_v)
+  assert_equal(seq_len_v.tolist(), [2, 3])
+  print(mask_v)
+  assert_equal(mask_v.tolist(), [[True, True], [True, True], [False, True]])
 
 
 def test_get_initializer_zero():
@@ -585,9 +1078,8 @@ def test_close_event_writer_thread():
 
   # https://github.com/tensorflow/tensorflow/issues/4820
   # The _EventLoggerThread is still running (at least in TF 1.1.0).
-  if writer and writer.event_writer and writer.event_writer._worker.is_alive():
-    stop_event_writer_thread(writer.event_writer)
-    assert_equal(count_event_logger_threads(), 0)
+  stop_event_writer_thread(writer)
+  assert_equal(count_event_logger_threads(), 0)
 
 
 def test_single_strided_slice():
@@ -771,10 +1263,18 @@ def test_reuse_name_scope_of_tensor_root():
 
 
 def test_loop_var_creation():
-  # Related TF bugs:
-  # https://github.com/tensorflow/tensorflow/issues/3114
-  # https://github.com/tensorflow/tensorflow/issues/4478
-  # https://github.com/tensorflow/tensorflow/issues/8604
+  """
+  test_loop_var_creation
+
+  TF error:
+  InvalidArgumentError: The node 'while/w/Assign' has inputs from different frames.
+  The input 'while/j' is in frame 'while/while/'. The input 'while/w' is in frame ''.
+
+  Related TF bugs:
+  https://github.com/tensorflow/tensorflow/issues/3114
+  https://github.com/tensorflow/tensorflow/issues/4478
+  https://github.com/tensorflow/tensorflow/issues/8604
+  """
 
   # tf.reset_default_graph()  # Strange, this does not work.
   i = tf.constant(0)
@@ -786,12 +1286,26 @@ def test_loop_var_creation():
     # w = tf.Variable(tf.constant(1))
     # w = tf.Variable(tf.constant_initializer(value=1, dtype=tf.int32)(shape=()))
     # However, resetting the control dependencies will also reset the frame.
-    with var_creation_scope():
-      w = tf.Variable(tf.constant(1))
-    return [i + w]
+    with default_control_flow_ctx():
+      # Note: tf.Variable directly will have this problem, as tf.constant() is in the current ctx.
+      w1 = tf.Variable(name="w1", initial_value=tf.constant(1))
+    # However, tf.get_variable should not have this problem.
+    w2 = tf.get_variable("w2", shape=(), dtype=tf.int32, initializer=tf.constant_initializer(2, dtype=tf.int32))
+    return [i + w1 + w2]
 
   loop = tf.while_loop(lambda i: tf.less(i, 5), body, [i])
   session.run(tf.global_variables_initializer())
+  session.run(loop)
+
+
+def test_dot_simple():
+  n_time, n_batch = 7, 11
+  n_in, n_out = 3, 5
+  weights = tf.random_normal((n_in, n_out))
+  x = tf.random_normal((n_time, n_batch, n_in))
+  y = dot(x, weights)
+  y.set_shape((n_time, n_batch, n_out))
+  session.run(y)
 
 
 def test_gather_nd_grad():
@@ -830,6 +1344,63 @@ def test_scatter_nd():
     updates=tf.ones((n_beam, n_batch, n_in)),
     shape=(n_base_time, n_batch, n_in))
   session.run(ref_grad)
+
+
+def test_nd_indices_scatter_nd_time_major():
+  def rel_embed(x, v, t):
+    """
+    :param Data x: energy_in. (B, T, K) or (T, B, K)
+    :param Data v: t_rel_var. (B, Ts, K)
+    :param tf.Tensor t: (B,), int32
+    :rtype: tf.Tensor
+    """
+    import tensorflow as tf
+    from TFUtil import nd_indices
+    v = v.copy_compatible_to(x)  # t_rel_var. (B, Ts, K)
+    assert v.dim == x.dim
+    t = t + 1  # shift by 1, because we init at -1
+    # t = tf.Print(t, ["t:", t])
+    time_dim = tf.shape(x.placeholder)[x.time_dim_axis]
+    batch_dim = tf.shape(x.placeholder)[x.batch_dim_axis]
+    assert len(v.shape) == 2 and all([isinstance(d, int) for d in v.shape])
+    ts_dim = v.shape[0]
+    assert x.batch_dim_axis in [0, 1]
+    indices = tf.expand_dims(tf.range(ts_dim), axis=x.batch_dim_axis)  # (1,Ts) or (Ts,1)
+    indices = indices + tf.expand_dims(t, axis=1 - x.batch_dim_axis)  # (B,Ts) or (Ts,B)
+    max_t = tf.maximum(tf.reduce_max(indices) + 1, time_dim + 1)
+    indices = nd_indices(indices, batch_axis=x.batch_dim_axis)  # (B,Ts,2) or (Ts,B,2)
+    x0 = tf.scatter_nd(
+      indices=indices, updates=v.placeholder,
+      shape=[batch_dim, max_t, x.dim] if x.batch_dim_axis == 0
+      else [max_t, batch_dim, x.dim])  # (B,T,K) or (T,B,K)
+    if x.batch_dim_axis == 0:
+      x0 = x0[:, 1:time_dim + 1]  # correct the shift from above
+    else:
+      x0 = x0[1:time_dim + 1]  # correct the shift from above
+    out = x.placeholder + x0
+    # out = tf.Print(out, ["i:", network.get_rec_step_index(), "t:", t], summarize=5)
+    return out
+
+  n_batch = 3
+  t = tf.convert_to_tensor([4, 3, 2])  # (B,)
+  n_time = 7
+  seq_len = tf.convert_to_tensor([7, 4, 5])
+  n_ts = 2
+  n_k = 5
+  v = tf.random_normal((n_ts, n_k))
+  v = expand_dims_unbroadcast(v, axis=0, dim=n_batch)  # (B,Ts,K)
+  v = Data(name="v", shape=(n_ts, n_k), placeholder=v)
+  x = tf.random_normal((n_batch, n_time, n_k))
+  x = Data(name="x", shape=(None, n_k), placeholder=x, size_placeholder={0: seq_len})
+  print(x)
+  print(v)
+  print(t)
+  res1 = rel_embed(x, v, t)
+  print("res1 (batch major):", res1)
+  res2 = rel_embed(x.copy_as_time_major(), v, t)
+  print("res2 (time major):", res2)
+  session.run(res1)
+  session.run(res2)
 
 
 def test_dimshuffle():
@@ -1313,6 +1884,19 @@ def test_expand_dims_unbroadcast_instead_of_tf_tile():
     assert_equal(list(r[:, beam]), [1, 2, 3])
 
 
+def test_expand_dims_unbroadcast_negative_axis():
+  batch_size = 3
+  n_time = 5
+  n_dim = 2
+  expand_dim = 6
+  v = tf.ones((batch_size, n_time, n_dim))  # (batch, time, dim)
+  v2 = expand_dims_unbroadcast(v, axis=-2, dim=expand_dim)  # (batch, time, 6, dim)
+  r = v2.eval()
+  print(r)
+  assert isinstance(r, numpy.ndarray)
+  assert_equal(r.shape, (batch_size, n_time, expand_dim, n_dim))  # (batch, time, dim)
+
+
 def test_where_nan():
   # via: https://stackoverflow.com/a/42497444/133374
   # @ops.RegisterGradient("Select")
@@ -1432,6 +2016,38 @@ def test_remove_labels():
   assert_equal(y_eval.indices.tolist(), [[0, 0], [0, 1], [1, 0]])
   assert_equal(y_eval.values.tolist(), [0, 2, 3])
   assert_equal(y_eval.dense_shape.tolist(), [3, 2])
+
+
+def test_ctc_greedy_decode():
+  logits = tf.constant([
+    [[1., 2., 3.], [2., 3., 1.], [2., 3., 1.], [3., 0., 0.]],
+    [[-1., 1., 0.], [0., 0., 1.], [0., 1., 0.], [2., 1., 1.]],
+    [[2., 3., 4.], [3., 2., 1.], [3., 2., 1.], [3., 3., 3.]]], name="logits")
+  seq_lens = tf.constant([4, 4, 2], name="seq_lens")
+  expected_labels = [[1, 0], [1, 1, 0], [0]]
+  y1 = ctc_greedy_decode(logits=logits, seq_lens=seq_lens, time_major=False)
+  (y2,), _ = tf.nn.ctc_greedy_decoder(inputs=tf.transpose(logits, [1, 0, 2]), sequence_length=seq_lens)
+  assert isinstance(y1, tf.SparseTensor)
+  assert isinstance(y2, tf.SparseTensor)
+  z = tf.sparse_to_dense(
+    sparse_indices=y1.indices, sparse_values=y1.values, output_shape=y1.dense_shape, default_value=-1)
+  z_eval = session.run(z)
+  assert isinstance(z_eval, numpy.ndarray)
+  assert z_eval.shape == (3, 3)
+  for i in range(3):
+    assert list(z_eval[i, :len(expected_labels[i])]) == expected_labels[i]
+    assert all([x == -1 for x in z_eval[i, len(expected_labels[i]):]])
+  y1_eval = session.run(y1)
+  y2_eval = session.run(y2)
+  assert isinstance(y1_eval, tf.SparseTensorValue)
+  assert isinstance(y1_eval.indices, numpy.ndarray)
+  assert isinstance(y1_eval.values, numpy.ndarray)
+  assert isinstance(y1_eval.dense_shape, numpy.ndarray)
+  print("y indices:", y1_eval.indices.tolist())
+  print("y values:", y1_eval.values.tolist())
+  assert_equal(y2_eval.indices.tolist(), y1_eval.indices.tolist())
+  assert_equal(y2_eval.values.tolist(), y1_eval.values.tolist())
+  assert_equal(y2_eval.dense_shape.tolist(), y1_eval.dense_shape.tolist())
 
 
 def test_supported_devices_for_op():
@@ -1690,6 +2306,13 @@ def test_check_base_op_type_and_replace_sigmoid():
     assert_almost_equal(vy1, vy2)
 
 
+def test_move_axis_auto_optimize_multiple():
+  x0 = tf.constant(numpy.random.normal(size=(3, 4, 2, 5)).astype("float32"))
+  x1 = move_axis(x0, 2, 0)
+  x2 = move_axis(x1, 1, 3)
+  pass  # TODO check that there is only a single transpose....
+
+
 def test_string_merge():
   strings = [
     ["sub@@", "word", "test"],
@@ -1711,6 +2334,22 @@ def test_string_merge():
   res = [s.decode("utf8") for s in res]
   print(res)
   assert_equal(res, ["sub@@ word test", "hel@@ lo wo@@ r@@ ld", "foo"])
+
+
+def test_vocab_string_merge():
+  vocab = tf.convert_to_tensor(["</s>", "sub@@", "word", "test", "hel@@", "lo", "wo@@", "r@@", "ld", "foo", "bar"])
+  labels = tf.convert_to_tensor([[1, 2, 3, 0, 0, 0], [4, 5, 6, 7, 8, 0], [9, 0, 0, 0, 0, 0]])
+  seq_lens = tf.convert_to_tensor([4, 6, 2])
+  strings = vocab_idx_to_vocab_string(labels, vocab=vocab)
+  tf_res = string_merge(strings, seq_lens=seq_lens)
+  res = session.run(tf_res)
+  print(res)
+  assert isinstance(res, numpy.ndarray)
+  res = res.tolist()
+  print(res)
+  res = [s.decode("utf8") for s in res]
+  print(res)
+  assert_equal(res, ["sub@@ word test </s>", "hel@@ lo wo@@ r@@ ld </s>", "foo </s>"])
 
 
 def test_string_replace():
@@ -1770,6 +2409,8 @@ def test_string_words_calc_wer():
 
 def test_kenlm():
   import TFKenLM
+  if not TFKenLM.kenlm_checked_out():
+    raise unittest.SkipTest("KenLM not checked out")
   input_strings = ["beyond immediate concerns </s>"]
   test_lm_file = TFKenLM.kenlm_dir + "/lm/test.arpa"
   assert os.path.exists(test_lm_file)
@@ -1787,6 +2428,8 @@ def test_kenlm():
 
 def test_kenlm_bpe():
   import TFKenLM
+  if not TFKenLM.kenlm_checked_out():
+    raise unittest.SkipTest("KenLM not checked out")
   input_strings = [
     "beyond immediate concerns </s>",
     "be@@ yond imm@@ edi@@ ate conc@@ erns </s>",
@@ -1808,6 +2451,72 @@ def test_kenlm_bpe():
   assert_equal(output_scores[0], output_scores[1])
   assert_equal(output_scores[2], output_scores[3])
   print("Scores are as expected.")
+
+
+def test_openfst():
+  import TFOpenFst
+  if not TFOpenFst.openfst_checked_out():
+    raise unittest.SkipTest("OpenFST not checked out")
+  TFOpenFst.get_tf_mod(verbose=True)
+
+  """
+  $ fstprint --osymbols=lexicon_opt.osyms --isymbols=lexicon_opt.isyms lexicon_opt.fst 
+  0	1	M	<epsilon>
+  0	2	m	man
+  0
+  1	3	a	<epsilon>
+  2	4	a	<epsilon>
+  3	5	r	<epsilon>
+  4	6	n	<epsilon>
+  5	6	s	Mars
+  5	7	t	Martian
+  6	0	<space>	<epsilon>
+  6	0	!	<epsilon>
+  6	0	,	<epsilon>
+  6	0	.	<epsilon>
+  6	0	?	<epsilon>
+  7	2	i	<epsilon>
+  """
+  fst_fn = TFOpenFst.returnn_dir + "/tests/lexicon_opt.fst"
+  assert os.path.exists(fst_fn)
+  output_symbols = {"man": 26, "Mars": 111, "Martian": 1530}
+
+  fst_tf = TFOpenFst.get_fst(filename=fst_fn)
+  states_tf = tf.placeholder(tf.int32, [None])
+  inputs_tf = tf.placeholder(tf.int32, [None])
+  output_tf = TFOpenFst.fst_transition(fst_handle=fst_tf, states=states_tf, inputs=inputs_tf)
+
+  def transitions(states, inputs):
+    return session.run(
+      output_tf, feed_dict={states_tf: states, inputs_tf: inputs})
+
+  def transition(state, input):
+    """
+    :param int state:
+    :param int|str input:
+    :return next_state,output_label,weight
+    """
+    if isinstance(input, str):
+      init_state = state
+      out_labels = []
+      out_weight = 0.
+      for c in input:
+        next_state, out_label, weight = transition(state, ord(c))
+        state = next_state
+        if out_label > 0:  # 0 is epsilon. -1 is invalid.
+          out_labels.append(out_label)
+        out_weight += weight
+      print("Input (%i, %r) -> output (%i, %r, weight %f)" % (init_state, input, state, out_labels, out_weight))
+      return state, out_labels, out_weight
+    assert isinstance(input, int)
+    next_states, out_labels, weights = transitions([state], [input])
+    return next_states[0], out_labels[0], weights[0]
+
+  assert_equal(transition(0, "Mars "), (0, [output_symbols["Mars"]], 0.0))
+  assert_equal(transition(0, "Martian "), (0, [output_symbols["Martian"]], 0.0))
+  assert_equal(transition(0, "Mar"), (5, [], 0.0))
+  assert_equal(transition(5, "s"), (6, [output_symbols["Mars"]], 0.0))
+  assert_equal(transition(0, "Unknown "), (-1, [], float("-inf")))
 
 
 def test_layer_norms():
@@ -1976,11 +2685,11 @@ def test_get_var_update_ops__get_variable_value_copy_before_update_ops():
       # This should be the value after the update, and the grad is -2, lr 1, thus should be 2.
       v_read_val = tf.identity(v.read_value())
       res = [
-        tf.Print(0, ["loss:", loss]), tf.Assert(tf.equal(loss, 1.0), ["loss ", loss, " == 1"]),
-        tf.Print(0, ["v:", v]),
-        tf.Print(0, ["v.value:", v_val]),
+        py_print(0, ["loss:", loss]), tf.Assert(tf.equal(loss, 1.0), ["loss ", loss, " == 1"]),
+        py_print(0, ["v:", v]),
+        py_print(0, ["v.value:", v_val]),
         tf.Assert(tf.equal(v_val, 0.0), ["v.value ", v_val, " == 0"]),  # last snapshot
-        tf.Print(0, ["v.read_value:", v_read_val]),
+        py_print(0, ["v.read_value:", v_read_val]),
         tf.Assert(tf.equal(v_read_val, 2.0), ["v.read_value ", v_read_val, " == 2"])  # after update
       ]
     session.run(v.initializer)
@@ -2127,7 +2836,7 @@ def test_same_context_loop():
     v1 = outer_loop_val + 1
     print("v1 control flow:", v1.op._control_flow_context)
     assert has_control_flow_context(v1)  # because +1 is done here in the loop
-    with same_context(outer_loop_val):
+    with same_control_flow_ctx(outer_loop_val):
       v2 = outer_loop_val + 2
     print("v2 control flow:", v2.op._control_flow_context)
     assert not has_control_flow_context(v2)  # should be done outside now, because `same_context` usage
@@ -2402,6 +3111,274 @@ def test_softmax_cross_entropy_over_size_gradient():
         raise Exception("got nan")
       assert loss < last_loss or 0.0 == loss == last_loss  # this must always improve
       last_loss = loss
+
+
+def test_FetchHelper_simple():
+  y = tf.sqrt(42.)
+  v = session.run(y)
+  numpy.testing.assert_almost_equal(v, numpy.sqrt(42.), decimal=5)
+
+  another_debug_test = tf.Print(y.op.inputs[0], ["debug print:"] + list(y.op.inputs))
+  # https://stackoverflow.com/questions/57707445/how-to-add-control-input-to-an-op-after-it-was-run-by-a-session
+  # add_control_input(y.op, another_debug_test.op)
+  # y.op._add_control_input(another_debug_test.op)
+  from tensorflow.contrib import graph_editor
+  y = graph_editor.graph_replace(target_ts=y, replacement_ts={y.op.inputs[0]: another_debug_test}, reuse_dst_scope=True)
+
+  fetch_helper = FetchHelper(y.op.inputs[0], verbose_stream=sys.stdout)
+  y = FetchHelper.copy_graph_replace_tensors(y, [fetch_helper])
+  session.run(y)
+  assert fetch_helper.callback_count == 1
+  numpy.testing.assert_almost_equal(fetch_helper.most_recent_value, 42.)
+
+
+def test_FetchHelper_loop():
+  N = 3
+  class Loop:
+    def body(self, i, x):
+      self.y = x / 2.
+      return i + 1, self.y
+    def cond(self, i, x):
+      return tf.less(i, N)
+  loop = Loop()
+  _, y = tf.while_loop(cond=loop.cond, body=loop.body, loop_vars=(0, 42.))
+  session.run(y)  # first run, to trigger https://stackoverflow.com/questions/57707445/
+
+  from tensorflow.contrib import graph_editor
+  ops = graph_editor.get_backward_walk_ops([y.op], inclusive=True, control_inputs=True)
+  _, info = graph_editor.copy(ops, reuse_dst_scope=True)
+  assert isinstance(info, graph_editor.TransformerInfo)
+  y = info.transformed(y)
+
+  fetch_helper = FetchHelper(info.transformed(loop.y.op.inputs[0]), verbose_stream=sys.stdout)
+  fetch_helper.add_to_control_inputs(info.transformed(loop.y.op))
+
+  v = session.run(y)
+  numpy.testing.assert_almost_equal(v, 42. / (2. ** N), decimal=5)
+  assert fetch_helper.callback_count == N
+  numpy.testing.assert_almost_equal(fetch_helper.most_recent_value, v * 2.)
+
+
+def test_FetchHelper_loop_invalid():
+  from TFNetwork import help_on_tf_exception  # not needed for the test, but helpful for further debug output
+  have_gpu = is_gpu_available()
+  print("Have GPU:", have_gpu)
+  graph = tf.Graph()
+  with graph.as_default():
+    session = tf.Session()
+    with session:
+      with tf.device("/gpu:0" if have_gpu else "/cpu:0"):
+        N = 3
+        class Loop:
+          def body(self, i, x):
+            target_shape = tf.convert_to_tensor([i + 1, 2])
+            with tf.device("/cpu:0"):
+              target_shape = tf.Print(target_shape, ["target shape:", target_shape])
+            self.y = tf.reshape(x / 2., target_shape)
+            with tf.device("/cpu:0"):
+              y = tf.Print(self.y, ["i:", i, "y:", self.y, "shape:", tf.shape(self.y)])
+            return i + 1, y
+          def cond(self, i, x):
+            return tf.less(i, N)
+        loop = Loop()
+        _, y = tf.while_loop(
+          cond=loop.cond, body=loop.body, loop_vars=(0, tf.convert_to_tensor([[42., 42.]])),
+          shape_invariants=(tf.TensorShape(()), tf.TensorShape((None, None))))
+        assert isinstance(y, tf.Tensor)
+
+      print("Run a first time now.")
+      try:
+        v = session.run(y)
+      except tf.errors.OpError as exc:
+        print("Got TF exception (kind of expected).")
+        print(exc)
+        help_on_tf_exception(session=session, exception=exc, fetches=y)
+        if exc.op is not loop.y.op:
+          print("Error, unexpected: %r vs %r" % (exc.op, loop.y.op))
+          raise
+      else:
+        assert False, "we should have gotten a TF exception, but we got: %r" % (v,)
+
+      y, fetch_helpers, target_op_transformed = FetchHelper.copy_graph(
+        y, target_op=loop.y.op, fetch_helper_tensors=list(loop.y.op.inputs), verbose_stream=sys.stdout)
+
+      print("Now run a second time, but now with fetch helpers added.")
+      try:
+        v = session.run(y)
+      except tf.errors.OpError as exc:
+        print("Got TF exception (kind of expected).")
+        print(exc)
+        # help_on_tf_exception(session=session, exception=exc, fetches=y)  # Broken now?
+        if exc.op is not target_op_transformed:
+          print("Error, unexpected: %r vs %r" % (exc.op, loop.y.op))
+          raise
+      else:
+        assert False, "we should have gotten a TF exception, but we got: %r" % (v,)
+
+      print("Fetches:")
+      for input_t, fetch_helper in zip(loop.y.op.inputs, fetch_helpers):
+        print("  %r: %r" % (input_t, fetch_helper.most_recent_value))
+        assert fetch_helper.callback_count >= 1
+
+
+def test_FetchHelper_loop_invalid_vars_switch():
+  step = tf.get_variable("step", shape=(), dtype=tf.int64, initializer=tf.zeros_initializer(), trainable=False)
+  v = tf.get_variable(
+    name="var_accum_grad", shape=(), dtype=tf.float32,
+    initializer=tf.zeros_initializer(), trainable=False)
+  session.run(tf.global_variables_initializer())
+
+  v = tf.cond(
+    tf.less_equal(tf.mod(step, 2), 0),
+    lambda: tf.assign(v, 2.0),
+    lambda: tf.assign_add(v, 3.0))
+  v = tf.identity(v)
+  print("v:", v, v.dtype, v.op._control_flow_context)
+
+  N = 3
+  class Loop:
+    def body(self, i, x):
+      target_shape = tf.convert_to_tensor([i + 1, 2 + tf.cast(v, tf.int32)])
+      with tf.device("/cpu:0"):
+        target_shape = tf.Print(target_shape, ["target shape:", target_shape])
+      self.y = tf.reshape(x / 2., target_shape)
+      with tf.device("/cpu:0"):
+        y = tf.Print(self.y, ["i:", i, "y:", self.y, "shape:", tf.shape(self.y)])
+      return i + 1, y
+    def cond(self, i, x):
+      return tf.less(i, N)
+  loop = Loop()
+  _, y = tf.while_loop(
+    cond=loop.cond, body=loop.body, loop_vars=(0, tf.convert_to_tensor([[42., 42.]])),
+    shape_invariants=(tf.TensorShape(()), tf.TensorShape((None, None))))
+  assert isinstance(y, tf.Tensor)
+
+  try:
+    v = session.run(y)
+  except tf.errors.OpError as exc:
+    print("Got TF exception (kind of expected).")
+    if exc.op is not loop.y.op:
+      print("Error, unexpected: %r vs %r" % (exc.op, loop.y.op))
+      raise
+  else:
+    assert False, "we should have gotten a TF exception, but we got: %r" % (v,)
+
+  op = loop.y.op
+  stop_at_ts = []
+  for op_ in op.graph.get_operations():
+    assert isinstance(op_, tf.Operation)
+    if op_._control_flow_context:
+      continue
+    for x in list(op_.inputs) + list(op_.outputs) + list(op.control_inputs):
+      assert isinstance(x, tf.Tensor)
+      # noinspection PyProtectedMember
+      if x.dtype._is_ref_dtype:
+        print("add stop:", x)
+        stop_at_ts.append(x)  # and also should not copy any variables/refs
+
+  y, fetch_helpers, target_op_transformed = FetchHelper.copy_graph(
+    y, target_op=loop.y.op, fetch_helper_tensors=list(loop.y.op.inputs), stop_at_ts=stop_at_ts,
+    verbose_stream=sys.stdout)
+
+  print("Now run a second time, but now with fetch helpers added.")
+  try:
+    v = session.run(y)
+  except tf.errors.OpError as exc:
+    print("Got TF exception (kind of expected).")
+    if exc.op is not target_op_transformed:
+      print("Error, unexpected: %r vs %r" % (exc.op, loop.y.op))
+      raise
+  else:
+    assert False, "we should have gotten a TF exception, but we got: %r" % (v,)
+
+  print("Fetches:")
+  for input_t, fetch_helper in zip(loop.y.op.inputs, fetch_helpers):
+    print("  %r: %r" % (input_t, fetch_helper.most_recent_value))
+    assert fetch_helper.callback_count >= 1
+
+
+def test_get_positional_encoding_batch_position():
+  # Test `get_positional_encoding` with `position` with a batch dimension.
+  num_channels = 8
+  position0 = tf.range(5)
+  position1 = tf.range(5, 10)
+  position2 = tf.range(5)
+  position = tf.stack([position0, position1, position2])  # (3, 5).
+  signal = get_positional_encoding(num_channels=num_channels, position=position)  # (3, 5, 8).
+  signal1 = get_positional_encoding(num_channels=num_channels, position=position1)  # (5, 8).
+  signal_np, signal1_np = session.run([signal, signal1])
+  assert signal_np.shape == (3, 5, 8)
+  numpy.array_equal(signal1_np, signal_np[1])
+
+
+def test_get_position_encoding():
+  y = get_positional_encoding(num_channels=4, position=tf.range(3))
+  values = session.run(y)
+  numpy.testing.assert_almost_equal(
+    values,
+    [[0.0, 0.0, 1.0, 1.0],
+     [0.8414709568023682, 9.99999901978299e-05, 0.5403022766113281, 1.0],
+     [0.9092974066734314, 0.0001999999803956598, -0.416146844625473, 1.0]])
+
+
+def test_get_linear_alignment_out_to_in_indices():
+  #     Examples:
+  #       * input_len=7, output_len=3, resulting indices [1,3,5].
+  #       * input_len=3, output_len=3, resulting indices [0,1,2].
+  #       * input_len=2, output_len=4, resulting indices [0,0,1,1].
+  assert_equal(
+    session.run(get_linear_alignment_out_to_in_indices(input_lens=[7], output_lens=[3])).tolist(),
+    [[1, 3, 5]])
+  assert_equal(
+    session.run(get_linear_alignment_out_to_in_indices(input_lens=[3], output_lens=[3])).tolist(),
+    [[0, 1, 2]])
+  assert_equal(
+    session.run(get_linear_alignment_out_to_in_indices(input_lens=[2], output_lens=[4])).tolist(),
+    [[0, 0, 1, 1]])
+  assert_equal(
+    session.run(get_linear_alignment_out_to_in_indices(input_lens=[7, 3, 1], output_lens=[3, 3, 3])).tolist(),
+    [[1, 3, 5], [0, 1, 2], [0, 0, 0]])
+  assert_equal(
+    session.run(
+      get_linear_alignment_out_to_in_indices(input_lens=[7, 4, 2, 1], output_lens=[3, 4, 4, 2], pad_value=-1)).tolist(),
+    [[1, 3, 5, -1], [0, 1, 2, 3], [0, 0, 1, 1], [0, 0, -1, -1]])
+
+
+def test_get_rnnt_linear_aligned_output():
+  #   Examples: (B is blank.)
+  #     * input_len=4, targets=[a,b,c] (len 3), output=[B,a,B,b,B,c,B] (len 7).
+  #     * input_len=0, targets=[a,b,c] (len 3), output=[a,b,c] (len 3).
+  #     * input_len=4, targets=[a] (len 1), output=[B,B,a,B,B] (len 5).
+  #     * input_len=3, targets=[a,b] (len 2), output=[B,a,B,b,B] (len 5)
+  assert_equal(
+    session.run(get_rnnt_linear_aligned_output(
+      input_lens=[4], targets=[[1, 2, 3]], target_lens=[3], blank_label_idx=4)[0]).tolist(),
+    [[4, 1, 4, 2, 4, 3, 4]])
+  assert_equal(
+    session.run(get_rnnt_linear_aligned_output(
+      input_lens=[0], targets=[[1, 2, 3]], target_lens=[3], blank_label_idx=4)[0]).tolist(),
+    [[1, 2, 3]])
+  assert_equal(
+    session.run(get_rnnt_linear_aligned_output(
+      input_lens=[4], targets=[[1]], target_lens=[1], blank_label_idx=4)[0]).tolist(),
+    [[4, 4, 1, 4, 4]])
+  assert_equal(
+    session.run(get_rnnt_linear_aligned_output(
+      input_lens=[3], targets=[[1, 2]], target_lens=[2], blank_label_idx=4)[0]).tolist(),
+    [[4, 1, 4, 2, 4]])
+  assert_equal(
+    session.run(get_rnnt_linear_aligned_output(
+      input_lens=[2], targets=tf.zeros((1, 0), dtype=tf.int32), target_lens=[0], blank_label_idx=4)[0]).tolist(),
+    [[4, 4]])
+  assert_equal(
+    session.run(get_rnnt_linear_aligned_output(
+      input_lens=[4, 3, 2, 0],
+      targets=[[1, 2, 3], [1, 2, -1], [-1, -1, -1], [1, 2, 3]],
+      target_lens=[3, 2, 0, 3], blank_label_idx=4)[0]).tolist(),
+    [[4, 1, 4, 2, 4, 3, 4],
+     [4, 1, 4, 2, 4, 0, 0],
+     [4, 4, 0, 0, 0, 0, 0],
+     [1, 2, 3, 0, 0, 0, 0]])
 
 
 if __name__ == "__main__":

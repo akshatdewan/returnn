@@ -1,7 +1,24 @@
-
 """
-Several wrappers around datasets are defined here, such as :class:`MetaDataset`,
-which are itself datasets again.
+There are use cases in which we want to combine several datasets:
+
+ * **Multimodality:** features from several datasets should be provided at the same time
+
+   * Examples: multi-source translation, speech translation with source CTC loss
+     for stability (needs both source audio and transcription)
+
+ * **Multi-Task Learning:** several datasets should be used alternatingly,
+   such that at each time the dataset of the corresponding task is selected
+
+   * Examples: multi-task speech translation (either from audio or from text)
+
+ * **Combination of Corpora:** the training data should be split into different datatsets.
+   This allows creating a combined corpus dynamically
+   and avoids manual concatenation/shuffling.
+
+   * Examples: multi-lingual translation systems
+     (datasets can be reused from corresponding bilingual systems)
+
+The dataset classes MetaDataset and CombinedDataset which perform these tasks are implemented in MetaDataset.py.
 """
 
 from __future__ import print_function
@@ -13,9 +30,14 @@ from Log import log
 from random import Random
 import numpy
 import sys
+import typing
 
 
 class EpochWiseFilter:
+  """
+  Applies some filter to the sequences (e.g. by seq length) for some epoch.
+  """
+
   def __init__(self, epochs_opts, debug_msg_prefix="EpochWiseFilter"):
     """
     :param dict[(int,int|None),dict[str]] epochs_opts: (ep_start, ep_end) -> epoch opts
@@ -23,6 +45,38 @@ class EpochWiseFilter:
     """
     self.epochs_opts = epochs_opts
     self.debug_msg_prefix = debug_msg_prefix
+
+  @classmethod
+  def filter_epoch(cls, opts, seq_order, get_seq_len, debug_msg_prefix):
+    """
+    :param dict[str]|Util.CollectionReadCheckCovered opts:
+    :param list[int] seq_order: list of seq idxs
+    :param ((int)->int) get_seq_len: seq idx -> len
+    :param str debug_msg_prefix:
+    :return: new seq_order
+    :rtype: list[int]
+    """
+    import Util
+    if not isinstance(opts, Util.CollectionReadCheckCovered):
+      opts = Util.CollectionReadCheckCovered(opts)
+    if opts.get("max_mean_len"):
+      max_mean_len = opts.get("max_mean_len")
+      lens_and_seqs = numpy.array(sorted([(get_seq_len(idx), idx) for idx in seq_order]))
+      best_num = Util.binary_search_any(
+        cmp=lambda num: numpy.mean(lens_and_seqs[:num, 0]) - max_mean_len, low=1, high=len(lens_and_seqs) + 1)
+      assert best_num is not None
+      selected_seq_idxs = set(lens_and_seqs[:best_num, 1])
+      # Select subset of seq_order. Keep order as-is.
+      seq_order = [seq_idx for seq_idx in seq_order if seq_idx in selected_seq_idxs]
+      print(
+        ("%sOld mean seq len is %f, new is %f, requested max is %f."
+         " Old num seqs is %i, new num seqs is %i.") %
+        (debug_msg_prefix,
+         float(numpy.mean(lens_and_seqs[:, 0])), float(numpy.mean(lens_and_seqs[:best_num, 0])),
+         max_mean_len, len(lens_and_seqs), best_num),
+        file=log.v4)
+    opts.assert_all_read()
+    return seq_order
 
   def filter(self, epoch, seq_order, get_seq_len):
     """
@@ -32,7 +86,6 @@ class EpochWiseFilter:
     :return: new seq_order
     """
     epoch = epoch or 1
-    import Util
     old_num_seqs = len(seq_order)
     any_filter = False
     for (ep_start, ep_end), value in sorted(self.epochs_opts.items()):
@@ -44,24 +97,9 @@ class EpochWiseFilter:
       assert isinstance(value, dict)
       if ep_start <= epoch <= ep_end:
         any_filter = True
-        opts = Util.CollectionReadCheckCovered(value)
-        if opts.get("max_mean_len"):
-          max_mean_len = opts.get("max_mean_len")
-          lens_and_seqs = numpy.array(sorted([(get_seq_len(idx), idx) for idx in seq_order]))
-          best_num = Util.binary_search_any(
-            cmp=lambda num: numpy.mean(lens_and_seqs[:num, 0]) - max_mean_len, low=1, high=len(lens_and_seqs) + 1)
-          assert best_num is not None
-          selected_seq_idxs = set(lens_and_seqs[:best_num, 1])
-          # Select subset of seq_order. Keep order as-is.
-          seq_order = [seq_idx for seq_idx in seq_order if seq_idx in selected_seq_idxs]
-          print(
-            ("%s, epoch %i. Old mean seq len is %f, new is %f, requested max is %f."
-             " Old num seqs is %i, new num seqs is %i.") %
-            (self.debug_msg_prefix, epoch,
-             float(numpy.mean(lens_and_seqs[:, 0])), float(numpy.mean(lens_and_seqs[:best_num, 0])),
-             max_mean_len, len(lens_and_seqs), best_num),
-            file=log.v4)
-        opts.assert_all_read()
+        seq_order = self.filter_epoch(
+          opts=value, debug_msg_prefix="%s, epoch %i. " % (self.debug_msg_prefix, epoch),
+          seq_order=seq_order, get_seq_len=get_seq_len)
     if any_filter:
       print("%s, epoch %i. Old num seqs %i, new num seqs %i." % (
         self.debug_msg_prefix, epoch, old_num_seqs, len(seq_order)), file=log.v4)
@@ -72,9 +110,59 @@ class EpochWiseFilter:
 
 class MetaDataset(CachedDataset2):
   """
-  This wraps around one or multiple datasets and might provide extra information.
-  Every dataset is expected to provide the the same sequences, where the sequence list
-  is given by a file.
+  The MetaDataset is to be used in the case of **Multimodality**.
+  Here, the datasets are expected to describe different features of the **same training sequences**.
+  These features will all be available to the network at the same time.
+
+  The datasets to be combined are given via the input parameter ``"datasets"``.
+  To define which training examples from the different datasets belong together,
+  a ``"seq_list_file"`` in pickle format has to be created.
+  It contains a list of sequence tags for each dataset (see example below).
+  Note, that in general each dataset type has its own tag format, e.g. for the TranslationDataset it is ``line-<n>``,
+  for the SprintDataset it is ``<corpusname>/<recording>/<segment id>``.
+  **Providing a sequence list can be omitted**, if the set of sequence tags is the same for all datasets.
+  When using multiple ExternSprintDataset instances, the sprint segment file can be provided as sequence list.
+  In this case the MetaDataset assumes that the sequences with equal tag correspond to each other.
+  This e.g. works when combining TranslationDatasets if all the text files are sentence aligned.
+
+
+  **Example of Sequence List:**
+
+  .. code::
+
+      { 'sprint': [
+          'corpus/ted_1/1',
+          'corpus/ted_1/2',
+          'corpus/ted_1/3',
+          'corpus/ted_1/4',
+      'translation': [
+          'line-0',
+          'line-1',
+          'line-2',
+          'line-3']
+      }
+
+  Python dict stored in pickle file. E.g. the sequence tagged with 'corpus/ted_1/3' in the 'sprint' dataset
+  corresponds to the sequence tagged 'line-2'
+  in the 'translation' dataset.
+
+  **Example of MetaDataset config:**
+
+  .. code::
+
+      train = {"class": "MetaDataset", "seq_list_file": "seq_list.pkl",
+               "datasets": {"sprint": train_sprint, "translation": train_translation},
+               "data_map": {"data": ("sprint", "data"),
+               "target_text_sprint": ("sprint", "orth_classes"),
+               "source_text": ("translation", "data"),
+               "target_text": ("translation", "classes")},
+               "seq_ordering": "random",
+               "partition_epoch": 2,
+      }
+
+  This combines a SprintDataset and a TranslationDataset.
+  These are defined as ``"train_sprint"`` and ``"train_translation"`` separately.
+  *Note that the current implementation expects one input feature to be called "data".*
   """
 
   def __init__(self,
@@ -94,6 +182,9 @@ class MetaDataset(CachedDataset2):
       Can be None if tag format is the same for all datasets.
         Then the sequence list will be default sequence order of default dataset (``data_map["data"][0]``),
         or seq_order_control_dataset.
+        You only need it if the tag name is not the same for all datasets.
+        It will currently not act as filter,
+        as the subdataset controls the sequence order (and thus what seqs to use).
     :param str|None seq_order_control_dataset: if set, this dataset will define the order for each epoch.
     :param str|None seq_lens_file: filename. json. dict[str,dict[str,int]], seq-tag -> data-key -> len.
       Use if getting sequence length from loading data is too costly.
@@ -106,8 +197,8 @@ class MetaDataset(CachedDataset2):
     assert self.shuffle_frames_of_nseqs == 0  # not implemented. anyway only for non-recurrent nets
 
     self.data_map = data_map
-    self.dataset_keys = set([m[0] for m in self.data_map.values()]); ":type: set[str]"
-    self.data_keys = set(self.data_map.keys()); ":type: set[str]"
+    self.dataset_keys = set([m[0] for m in self.data_map.values()])  # type: typing.Set[str]
+    self.data_keys = set(self.data_map.keys())  # type: typing.Set[str]
     assert "data" in self.data_keys
     self.target_list = sorted(self.data_keys - {"data"})
     self.default_dataset_key = seq_order_control_dataset or self.data_map["data"][0]
@@ -116,7 +207,7 @@ class MetaDataset(CachedDataset2):
     # This will only initialize datasets needed for features occuring in data_map
     self.datasets = {
       key: init_dataset(datasets[key], extra_kwargs={"name": "%s_%s" % (self.name, key)})
-      for key in self.dataset_keys}
+      for key in self.dataset_keys}  # type: typing.Dict[str,Dataset]
 
     self.seq_list_original = self._load_seq_list(seq_list_file)
     self.num_total_seqs = len(self.seq_list_original[self.default_dataset_key])
@@ -125,15 +216,14 @@ class MetaDataset(CachedDataset2):
 
     self.tag_idx = {tag: idx for (idx, tag) in enumerate(self.seq_list_original[self.default_dataset_key])}
 
+    self._seq_lens = None  # type: typing.Optional[typing.Dict[str,NumbersDict]]
+    self._num_timesteps = None  # type: typing.Optional[NumbersDict]
     if seq_lens_file:
       seq_lens = load_json(filename=seq_lens_file)
       assert isinstance(seq_lens, dict)
       # dict[str,NumbersDict], seq-tag -> data-key -> len
       self._seq_lens = {tag: NumbersDict(l) for (tag, l) in seq_lens.items()}
       self._num_timesteps = sum([self._seq_lens[s] for s in self.seq_list_original[self.default_dataset_key]])
-    else:
-      self._seq_lens = None
-      self._num_timesteps = None
 
     if data_dims:
       data_dims = convert_data_dims(data_dims)
@@ -155,7 +245,8 @@ class MetaDataset(CachedDataset2):
     self.num_inputs = self.data_dims["data"][0]
     self.num_outputs = self.data_dims
 
-    self.data_dtypes = {data_key: _select_dtype(data_key, self.data_dims, data_dtypes) for data_key in self.data_keys}
+    self.orig_seq_order_is_initialized = False
+    self.seq_list_ordered = None  # type: typing.Optional[typing.Dict[str,typing.List[str]]]
 
   def _is_same_seq_name_for_each_dataset(self):
     """
@@ -176,11 +267,7 @@ class MetaDataset(CachedDataset2):
     :rtype: dict[str,list[str]]
     """
     if seq_list_file:
-      if seq_list_file.endswith(".pkl"):
-        import pickle
-        seq_list = pickle.load(open(seq_list_file, 'rb'))
-      else:
-        seq_list = open(seq_list_file).read().splitlines()
+      seq_list = Dataset._load_seq_list_file(seq_list_file, expect_list=False)
     else:
       # We create a sequence list from all the sequences of the default dataset and hope that it also applies to the
       # other datasets. This can only work if all datasets have the same tag format and the sequences in the other
@@ -192,21 +279,27 @@ class MetaDataset(CachedDataset2):
       seq_list = default_dataset.get_all_tags()
       # Catch index out of bounds errors. Whether the tags are actually valid will be checked in _check_dataset_seq().
       for key in self.dataset_keys:
-        if key != self.default_dataset_key and self.datasets[key].get_total_num_seqs() < len(seq_list):
-          print("Dataset %r has less sequences (%i) than in sequence list (%i) read from %r, this cannot work out!" % (
-            key, self.datasets[key].get_total_num_seqs(), len(seq_list), self.default_dataset_key), file=log.v1)
-          other_tags = self.datasets[key].get_all_tags()
-          for tag in seq_list:
-            if tag not in other_tags:
-              print(
-                "Seq tag %r in dataset %r but not in dataset %r." % (tag, self.default_dataset_key, key), file=log.v1)
-              break  # only print one
-          for tag in other_tags:
-            if tag not in seq_list:
-              print(
-                "Seq tag %r in dataset %r but not in dataset %r." % (tag, key, self.default_dataset_key), file=log.v1)
-              break  # only print one
-          raise Exception("Dataset %r is missing seqs." % key)
+        if key == self.default_dataset_key:
+          continue
+        try:
+          if self.datasets[key].get_total_num_seqs() >= len(seq_list):
+            continue  # ok
+        except NotImplementedError:
+          continue  # we don't know. but continue for now...
+        print("Dataset %r has less sequences (%i) than in sequence list (%i) read from %r, this cannot work out!" % (
+          key, self.datasets[key].get_total_num_seqs(), len(seq_list), self.default_dataset_key), file=log.v1)
+        other_tags = self.datasets[key].get_all_tags()
+        for tag in seq_list:
+          if tag not in other_tags:
+            print(
+              "Seq tag %r in dataset %r but not in dataset %r." % (tag, self.default_dataset_key, key), file=log.v1)
+            break  # only print one
+        for tag in other_tags:
+          if tag not in seq_list:
+            print(
+              "Seq tag %r in dataset %r but not in dataset %r." % (tag, key, self.default_dataset_key), file=log.v1)
+            break  # only print one
+        raise Exception("Dataset %r is missing seqs." % key)
 
     assert isinstance(seq_list, (list, dict))
     if isinstance(seq_list, list):
@@ -225,6 +318,11 @@ class MetaDataset(CachedDataset2):
     return self.datasets[self.default_dataset_key].get_seq_length(seq_idx)["data"]
 
   def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :param int|None epoch:
+    :param list[str]|None seq_list:
+    :rtype: bool
+    """
     need_reinit = self.epoch is None or self.epoch != epoch or seq_list
     super(MetaDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list)
 
@@ -242,7 +340,14 @@ class MetaDataset(CachedDataset2):
       seq_index = seq_order_dataset.get_current_seq_order()
     else:
       if self._seq_lens:
-        get_seq_len = lambda s: self._seq_lens[self.seq_list_original[self.default_dataset_key][s]]["data"]
+        def get_seq_len(s):
+          """
+          :param int s:
+          :rtype: int
+          """
+          return self._seq_lens[self.seq_list_original[self.default_dataset_key][s]]["data"]
+      elif self._seq_order_seq_lens_file:
+        get_seq_len = self._get_seq_order_seq_lens_by_idx
       else:
         self.orig_seq_order_is_initialized = False
         get_seq_len = self._get_dataset_seq_length
@@ -256,6 +361,22 @@ class MetaDataset(CachedDataset2):
         continue
       dataset.init_seq_order(epoch=epoch, seq_list=self.seq_list_ordered[dataset_key])
     return True
+
+  def get_all_tags(self):
+    """
+    :return: list of all seq tags, of the whole dataset, without partition epoch
+    :rtype: list[str]
+    """
+    return self.seq_list_original[self.default_dataset_key]
+
+  def finish_epoch(self):
+    """
+    This would get called at the end of the epoch.
+    """
+    super(MetaDataset, self).finish_epoch()
+    for _, dataset in self.datasets.items():
+      assert isinstance(dataset, Dataset)
+      dataset.finish_epoch()
 
   def _load_seqs(self, start, end):
     for dataset_key in self.dataset_keys:
@@ -280,7 +401,7 @@ class MetaDataset(CachedDataset2):
     :rtype: numpy.ndarray
     """
     dataset_key, dataset_data_key = self.data_map[data_key]
-    dataset = self.datasets[dataset_key]; ":type: Dataset"
+    dataset = self.datasets[dataset_key]  # type: Dataset
     return dataset.get_data(seq_idx, dataset_data_key)
 
   def _collect_single_seq(self, seq_idx):
@@ -294,25 +415,50 @@ class MetaDataset(CachedDataset2):
     return DatasetSeq(seq_idx=seq_idx, seq_tag=seq_tag, features=features, targets=targets)
 
   def get_seq_length(self, sorted_seq_idx):
+    """
+    :param int sorted_seq_idx:
+    :rtype: NumbersDict
+    """
     if self._seq_lens:
       return self._seq_lens[self.seq_list_ordered[self.default_dataset_key][sorted_seq_idx]]
     return super(MetaDataset, self).get_seq_length(sorted_seq_idx)
 
   def get_tag(self, sorted_seq_idx):
+    """
+    :param int sorted_seq_idx:
+    :rtype: str
+    """
     return self.seq_list_ordered[self.default_dataset_key][sorted_seq_idx]
 
   def get_target_list(self):
+    """
+    :rtype: list[str]
+    """
     return self.target_list
 
   def get_data_shape(self, data_key):
+    """
+    :param str data_key:
+    :rtype: list[int]
+    """
     dataset_key, dataset_data_key = self.data_map[data_key]
     return self.datasets[dataset_key].get_data_shape(dataset_data_key)
 
   def get_data_dtype(self, key):
-    dtype = self.data_dtypes[key]
-    if self.added_data:
-      assert super(MetaDataset, self).get_data_dtype(key) == dtype
-    return dtype
+    """
+    :param str key:
+    :rtype: str
+    """
+    dataset_key, dataset_data_key = self.data_map[key]
+    return self.datasets[dataset_key].get_data_dtype(dataset_data_key)
+
+  def is_data_sparse(self, key):
+    """
+    :param str key:
+    :rtype: bool
+    """
+    dataset_key, dataset_data_key = self.data_map[key]
+    return self.datasets[dataset_key].is_data_sparse(dataset_data_key)
 
 
 class ClusteringDataset(CachedDataset2):
@@ -323,6 +469,12 @@ class ClusteringDataset(CachedDataset2):
   """
 
   def __init__(self, dataset, cluster_map_file, n_clusters, single_cluster=False, **kwargs):
+    """
+    :param dict[str] dataset:
+    :param cluster_map_file:
+    :param int n_clusters:
+    :param single_cluster:
+    """
     super(CachedDataset2, self).__init__(**kwargs)
     self.dataset = init_dataset(dataset)
     self.n_clusters = n_clusters
@@ -331,7 +483,7 @@ class ClusteringDataset(CachedDataset2):
     self.cluster_idx_dtype = "int32"
     self.num_inputs = self.dataset.num_inputs
     self.num_outputs = self.dataset.num_outputs.copy()
-    self.num_outputs["cluster_idx"] = [n_clusters, 1]  # will be a single int32
+    self.num_outputs["cluster_idx"] = (n_clusters, 1)  # will be a single int32
     self.expected_load_seq_start = 0
 
   def _load_cluster_map(self, filename):
@@ -340,7 +492,7 @@ class ClusteringDataset(CachedDataset2):
     # It has lines like: <map-item key="CHiME3/dt05_bth/M03_22GC010M_BTH.CH5/1" value="0"/>
     import re
     pattern = re.compile('<map-item key="(.*)" value="(.*)"/>')
-    cluster_map = {}  # type: dict[str,int]  # seq-name -> cluster-idx
+    cluster_map = {}  # type: typing.Dict[str,int]  # seq-name -> cluster-idx
     for l in ls:
       if not l.startswith("<map-item"):
         continue
@@ -351,43 +503,79 @@ class ClusteringDataset(CachedDataset2):
     return cluster_map
 
   def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :param int epoch:
+    :param list[str]|int seq_list:
+    :rtype: bool
+    """
     self.dataset.init_seq_order(epoch=epoch, seq_list=seq_list)
     return super(ClusteringDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list)
 
   def get_data_keys(self):
+    """
+    :rtype: list[str]
+    """
     return self.dataset.get_data_keys() + ["cluster_idx"]
 
   def get_data_dtype(self, key):
-    if key == "cluster_idx": return self.cluster_idx_dtype
+    """
+    :param str key:
+    :rtype: str
+    """
+    if key == "cluster_idx":
+      return self.cluster_idx_dtype
     return self.dataset.get_data_dtype(key)
 
   @property
   def num_seqs(self):
+    """
+    :rtype: int
+    """
     return self.dataset.num_seqs
 
   def is_less_than_num_seqs(self, n):
+    """
+    :param int n:
+    :rtype: bool
+    """
     return self.dataset.is_less_than_num_seqs(n)
 
   def _load_seqs(self, start, end):
+    """
+    :param int start:
+    :param int end:
+    """
     self.dataset.load_seqs(start, end)
     super(ClusteringDataset, self)._load_seqs(start=start, end=end)
 
   def get_tag(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: str
+    """
     return self.dataset.get_tag(seq_idx)
 
   def _collect_single_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     seq_name = self.get_tag(seq_idx)
-    #print >> log.v5, "ClusteringDataset: _collect_single_seq: seq_name", seq_name
     data = {key: self.dataset.get_data(seq_idx=seq_idx, key=key) for key in self.dataset.get_data_keys()}
     data["cluster_idx"] = numpy.array([self.cluster_map[seq_name]], dtype=self.cluster_idx_dtype)
     return DatasetSeq(seq_idx=seq_idx, features=data["data"], targets=data)
 
-  def _generate_batches(self, recurrent_net, batch_size, max_seqs=-1, seq_drop=0.0, max_seq_length=None, used_data_keys=None):
+  # noinspection PyMethodOverriding
+  def _generate_batches(self, recurrent_net, batch_size, max_seqs=-1, seq_drop=0.0, max_seq_length=None,
+                        used_data_keys=None):
     import sys
-    if max_seq_length is None: max_seq_length = sys.maxsize
-    if batch_size == 0: batch_size = sys.maxsize
+    if max_seq_length is None:
+      max_seq_length = sys.maxsize
+    if batch_size == 0:
+      batch_size = sys.maxsize
     assert batch_size > 0
-    if max_seqs == -1: max_seqs = float('inf')
+    if max_seqs == -1:
+      max_seqs = float('inf')
     assert max_seqs > 0
     assert seq_drop <= 1.0
     chunk_size = self.chunk_size
@@ -395,7 +583,8 @@ class ClusteringDataset(CachedDataset2):
     from EngineBatch import Batch
     batch = Batch()
     last_seq_idx = None
-    for seq_idx, t_start, t_end in self.iterate_seqs(chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
+    for seq_idx, t_start, t_end in self.iterate_seqs(
+          chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
       if self.single_cluster:
         if last_seq_idx is not None and last_seq_idx != seq_idx:
           last_seq_name = self.get_tag(last_seq_idx)
@@ -407,7 +596,7 @@ class ClusteringDataset(CachedDataset2):
       length = t_end - t_start
       if max_seq_length < 0 and length['classes'] > -max_seq_length:
         continue
-      elif max_seq_length > 0 and length.max_value() > max_seq_length:
+      elif 0 < max_seq_length < length.max_value():
         continue
       if length.max_value() > batch_size:
         print("warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size), file=log.v4)
@@ -444,6 +633,7 @@ class ConcatDataset(CachedDataset2):
     for ds in self.datasets[1:]:
       assert ds.num_inputs == self.num_inputs
       assert ds.num_outputs == self.num_outputs
+    self.dataset_seq_idx_offsets = None  # type: typing.Optional[typing.List[int]]
 
   def init_seq_order(self, epoch=None, seq_list=None):
     """
@@ -475,6 +665,10 @@ class ConcatDataset(CachedDataset2):
     return True
 
   def _get_dataset_for_seq_idx(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: int
+    """
     i = 0
     while i < len(self.dataset_seq_idx_offsets):
       if seq_idx + self.dataset_seq_idx_offsets[i] < 0:
@@ -483,6 +677,10 @@ class ConcatDataset(CachedDataset2):
     return i - 1
 
   def _load_seqs(self, start, end):
+    """
+    :param int start:
+    :param int end:
+    """
     sub_start = start
     # We maybe need to call load_seqs on several of our datasets, thus we need this loop.
     while True:
@@ -506,6 +704,10 @@ class ConcatDataset(CachedDataset2):
     super(ConcatDataset, self)._load_seqs(start=start, end=end)
 
   def _collect_single_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     dataset_idx = self._get_dataset_for_seq_idx(seq_idx)
     dataset = self.datasets[dataset_idx]
     dataset_seq_idx = seq_idx + self.dataset_seq_idx_offsets[dataset_idx]
@@ -516,17 +718,55 @@ class ConcatDataset(CachedDataset2):
 
   @property
   def num_seqs(self):
+    """
+    :rtype: int
+    """
     return sum([ds.num_seqs for ds in self.datasets])
 
   def get_target_list(self):
+    """
+    :rtype: list[str]
+    """
     return self.datasets[0].get_target_list()
 
 
 class CombinedDataset(CachedDataset2):
   """
-  This combines multiple different datasets, which provide different data-sources.
-  E.g. one can provide am-dataset with data:acoustic-features -> classes:characters (acoustic model train data),
-  and lm-dataset provides just data:characters (language model train data).
+  The CombinedDataset is to be used in the cases of **Multi-Task Learning** and **Combination of Corpora**.
+  Here, in general, the datasets describe **different training sequences**.
+  For each sequence, only the features of the corresponding dataset will be available.
+  Features of the other datasets are set to empty arrays.
+  The input parameter ``"datasets"`` is the same as for the MetaDataset.
+  The ``"data_map"`` is reversed to allow for several datasets mapping to the same feature.
+  The ``"default"`` ``"seq_ordering"`` is to first go through all sequences of the first dataset,
+  then the second and so on.
+  All other sequence orderings (``"random"``, ``"sorted"``, ``"laplace"``, ...) are supported
+  and based on this "default" ordering.
+  There is a special sequence ordering ``"random_dataset"``, where we pick datasets at random,
+  while keeping the sequence order within the datasets as is.
+  To adjust the ratio of number of training examples from the different datasets in an epoch,
+  one can use ``"repeat_epoch"`` in some of the datasets to
+  increase their size relative to the others.
+  Also, ``"partition_epoch"`` in some of the datasets can be used to shrink them relative to the others.
+
+  **Example of CombinedDataset config:**
+
+  .. code::
+
+      train = {"class": "CombinedDataset",
+               "datasets": {"sprint": train_sprint, "translation": train_translation},
+               "data_map": {("sprint", "data"): "data",
+                            ("sprint", "orth_classes"): "orth_classes",
+                            ("translation", "data"): "source_text",
+                            ("translation", "classes"): "orth_classes"},
+               "seq_ordering": "default",
+               "partition_epoch": 2,
+       }
+
+  This combines a SprintDataset and a TranslationDataset.
+  These are defined as ``"train_sprint"`` and ``"train_translation"`` separately.
+  *Note that the current implementation expects one input feature to be called "data".*
+
   Note: The mapping has been inverted. We now expect (dataset-key, dataset-data-key) -> self-data-key
   am-dataset:data -> am-data, am-dataset:classes -> am-classes, lm-dataset:data -> lm-data.
   For each sequence idx, it will select one of the given datasets, fill in the data-keys of this dataset
@@ -564,9 +804,9 @@ class CombinedDataset(CachedDataset2):
     assert self.shuffle_frames_of_nseqs == 0  # not implemented. anyway only for non-recurrent nets
 
     self.rnd = Random(self.epoch)
-    self.dataset_keys = set([m[0] for m in data_map.keys()]); ":type: set[str]"
+    self.dataset_keys = set([m[0] for m in data_map.keys()])  # type: typing.Set[str]
     self.dataset_idx2key_map = dict(enumerate(sorted(self.dataset_keys)))  # idx -> dataset-key
-    self.data_keys = set(data_map.values()); ":type: set[str]"
+    self.data_keys = set(data_map.values())  # type: typing.Set[str]
     assert "data" in self.data_keys
     self.target_list = sorted(self.data_keys - {"data"})
 
@@ -583,16 +823,11 @@ class CombinedDataset(CachedDataset2):
         target_lookup_table[dataset_key].setdefault(key, None)
     self.target_lookup_table = target_lookup_table
 
-    # This will only initialize datasets needed for features occuring in data_map
+    # This will only initialize datasets needed for features occurring in data_map
     self.datasets = {key: init_dataset(datasets[key]) for key in self.dataset_keys}
 
-    try:
-      self._num_seqs = sum([self.datasets[k].num_seqs for k in sorted(self.datasets.keys())])
-      self.know_num_seqs_beforehand = True
-    except Exception:
-      self._estimated_num_seqs = sum([self.datasets[k].estimated_num_seqs for k in sorted(self.datasets.keys())])
-      self.estimated_num_seq_per_subset = [self.datasets[k].estimated_num_seqs for k in sorted(self.datasets.keys())]
-      self.know_num_seqs_beforehand = False
+    self._estimated_num_seqs = sum([self.datasets[k].estimated_num_seqs for k in sorted(self.datasets.keys())])
+    self.estimated_num_seq_per_subset = [self.datasets[k].estimated_num_seqs for k in sorted(self.datasets.keys())]
 
     if data_dims:
       data_dims = convert_data_dims(data_dims)
@@ -616,14 +851,23 @@ class CombinedDataset(CachedDataset2):
 
     self.data_dtypes = {data_key: _select_dtype(data_key, self.data_dims, data_dtypes) for data_key in self.data_keys}
 
+    self.dataset_seq_idx_list = None  # type: typing.Optional[typing.List[typing.Tuple[int,int]]]
+    self.seq_order = None  # type: typing.Optional[typing.List[int]]
+    self.dataset_sorted_seq_idx_list = None  # type: typing.Optional[typing.List[typing.Tuple[int,int]]]
+    self.used_num_seqs_per_subset = None  # type: typing.Optional[typing.List[int]]
+
   def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :param int epoch:
+    :param list[str]|None seq_list:
+    :rtype: bool
+    """
     assert seq_list is None, "seq_list not supported for %s" % self.__class__
     need_reinit = self.epoch is None or self.epoch != epoch
     super(CombinedDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list)
+    self.rnd.seed(epoch or 1)
 
     if not need_reinit:
-      if self.know_num_seqs_beforehand:
-        self._num_seqs = len(self.seq_order)
       return False
 
     # First init sequence order for sub-datasets as usual to get a list of available sequences. This way sorting and
@@ -632,106 +876,16 @@ class CombinedDataset(CachedDataset2):
     for dataset in self.datasets.values():
       dataset.init_seq_order(epoch=epoch)
 
-    if self.know_num_seqs_beforehand:
-      self.dataset_seq_idx_list = self._create_dataset_seq_idx_list()
-
-      if self.seq_ordering == "random_dataset":
-        self.seq_order = self._get_random_dataset_seq_order()
-      else:
-        self.seq_order = self.get_seq_order_for_epoch(
-            epoch=epoch, num_seqs=len(self.dataset_seq_idx_list), get_seq_len=self._get_seq_length)
-      self._num_seqs = len(self.seq_order)
-
-      # We only want to load those sequences in the sub-datasets that appear in self.seq_order. For this, we extract
-      # sequence lists containing the subset of sequences for each dataset from self.seq_order.
-      seq_lists = [[] for _ in self.datasets]
-      for seq_idx in self.seq_order:
-        dataset_idx, dataset_seq_idx = self.dataset_seq_idx_list[seq_idx]
-        dataset = self.datasets[self.dataset_idx2key_map[dataset_idx]]
-        seq_tag = dataset.get_tag(dataset_seq_idx)
-        seq_lists[dataset_idx].append(seq_tag)
-
-      # Re-initialize sequence orders of sub-datasets with created sequence list.
-      for dataset_idx, dataset_key in self.dataset_idx2key_map.items():
-        self.datasets[dataset_key].init_seq_order(epoch=epoch, seq_list=seq_lists[dataset_idx])
-
-      # Apply seq_order to self.dataset_seq_idx.
-      # We have to re-calculate the seq_idx's because we sorted the datasets in the previous step.
-      self.dataset_sorted_seq_idx_list = []
-      counters = [0] * len(self.datasets)
-      for seq_idx in self.seq_order:
-        dataset_idx, _ = self.dataset_seq_idx_list[seq_idx]
-        dataset_seq_idx = counters[dataset_idx]
-        counters[dataset_idx] += 1
-        self.dataset_sorted_seq_idx_list.append((dataset_idx, dataset_seq_idx))
-
-    else:
-      self.dataset_sorted_seq_idx_list = [] # We will fill this as we go
-      self.used_num_seqs_per_subset = [0] * len(self.datasets)
+    self.dataset_sorted_seq_idx_list = []  # We will fill this as we go
+    self.used_num_seqs_per_subset = [0] * len(self.datasets)
 
     return True
 
-  def _create_dataset_seq_idx_list(self):
-    """
-    Creates a list of all available sequences, to which we can later apply the sequence ordering.
-    It contains the index of the dataset and the sequence index within the dataset for every sequence.
-    The sequences appear sorted by dataset first.
-
-    :returns: list of (dataset-idx, dataset-seq-idx)
-    :rtype: list[(int,int)]
-    """
-    dataset_seq_idxs = []
-    for dataset_idx in range(len(self.datasets)):
-      dataset = self.datasets[self.dataset_idx2key_map[dataset_idx]]
-      for dataset_seq_idx in range(dataset.num_seqs):
-        dataset_seq_idxs.append((dataset_idx, dataset_seq_idx))
-
-    return dataset_seq_idxs
-
-  def _get_random_dataset_seq_order(self):
-    """
-    Choose datasets randomly but preserve order within each dataset. This sorting method is unique to CombinedDataset.
-    """
-    # Create a list containing each dataset_idx dataset.num_seqs-times and shuffle it.
-    dataset_ids = [idx_tuple[0] for idx_tuple in self.dataset_seq_idx_list]
-    self.rnd.shuffle(dataset_ids)
-
-    # Calculate the offset for all datasets (i.e. the index where sequences of a given dataset start
-    # in self.dataset_seq_idx_list).
-    dataset_offsets = [0]
-    for dataset_idx in range(len(self.datasets)):
-      dataset = self.datasets[self.dataset_idx2key_map[dataset_idx]]
-      dataset_offsets.append(dataset_offsets[-1] + dataset.num_seqs)
-
-    # Create the actual seq_order list.
-    # We want to keep the order within the sub-datasets, thus we assign seq_ids by simply counting up for each dataset.
-    # We however have to account for the different offsets needed when accessing self.dataset_seq_idx_list later.
-    seq_order = []
-    counters = [0] * len(self.datasets)
-    for dataset_idx in dataset_ids:
-      seq_order.append(counters[dataset_idx] + dataset_offsets[dataset_idx])
-      counters[dataset_idx] += 1
-
-    total_num_seqs = len(self.dataset_seq_idx_list)
-    assert sum(counters) == total_num_seqs
-
-    if self.partition_epoch:
-      seq_order = self._apply_partition_epoch(seq_order, self.partition_epoch, self.epoch)
-    if self.repeat_epoch:
-      seq_order = seq_order * self.repeat_epoch
-
-    return seq_order
-
-  def _get_seq_length(self, seq_idx):
-    dataset_idx, dataset_seq_idx = self.dataset_seq_idx_list[seq_idx]
-    dataset = self.datasets[self.dataset_idx2key_map[dataset_idx]]
-
-    return dataset.get_seq_length(dataset_seq_idx)["data"]
-
   def _expand_dataset_sec_idxs(self, num_values):
     """
-    :param num_values: int Add num_values entries to the dataset-segment-idx mapping table
-    :return:
+    :param int num_values: Add num_values entries to the dataset-segment-idx mapping table
+    :return: something?
+    :rtype: bool
     """
     for i in range(num_values):
       if self.seq_ordering == "default":  # i.e. in order
@@ -762,7 +916,7 @@ class CombinedDataset(CachedDataset2):
             for estimated, used in zip(self.estimated_num_seq_per_subset, self.used_num_seqs_per_subset)]
           total_remaining = float(sum(expected_remaining_seqs))
 
-          if total_remaining < 0.1: # We expect no more data, but try anyway
+          if total_remaining < 0.1:  # We expect no more data, but try anyway
             nonempty_datasets = []
             for j, k in enumerate(sorted(self.datasets.keys())):
               if self.datasets[k].is_less_than_num_seqs(self.used_num_seqs_per_subset[j]):
@@ -793,7 +947,7 @@ class CombinedDataset(CachedDataset2):
 
   def _load_seqs(self, start, end):
     # If the segment order is not yet known, fix the next few segments
-    if not self.know_num_seqs_beforehand and end > len(self.dataset_sorted_seq_idx_list):
+    if end > len(self.dataset_sorted_seq_idx_list):
       self._expand_dataset_sec_idxs(end - len(self.dataset_sorted_seq_idx_list))
 
     requested_seqs = self.dataset_sorted_seq_idx_list[start:end]
@@ -801,7 +955,7 @@ class CombinedDataset(CachedDataset2):
     for dataset_idx in range(len(self.datasets)):
       dataset = self.datasets[self.dataset_idx2key_map[dataset_idx]]
       sub_requested_seqs = [s[1] for s in requested_seqs if s[0] == dataset_idx]
-      if sub_requested_seqs == []:
+      if not sub_requested_seqs:
         continue
       sub_start, sub_end = min(sub_requested_seqs), max(sub_requested_seqs)
       dataset.load_seqs(sub_start, sub_end + 1)
@@ -815,7 +969,7 @@ class CombinedDataset(CachedDataset2):
     :rtype: numpy.ndarray
     """
     dataset_data_key = self.target_lookup_table[dataset_key][data_key]
-    dataset = self.datasets[dataset_key]; ":type: Dataset"
+    dataset = self.datasets[dataset_key]  # type: Dataset
     if dataset_data_key is not None:
       return dataset.get_data(dataset_seq_idx, dataset_data_key)
     else:
@@ -838,24 +992,36 @@ class CombinedDataset(CachedDataset2):
     return DatasetSeq(seq_idx=seq_idx, seq_tag=seq_tag, features=features, targets=targets)
 
   def is_less_than_num_seqs(self, n):
-    if self.know_num_seqs_beforehand:
-      return n < self._num_seqs
+    """
+    :param int n:
+    :rtype: bool
+    """
+    if n < len(self.dataset_sorted_seq_idx_list):
+      return True
     else:
-      if n < len(self.dataset_sorted_seq_idx_list):
-        return True
-      else:
-        return self._expand_dataset_sec_idxs(n - len(self.dataset_sorted_seq_idx_list) + 1)
+      return self._expand_dataset_sec_idxs(n - len(self.dataset_sorted_seq_idx_list) + 1)
 
   def get_target_list(self):
+    """
+    :rtype: list[str]
+    """
     return self.target_list
 
   def get_data_dtype(self, key):
+    """
+    :param str key:
+    :rtype: str
+    """
     dtype = self.data_dtypes[key]
     if self.added_data:
       assert super(CombinedDataset, self).get_data_dtype(key) == dtype
     return dtype
 
   def get_data_dim(self, key):
+    """
+    :param str key:
+    :rtype: int
+    """
     assert key in self.data_dims
     return self.data_dims[key][0]
 
@@ -867,7 +1033,7 @@ class ConcatSeqsDataset(CachedDataset2):
   def __init__(self, dataset, seq_list_file, seq_len_file, seq_tag_delim=";", remove_in_between_postfix=None,
                use_cache_manager=False, epoch_wise_filter=None, **kwargs):
     """
-    :param dict[str] dataset: kwargs for init_dataset
+    :param dict[str]|str|Dataset dataset: kwargs for init_dataset
     :param str seq_list_file: filename. line-separated. seq_tag_delim.join(seq_tags) for concatenated seqs
     :param str seq_len_file: file with Python dict, (single) seg_name -> len, which is used for sorting
     :param str seq_tag_delim:
@@ -879,8 +1045,9 @@ class ConcatSeqsDataset(CachedDataset2):
     self.seq_tag_delim = seq_tag_delim
     self.remove_in_between_postfix = remove_in_between_postfix or {}
     self.epoch_wise_filter = EpochWiseFilter(epoch_wise_filter) if epoch_wise_filter else None
-    dataset = dataset.copy()
-    dataset.setdefault("name", "%s_subdataset" % self.name)
+    if isinstance(dataset, dict):
+      dataset = dataset.copy()
+      dataset.setdefault("name", "%s_subdataset" % self.name)
     self.sub_dataset = init_dataset(dataset)
     self.num_outputs = self.sub_dataset.num_outputs
     self.num_inputs = self.sub_dataset.num_inputs
@@ -893,8 +1060,8 @@ class ConcatSeqsDataset(CachedDataset2):
     self.seq_lens = eval(open(seq_len_file).read())
     assert isinstance(self.seq_lens, dict)
     self.full_seq_len_list = self._get_full_seq_lens_list()
-    self.cur_seq_list = None  # type: list[str]  # list of seq tags
-    self.cur_sub_seq_idxs = None  # type: list[list[int]]  # list of list of sub seq idxs
+    self.cur_seq_list = None  # type: typing.Optional[typing.List[str]]  # list of seq tags
+    self.cur_sub_seq_idxs = None  # type: typing.Optional[typing.List[typing.List[int]]]  # list of list of sub seq idxs
 
   def _get_full_seq_lens_list(self):
     """
@@ -909,10 +1076,20 @@ class ConcatSeqsDataset(CachedDataset2):
     return ls
 
   def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :param int epoch:
+    :param list[str]|None seq_list:
+    :rtype: bool
+    """
     super(ConcatSeqsDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list)
     assert not seq_list
     if not seq_list:
-      get_seq_len = lambda i: self.full_seq_len_list[i]
+      def get_seq_len(i):
+        """
+        :param int i:
+        :rtype: int
+        """
+        return self.full_seq_len_list[i]
       seq_order = self.get_seq_order_for_epoch(
         epoch=epoch, num_seqs=len(self.full_seq_list), get_seq_len=get_seq_len)
       if self.epoch_wise_filter:
@@ -922,7 +1099,7 @@ class ConcatSeqsDataset(CachedDataset2):
     self.cur_seq_list = seq_list
     self._num_seqs = len(seq_list)
     sub_seq_list = []
-    sub_seq_idxs = []  # type: list[list[int]]  # list of list of seqs
+    sub_seq_idxs = []  # type: typing.List[typing.List[int]]  # list of list of seqs
     sub_seq_idx = 0
     for seq_tag in seq_list:
       sub_seq_tags = seq_tag.split(self.seq_tag_delim)
@@ -967,21 +1144,43 @@ class ConcatSeqsDataset(CachedDataset2):
     return DatasetSeq(seq_idx=seq_idx, seq_tag=seq_tag, features=features)
 
   def get_data_keys(self):
+    """
+    :rtype: list[str]
+    """
     return self.sub_dataset.get_data_keys()
 
   def get_target_list(self):
+    """
+    :rtype: list[str]
+    """
     return self.sub_dataset.get_target_list()
 
   def get_data_dtype(self, key):
+    """
+    :param str key:
+    :rtype: str
+    """
     return self.sub_dataset.get_data_dtype(key)
 
   def get_data_dim(self, key):
+    """
+    :param str key:
+    :rtype: int
+    """
     return self.sub_dataset.get_data_dim(key)
 
   def is_data_sparse(self, key):
+    """
+    :param str key:
+    :rtype: bool
+    """
     return self.sub_dataset.is_data_sparse(key)
 
   def get_data_shape(self, key):
+    """
+    :param str key:
+    :rtype: list[int]
+    """
     return self.sub_dataset.get_data_shape(key)
 
 
@@ -1075,7 +1274,8 @@ class ChunkShuffleDataset(CachedDataset2):
     See EngineUtil.assign_dev_data() for comparison.
     :returns whether we added some more
     """
-    if not self.batch_gen.has_more(): return False
+    if not self.batch_gen.has_more():
+      return False
     batches = self.batch_gen.peek_next_n(1)
     for batch in batches:
       assert batch.seqs
@@ -1097,7 +1297,8 @@ class ChunkShuffleDataset(CachedDataset2):
     return True
 
   def _add_more_until(self, end, shuffle=False):
-    if self.added_data and end <= self.added_data[-1].seq_idx: return True
+    if self.added_data and end <= self.added_data[-1].seq_idx:
+      return True
     while self._add_more():
       assert self.added_data
       if end <= self.added_data[-1].seq_idx:
@@ -1120,9 +1321,12 @@ class ChunkShuffleDataset(CachedDataset2):
     :returns whether seq_idx < num_seqs. In case num_seqs is not known in advance, it will wait
     until it knows that n is behind the end or that we have the seq.
     """
-    if self._num_seqs is not None: return seq_idx < self._num_seqs
-    if seq_idx < self.expected_load_seq_start: return True
-    if self.added_data and seq_idx <= self.added_data[-1].seq_idx: return True
+    if self._num_seqs is not None:
+      return seq_idx < self._num_seqs
+    if seq_idx < self.expected_load_seq_start:
+      return True
+    if self.added_data and seq_idx <= self.added_data[-1].seq_idx:
+      return True
     return self._add_more_until(seq_idx)
 
   def _load_seqs(self, start, end):
@@ -1149,12 +1353,17 @@ class ChunkShuffleDataset(CachedDataset2):
     assert False, "should not be called"
 
   def get_target_list(self):
+    """
+    :rtype: list[str]
+    """
     return self.dataset.get_target_list()
 
 
 def _simple_to_bool(v):
-  if v == 0: v = False
-  if v == 1: v = True
+  if v == 0:
+    v = False
+  if v == 1:
+    v = True
   assert isinstance(v, bool)
   return v
 
@@ -1169,5 +1378,3 @@ def _select_dtype(key, data_dims, data_dtypes):
     return "int32"  # standard for 1-of-k
   else:
     return "float32"  # standard otherwise
-
-

@@ -1,17 +1,25 @@
 
+"""
+Some datasets for artificially generated data.
+"""
+
 from __future__ import print_function
 
 from Dataset import Dataset, DatasetSeq, convert_data_dims
 from CachedDataset2 import CachedDataset2
 from HDFDataset import HDFDataset
-from Util import class_idx_seq_to_1_of_k, CollectionReadCheckCovered
+from Util import class_idx_seq_to_1_of_k, CollectionReadCheckCovered, PY3
 from Log import log
 import numpy
 import re
 import sys
+import typing
 
 
 class GeneratingDataset(Dataset):
+  """
+  Some base class for datasets with artificially generated data.
+  """
 
   _input_classes = None
   _output_classes = None
@@ -29,12 +37,14 @@ class GeneratingDataset(Dataset):
     self.num_inputs = input_dim
     output_dim = convert_data_dims(output_dim, leave_dict_as_is=False)
     if "data" not in output_dim and input_dim is not None:
-      output_dim["data"] = [input_dim * self.window, 2]  # not sparse
+      output_dim["data"] = (input_dim * self.window, 2)  # not sparse
     self.num_outputs = output_dim
     self.expected_load_seq_start = 0
     self._num_seqs = num_seqs
     self.random = numpy.random.RandomState(1)
     self.fixed_random_seed = fixed_random_seed  # useful when used as eval dataset
+    self.reached_final_seq = False
+    self.added_data = []  # type: typing.List[DatasetSeq]
 
   def init_seq_order(self, epoch=None, seq_list=None):
     """
@@ -48,7 +58,7 @@ class GeneratingDataset(Dataset):
     self._num_timesteps = 0
     self.reached_final_seq = False
     self.expected_load_seq_start = 0
-    self.added_data = []; " :type: list[DatasetSeq] "
+    self.added_data = []
     return True
 
   def _cleanup_old_seqs(self, seq_idx_end):
@@ -69,12 +79,21 @@ class GeneratingDataset(Dataset):
         seq_idx, start_loaded_seq_idx, end_loaded_seq_idx))
 
   def _get_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq|None
+    """
     for data in self.added_data:
       if data.seq_idx == seq_idx:
         return data
     return None
 
   def is_cached(self, start, end):
+    """
+    :param int start:
+    :param int end:
+    :rtype: bool
+    """
     # Always False, to force that we call self._load_seqs().
     # This is important for our buffer management.
     return False
@@ -116,36 +135,68 @@ class GeneratingDataset(Dataset):
     assert False, "Shuffling in GeneratingDataset does not make sense."
 
   def get_num_timesteps(self):
+    """
+    :rtype: int
+    """
     assert self.reached_final_seq
     return self._num_timesteps
 
   @property
   def num_seqs(self):
+    """
+    :rtype: int
+    """
     return self._num_seqs
 
-  def get_seq_length(self, sorted_seq_idx):
+  def get_seq_length(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: Util.NumbersDict
+    """
     # get_seq_length() can be called before the seq is loaded via load_seqs().
     # Thus, we just call load_seqs() ourselves here.
-    assert sorted_seq_idx >= self.expected_load_seq_start
-    self.load_seqs(self.expected_load_seq_start, sorted_seq_idx + 1)
-    return self._get_seq(sorted_seq_idx).num_frames
+    assert seq_idx >= self.expected_load_seq_start
+    self.load_seqs(self.expected_load_seq_start, seq_idx + 1)
+    return self._get_seq(seq_idx).num_frames
 
   def get_data(self, seq_idx, key):
+    """
+    :param int seq_idx:
+    :param str key:
+    :rtype: numpy.ndarray
+    """
     return self._get_seq(seq_idx).features[key]
 
   def get_input_data(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: numpy.ndarray
+    """
     return self.get_data(seq_idx, "data")
 
   def get_targets(self, target, seq_idx):
+    """
+    :param int seq_idx:
+    :param str target:
+    :rtype: numpy.ndarray
+    """
     return self.get_data(seq_idx, target)
 
   def get_ctc_targets(self, sorted_seq_idx):
+    """
+    :param int sorted_seq_idx:
+    :rtype: typing.Optional[numpy.ndarray]
+    """
     self._check_loaded_seq_idx(sorted_seq_idx)
     assert self._get_seq(sorted_seq_idx).ctc_targets
 
-  def get_tag(self, sorted_seq_idx):
-    self._check_loaded_seq_idx(sorted_seq_idx)
-    return self._get_seq(sorted_seq_idx).seq_tag
+  def get_tag(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: str
+    """
+    self._check_loaded_seq_idx(seq_idx)
+    return self._get_seq(seq_idx).seq_tag
 
 
 class Task12AXDataset(GeneratingDataset):
@@ -165,6 +216,9 @@ class Task12AXDataset(GeneratingDataset):
       **kwargs)
 
   def get_random_seq_len(self):
+    """
+    :rtype: int
+    """
     return self.random.randint(10, 100)
 
   def generate_input_seq(self, seq_len):
@@ -172,6 +226,9 @@ class Task12AXDataset(GeneratingDataset):
     Somewhat made up probability distribution.
     Try to make in a way that at least some "R" will occur in the output seq.
     Otherwise, "R"s are really rare.
+
+    :param int seq_len:
+    :rtype: list[int]
     """
     seq = self.random.choice(["", "1", "2"])
     while len(seq) < seq_len:
@@ -211,6 +268,7 @@ class Task12AXDataset(GeneratingDataset):
   def estimate_output_class_priors(self, num_trials, seq_len=10):
     """
     :type num_trials: int
+    :param int seq_len:
     :rtype: (float, float)
     """
     count_l, count_r = 0, 0
@@ -222,6 +280,10 @@ class Task12AXDataset(GeneratingDataset):
     return float(count_l) / (num_trials * seq_len), float(count_r) / (num_trials * seq_len)
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     seq_len = self.get_random_seq_len()
     input_seq = self.generate_input_seq(seq_len)
     output_seq = self.make_output_seq(input_seq)
@@ -250,11 +312,14 @@ class TaskEpisodicCopyDataset(GeneratingDataset):
       **kwargs)
 
   def generate_input_seq(self):
+    """
+    :rtype: list[int]
+    """
     seq = ""
     # Start with random chars.
     rnd_char_len = self.random.randint(1, 10)
     seq += "".join([self.random.choice(list(self._input_classes[2:]))
-                    for i in range(rnd_char_len)])
+                    for _ in range(rnd_char_len)])
     blank_len = self.random.randint(1, 100)
     seq += " " * blank_len  # blanks
     seq += "."  # 1 delim
@@ -275,9 +340,12 @@ class TaskEpisodicCopyDataset(GeneratingDataset):
       c = input_classes[i]
       if state == 0:
         output_seq_str += " "
-        if c == " ": pass  # just ignore
-        elif c == ".": state = 1  # start with recall now
-        else: input_mem += c
+        if c == " ":
+          pass  # just ignore
+        elif c == ".":
+          state = 1  # start with recall now
+        else:
+          input_mem += c
       else:  # recall from memory
         # Ignore input.
         if not input_mem:
@@ -288,6 +356,10 @@ class TaskEpisodicCopyDataset(GeneratingDataset):
     return list(map(cls._output_classes.index, output_seq_str))
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     input_seq = self.generate_input_seq()
     output_seq = self.make_output_seq(input_seq)
     features = class_idx_seq_to_1_of_k(input_seq, num_classes=len(self._input_classes))
@@ -315,6 +387,9 @@ class TaskXmlModelingDataset(GeneratingDataset):
     self.limit_stack_depth = limit_stack_depth
 
   def generate_input_seq(self):
+    """
+    :rtype: list[int]
+    """
     # Because this is a prediction task, start with blank,
     # and the output seq should predict the next char after the blank.
     seq = " "
@@ -323,7 +398,7 @@ class TaskXmlModelingDataset(GeneratingDataset):
       if not xml_stack or (len(xml_stack) < self.limit_stack_depth and self.random.rand() > 0.6):
         tag_len = self.random.randint(1, 10)
         tag = "".join([self.random.choice(list(self._input_classes[4:]))
-                       for i in range(tag_len)])
+                       for _ in range(tag_len)])
         seq += "<%s>" % tag
         xml_stack += [tag]
       else:
@@ -338,7 +413,6 @@ class TaskXmlModelingDataset(GeneratingDataset):
     :type input_seq: list[int]
     :rtype: list[int]
     """
-    input_classes = cls._input_classes
     input_seq_str = "".join(cls._input_classes[i] for i in input_seq)
     xml_stack = []
     output_seq_str = ""
@@ -380,6 +454,10 @@ class TaskXmlModelingDataset(GeneratingDataset):
     return list(map(cls._output_classes.index, output_seq_str))
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     input_seq = self.generate_input_seq()
     output_seq = self.make_output_seq(input_seq)
     features = class_idx_seq_to_1_of_k(input_seq, num_classes=len(self._input_classes))
@@ -405,6 +483,9 @@ class TaskVariableAssignmentDataset(GeneratingDataset):
       **kwargs)
 
   def generate_input_seq(self):
+    """
+    :rtype: list[int]
+    """
     seq = ""
     from collections import OrderedDict
     store = OrderedDict()
@@ -414,12 +495,14 @@ class TaskVariableAssignmentDataset(GeneratingDataset):
       key_len = self.random.randint(2, 5)
       while True:  # find unique key
         key = "".join([self.random.choice(list(self._input_classes[7:]))
-                       for i in range(key_len)])
-        if key not in store: break
+                       for _ in range(key_len)])
+        if key not in store:
+          break
       value_len = self.random.randint(1, 2)
       value = "".join([self.random.choice(list(self._input_classes[7:]))
-                       for i in range(value_len)])
-      if seq: seq += ","
+                       for _ in range(value_len)])
+      if seq:
+        seq += ","
       seq += "S(%s,%s)" % (key, value)
       store[key] = value
     # Now one query.
@@ -435,7 +518,6 @@ class TaskVariableAssignmentDataset(GeneratingDataset):
     :type input_seq: list[int]
     :rtype: list[int]
     """
-    input_classes = cls._input_classes
     input_seq_str = "".join(cls._input_classes[i] for i in input_seq)
     store = {}
     key, value = "", ""
@@ -444,10 +526,14 @@ class TaskVariableAssignmentDataset(GeneratingDataset):
     for c in input_seq_str:
       if state == 0:
         key = ""
-        if c == "S": state = 1  # store
-        elif c == "Q": state = 2  # query
-        elif c in " ,": pass  # can be ignored
-        else: assert False, "c %r in %r" % (c, input_seq_str)
+        if c == "S":
+          state = 1  # store
+        elif c == "Q":
+          state = 2  # query
+        elif c in " ,":
+          pass  # can be ignored
+        else:
+          assert False, "c %r in %r" % (c, input_seq_str)
         output_seq_str += " "
       elif state == 1:  # store
         assert c == "(", repr(input_seq_str)
@@ -501,6 +587,10 @@ class TaskVariableAssignmentDataset(GeneratingDataset):
     return list(map(cls._output_classes.index, output_seq_str))
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     input_seq = self.generate_input_seq()
     output_seq = self.make_output_seq(input_seq)
     features = class_idx_seq_to_1_of_k(input_seq, num_classes=len(self._input_classes))
@@ -537,6 +627,9 @@ class TaskNumberBaseConvertDataset(GeneratingDataset):
     self.max_input_seq_len = max_input_seq_len
 
   def get_random_input_seq_len(self):
+    """
+    :rtype: int
+    """
     return self.random.randint(self.min_input_seq_len, self.max_input_seq_len + 1)
 
   def generate_input_seq(self):
@@ -544,7 +637,7 @@ class TaskNumberBaseConvertDataset(GeneratingDataset):
     :rtype: list[int]
     """
     seq_len = self.get_random_input_seq_len()
-    seq = [self.random.randint(0, len(self._input_classes)) for i in range(seq_len)]
+    seq = [self.random.randint(0, len(self._input_classes)) for _ in range(seq_len)]
     return seq
 
   def make_output_seq(self, input_seq):
@@ -559,9 +652,15 @@ class TaskNumberBaseConvertDataset(GeneratingDataset):
     while number:
       output_seq.insert(0, number % self.output_base)
       number //= self.output_base
+    if not output_seq:
+      output_seq = [0]
     return output_seq
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     input_seq = self.generate_input_seq()
     output_seq = self.make_output_seq(input_seq)
     features = numpy.array(input_seq)
@@ -570,18 +669,38 @@ class TaskNumberBaseConvertDataset(GeneratingDataset):
 
 
 class DummyDataset(GeneratingDataset):
+  """
+  Some dummy data, which does not have any meaning.
+  If you want to have artificial data with some meaning, look at other datasets here.
+  The input are some dense data, the outputs are sparse.
+  """
 
   def __init__(self, input_dim, output_dim, num_seqs, seq_len=2,
                input_max_value=10.0, input_shift=None, input_scale=None, **kwargs):
+    """
+    :param int input_dim:
+    :param int output_dim:
+    :param int|float num_seqs:
+    :param int|dict[str,int] seq_len:
+    :param float input_max_value:
+    :param float|None input_shift:
+    :param float|None input_scale:
+    """
     super(DummyDataset, self).__init__(input_dim=input_dim, output_dim=output_dim, num_seqs=num_seqs, **kwargs)
     self.seq_len = seq_len
     self.input_max_value = input_max_value
-    if input_shift is None: input_shift = -input_max_value / 2.0
+    if input_shift is None:
+      input_shift = -input_max_value / 2.0
     self.input_shift = input_shift
-    if input_scale is None: input_scale = 1.0 / self.input_max_value
+    if input_scale is None:
+      input_scale = 1.0 / self.input_max_value
     self.input_scale = input_scale
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     seq_len = self.seq_len
     i1 = seq_idx
     i2 = i1 + seq_len * self.num_inputs
@@ -594,9 +713,23 @@ class DummyDataset(GeneratingDataset):
 
 
 class DummyDatasetMultipleSequenceLength(DummyDataset):
+  """
+  Like :class:`DummyDataset` but has provides seqs with different sequence lengths.
+  """
 
-  def __init__(self, input_dim, output_dim, num_seqs, seq_len={'data': 10, 'classes':20},
+  def __init__(self, input_dim, output_dim, num_seqs, seq_len=None,
                input_max_value=10.0, input_shift=None, input_scale=None, **kwargs):
+    """
+    :param int input_dim:
+    :param int output_dim:
+    :param int|float num_seqs:
+    :param int|dict[str,int] seq_len:
+    :param float input_max_value:
+    :param float|None input_shift:
+    :param float|None input_scale:
+    """
+    if seq_len is None:
+      seq_len = {'data': 10, 'classes': 20}
     super(DummyDatasetMultipleSequenceLength, self).__init__(
       input_dim=input_dim,
       output_dim=output_dim,
@@ -605,10 +738,14 @@ class DummyDatasetMultipleSequenceLength(DummyDataset):
       input_max_value=input_max_value,
       input_shift=input_shift,
       input_scale=input_scale,
-      **kwargs
-    )
+      **kwargs)
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
+    assert isinstance(self.seq_len, dict)
     seq_len_data = self.seq_len['data']
     seq_len_classes = self.seq_len['classes']
     i1 = seq_idx
@@ -676,15 +813,14 @@ class StaticDataset(GeneratingDataset):
     output_dim = convert_data_dims(output_dim, leave_dict_as_is=False)
     if input_dim is not None and "data" not in output_dim:
       assert "data" in self.data_keys
-      output_dim["data"] = [input_dim, 2]  # assume dense, not sparse
+      output_dim["data"] = (input_dim, 2)  # assume dense, not sparse
     for key, value in first_data.items():
       if key not in output_dim:
-        output_dim[key] = [value.shape[-1] if value.ndim >= 2 else 0, len(value.shape)]
+        output_dim[key] = (value.shape[-1] if value.ndim >= 2 else 0, len(value.shape))
     if input_dim is None and "data" in self.data_keys:
       input_dim = output_dim["data"][0]
     for key in self.data_keys:
       first_data_output = first_data[key]
-      assert len(first_data_output.shape) <= 2  # (time[,dim])
       assert key in output_dim
       assert output_dim[key][1] == len(first_data_output.shape)
       if len(first_data_output.shape) >= 2:
@@ -694,26 +830,51 @@ class StaticDataset(GeneratingDataset):
     super(StaticDataset, self).__init__(input_dim=input_dim, output_dim=output_dim, num_seqs=num_seqs, **kwargs)
 
   def generate_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
     data = self.data[seq_idx]
     return DatasetSeq(seq_idx=seq_idx, features={key: data[key] for key in self.data_keys})
 
   def get_data_keys(self):
+    """
+    :rtype: list[str]
+    """
     return self.data_keys
 
   def get_target_list(self):
+    """
+    :rtype: list[str]
+    """
     return self.target_list
 
   def get_data_dtype(self, key):
+    """
+    :param str key:
+    :rtype: str
+    """
     return self.data[0][key].dtype
 
 
 class CopyTaskDataset(GeneratingDataset):
+  """
+  Copy task.
+  Input/output is exactly the same random sequence of sparse labels.
+  """
 
   def __init__(self, nsymbols, minlen=0, maxlen=0, minlen_epoch_factor=0, maxlen_epoch_factor=0, **kwargs):
+    """
+    :param int nsymbols:
+    :param int minlen:
+    :param int maxlen:
+    :param float minlen_epoch_factor:
+    :param float maxlen_epoch_factor:
+    """
     # Sparse data.
     super(CopyTaskDataset, self).__init__(input_dim=nsymbols,
-                                          output_dim={"data": [nsymbols, 1],
-                                                      "classes": [nsymbols, 1]},
+                                          output_dim={"data": (nsymbols, 1),
+                                                      "classes": (nsymbols, 1)},
                                           **kwargs)
 
     assert nsymbols <= 256
@@ -724,6 +885,9 @@ class CopyTaskDataset(GeneratingDataset):
     self.maxlen_epoch_factor = maxlen_epoch_factor
 
   def get_random_seq_len(self):
+    """
+    :rtype: int
+    """
     assert isinstance(self.epoch, int)
     minlen = int(self.minlen + self.minlen_epoch_factor * self.epoch)
     maxlen = int(self.maxlen + self.maxlen_epoch_factor * self.epoch)
@@ -736,26 +900,15 @@ class CopyTaskDataset(GeneratingDataset):
     :rtype: DatasetSeq
     """
     seq_len = self.get_random_seq_len()
-    seq = [self.random.randint(0, self.nsymbols) for i in range(seq_len)]
+    seq = [self.random.randint(0, self.nsymbols) for _ in range(seq_len)]
     seq_np = numpy.array(seq, dtype="int8")
     return DatasetSeq(seq_idx=seq_idx, features=seq_np, targets={"classes": seq_np})
 
 
-class _TFKerasDataset(CachedDataset2):
-  """
-  Wraps around any dataset from tf.contrib.keras.datasets.
-  See: https://www.tensorflow.org/versions/master/api_docs/python/tf/contrib/keras/datasets
-  TODO: Should maybe be moved to a separate file. (Only here because of tf.contrib.keras.datasets.reuters).
-  """
-  # TODO...
-
-
-class _NltkCorpusReaderDataset(CachedDataset2):
-  """
-  Wraps around any dataset from nltk.corpus.
-  TODO: Should maybe be moved to a separate file, e.g. CorpusReaderDataset.py or so?
-  """
-  # TODO ...
+# Multiple external sources where we could write automatic wrappers:
+# * https://github.com/tensorflow/datasets
+# * tf.contrib.keras.datasets, https://www.tensorflow.org/api_docs/python/tf/keras/datasets
+# * nltk.corpus
 
 
 class ExtractAudioFeatures:
@@ -767,18 +920,27 @@ class ExtractAudioFeatures:
   def __init__(self,
                window_len=0.025, step_len=0.010,
                num_feature_filters=None, with_delta=False, norm_mean=None, norm_std_dev=None,
-               features="mfcc", random_permute=None, random_state=None, raw_ogg_opts=None):
+               features="mfcc", feature_options=None, random_permute=None, random_state=None, raw_ogg_opts=None,
+               post_process=None,
+               sample_rate=None,
+               peak_normalization=True, preemphasis=None, join_frames=None):
     """
     :param float window_len: in seconds
     :param float step_len: in seconds
     :param int num_feature_filters:
     :param bool|int with_delta:
-    :param numpy.ndarray|str|None norm_mean: if str, will interpret as filename
-    :param numpy.ndarray|str|None norm_std_dev: if str, will interpret as filename
+    :param numpy.ndarray|str|int|float|None norm_mean: if str, will interpret as filename
+    :param numpy.ndarray|str|int|float|None norm_std_dev: if str, will interpret as filename
     :param str features: "mfcc", "log_mel_filterbank", "log_log_mel_filterbank", "raw", "raw_ogg"
+    :param dict[str]|None feature_options: provide additional parameters for the feature function
     :param CollectionReadCheckCovered|dict[str]|bool|None random_permute:
     :param numpy.random.RandomState|None random_state:
     :param dict[str]|None raw_ogg_opts:
+    :param function post_process:
+    :param int|None sample_rate:
+    :param bool peak_normalization: set to False to disable the peak normalization for audio files
+    :param float|None preemphasis: set a preemphasis filter coefficient
+    :param int|None join_frames: concatenate multiple frames together to a superframe
     :return: (audio_len // int(step_len * sample_rate), (with_delta + 1) * num_feature_filters), float32
     :rtype: numpy.ndarray
     """
@@ -792,14 +954,19 @@ class ExtractAudioFeatures:
       else:
         num_feature_filters = 40  # was the old default
     self.num_feature_filters = num_feature_filters
+    self.preemphasis = preemphasis
     if isinstance(with_delta, bool):
       with_delta = 1 if with_delta else 0
     assert isinstance(with_delta, int) and with_delta >= 0
     self.with_delta = with_delta
+    # join frames needs to be set before norm loading
+    self.join_frames = join_frames
     if norm_mean is not None:
-      norm_mean = self._load_feature_vec(norm_mean)
+      if not isinstance(norm_mean, (int, float)):
+        norm_mean = self._load_feature_vec(norm_mean)
     if norm_std_dev is not None:
-      norm_std_dev = self._load_feature_vec(norm_std_dev)
+      if not isinstance(norm_std_dev, (int, float)):
+        norm_std_dev = self._load_feature_vec(norm_std_dev)
     self.norm_mean = norm_mean
     self.norm_std_dev = norm_std_dev
     if random_permute and not isinstance(random_permute, CollectionReadCheckCovered):
@@ -807,7 +974,11 @@ class ExtractAudioFeatures:
     self.random_permute_opts = random_permute
     self.random_state = random_state
     self.features = features
+    self.feature_options = feature_options
+    self.post_process = post_process
+    self.sample_rate = sample_rate
     self.raw_ogg_opts = raw_ogg_opts
+    self.peak_normalization = peak_normalization
 
   def _load_feature_vec(self, value):
     """
@@ -823,9 +994,10 @@ class ExtractAudioFeatures:
     assert value.shape == (self.get_feature_dimension(),)
     return value.astype("float32")
 
-  def get_audio_features_from_raw_bytes(self, raw_bytes):
+  def get_audio_features_from_raw_bytes(self, raw_bytes, seq_name=None):
     """
     :param io.BytesIO raw_bytes:
+    :param str|None seq_name:
     :return: shape (time,feature_dim)
     :rtype: numpy.ndarray
     """
@@ -847,18 +1019,30 @@ class ExtractAudioFeatures:
     # Instead, use PySoundFile, which is also faster. See here for discussions:
     # https://github.com/beetbox/audioread/issues/64
     # https://github.com/librosa/librosa/issues/681
+    # noinspection PyPackageRequirements
     import soundfile  # pip install pysoundfile
+    # integer audio formats are automatically transformed in the range [-1,1]
     audio, sample_rate = soundfile.read(raw_bytes)
-    return self.get_audio_features(audio=audio, sample_rate=sample_rate)
+    return self.get_audio_features(audio=audio, sample_rate=sample_rate, seq_name=seq_name)
 
-  def get_audio_features(self, audio, sample_rate):
+  def get_audio_features(self, audio, sample_rate, seq_name=None):
     """
     :param numpy.ndarray audio: raw audio samples, shape (audio_len,)
     :param int sample_rate: e.g. 22050
+    :param str|None seq_name:
+    :return: array (time,dim), dim == self.get_feature_dimension()
     :rtype: numpy.ndarray
     """
-    peak = numpy.max(numpy.abs(audio))
-    audio /= peak
+    if self.sample_rate is not None:
+      assert sample_rate == self.sample_rate, "currently no conversion implemented..."
+
+    if self.preemphasis:
+      from scipy import signal
+      audio = signal.lfilter([1, -self.preemphasis], [1], audio)
+
+    if self.peak_normalization:
+      peak = numpy.max(numpy.abs(audio))
+      audio /= peak
 
     if self.random_permute_opts and self.random_permute_opts.truth_value:
       audio = _get_random_permuted_audio(
@@ -879,12 +1063,20 @@ class ExtractAudioFeatures:
         "num_feature_filters": self.num_feature_filters,
         "audio": audio}
 
+      if self.feature_options is not None:
+        assert isinstance(self.feature_options, dict)
+        kwargs.update(self.feature_options)
+
       if self.features == "mfcc":
         feature_data = _get_audio_features_mfcc(**kwargs)
       elif self.features == "log_mel_filterbank":
         feature_data = _get_audio_log_mel_filterbank(**kwargs)
       elif self.features == "log_log_mel_filterbank":
         feature_data = _get_audio_log_log_mel_filterbank(**kwargs)
+      elif self.features == "db_mel_filterbank":
+        feature_data = _get_audio_db_mel_filterbank(**kwargs)
+      elif self.features == "linear_spectrogram":
+        feature_data = _get_audio_linear_spectrogram(**kwargs)
       else:
         raise Exception("non-supported feature type %r" % (self.features,))
 
@@ -892,20 +1084,76 @@ class ExtractAudioFeatures:
     assert feature_data.shape[1] == self.num_feature_filters
 
     if self.with_delta:
+      # noinspection PyPackageRequirements
       import librosa
       deltas = [librosa.feature.delta(feature_data, order=i, axis=0).astype("float32")
                 for i in range(1, self.with_delta + 1)]
       feature_data = numpy.concatenate([feature_data] + deltas, axis=1)
-      assert feature_data.shape[1] == self.get_feature_dimension()
+      assert feature_data.shape[1] == (self.with_delta + 1) * self.num_feature_filters
 
     if self.norm_mean is not None:
-      feature_data -= self.norm_mean[None, :]
+      if isinstance(self.norm_mean, (int, float)):
+        feature_data -= self.norm_mean
+      else:
+        feature_data -= self.norm_mean[None, :]
+
     if self.norm_std_dev is not None:
-      feature_data /= self.norm_std_dev[None, :]
+      if isinstance(self.norm_std_dev, (int, float)):
+        feature_data /= self.norm_std_dev
+      else:
+        feature_data /= self.norm_std_dev[None, :]
+
+    if self.join_frames is not None:
+      pad_len = self.join_frames - (feature_data.shape[0] % self.join_frames)
+      pad_len = pad_len % self.join_frames
+      new_len = feature_data.shape[0] + pad_len
+      feature_data = numpy.pad(feature_data, pad_width=((0, pad_len), (0, 0)), mode="edge")
+      feature_data = numpy.reshape(feature_data,
+                                   newshape=(new_len // self.join_frames, feature_data.shape[1] * self.join_frames),
+                                   order='C')
+
+    assert feature_data.shape[1] == self.get_feature_dimension()
+    if self.post_process:
+      feature_data = self.post_process(feature_data, seq_name=seq_name)
+      assert isinstance(feature_data, numpy.ndarray) and len(feature_data.shape) == 2
+      assert feature_data.shape[1] == self.get_feature_dimension()
     return feature_data
 
   def get_feature_dimension(self):
-    return (self.with_delta + 1) * self.num_feature_filters
+    """
+    :rtype: int
+    """
+    return (self.with_delta + 1) * self.num_feature_filters * (self.join_frames or 1)
+
+
+def _get_audio_linear_spectrogram(audio, sample_rate, window_len=0.025, step_len=0.010, num_feature_filters=512):
+  """
+  Computes linear spectrogram features from an audio signal.
+  Drops the DC component.
+
+  :param numpy.ndarray audio: raw audio samples, shape (audio_len,)
+  :param int sample_rate: e.g. 22050
+  :param float window_len: in seconds
+  :param float step_len: in seconds
+  :return: (audio_len // int(step_len * sample_rate), num_feature_filters), float32
+  :rtype: numpy.ndarray
+  """
+  # noinspection PyPackageRequirements
+  import librosa
+
+  min_n_fft = int(window_len * sample_rate)
+  assert num_feature_filters*2 >= min_n_fft
+  assert num_feature_filters % 2 == 0
+
+  spectrogram = numpy.abs(librosa.core.stft(
+    audio, hop_length=int(step_len * sample_rate), win_length=int(window_len * sample_rate), n_fft=num_feature_filters*2))
+
+  # remove the DC part
+  spectrogram = spectrogram[1:]
+
+  assert spectrogram.shape[0] == num_feature_filters
+  spectrogram = spectrogram.transpose().astype("float32")  # (time, dim)
+  return spectrogram
 
 
 def _get_audio_features_mfcc(audio, sample_rate, window_len=0.025, step_len=0.010, num_feature_filters=40):
@@ -918,6 +1166,7 @@ def _get_audio_features_mfcc(audio, sample_rate, window_len=0.025, step_len=0.01
   :return: (audio_len // int(step_len * sample_rate), num_feature_filters), float32
   :rtype: numpy.ndarray
   """
+  # noinspection PyPackageRequirements
   import librosa
   mfccs = librosa.feature.mfcc(
     audio.flatten(), sr=sample_rate,
@@ -948,6 +1197,7 @@ def _get_audio_log_mel_filterbank(audio, sample_rate, window_len=0.025, step_len
   :return: (audio_len // int(step_len * sample_rate), num_feature_filters), float32
   :rtype: numpy.ndarray
   """
+  # noinspection PyPackageRequirements
   import librosa
   mel_filterbank = librosa.feature.melspectrogram(
     audio, sr=sample_rate,
@@ -955,6 +1205,41 @@ def _get_audio_log_mel_filterbank(audio, sample_rate, window_len=0.025, step_len
     hop_length=int(step_len * sample_rate), n_fft=int(window_len * sample_rate))
   log_noise_floor = 1e-3  # prevent numeric overflow in log
   log_mel_filterbank = numpy.log(numpy.maximum(log_noise_floor, mel_filterbank))
+  assert log_mel_filterbank.shape[0] == num_feature_filters
+  log_mel_filterbank = log_mel_filterbank.transpose().astype("float32")  # (time, dim)
+  return log_mel_filterbank
+
+
+def _get_audio_db_mel_filterbank(audio, sample_rate,
+                                 window_len=0.025, step_len=0.010, num_feature_filters=80, fmin=0, min_amp=1e-10):
+  """
+  Computes log Mel-filterbank features in dezibel values from an audio signal.
+  Provides adjustable minimum frequency and minimual amplitude clipping
+
+  :param numpy.ndarray audio: raw audio samples, shape (audio_len,)
+  :param int sample_rate: e.g. 22050
+  :param float window_len: in seconds
+  :param float step_len: in seconds
+  :param int num_feature_filters: number of mel-filterbanks
+  :param int fmin: minimum frequency covered by mel filters
+  :param int min_amp: silence clipping for small amplitudes
+  :return: (audio_len // int(step_len * sample_rate), num_feature_filters), float32
+  :rtype: numpy.ndarray
+  """
+  # noinspection PyPackageRequirements
+  assert fmin >= 0
+  assert min_amp > 0
+
+  import librosa
+  mel_filterbank = librosa.feature.melspectrogram(
+    audio, sr=sample_rate,
+    n_mels=num_feature_filters,
+    hop_length=int(step_len * sample_rate),
+    n_fft=int(window_len * sample_rate),
+    fmin=fmin
+   )
+
+  log_mel_filterbank = 20 * numpy.log10(numpy.maximum(min_amp, mel_filterbank))
   assert log_mel_filterbank.shape[0] == num_feature_filters
   log_mel_filterbank = log_mel_filterbank.transpose().astype("float32")  # (time, dim)
   return log_mel_filterbank
@@ -976,6 +1261,7 @@ def _get_audio_log_log_mel_filterbank(audio, sample_rate, window_len=0.025, step
   :return: (audio_len // int(step_len * sample_rate), num_feature_filters), float32
   :rtype: numpy.ndarray
   """
+  # noinspection PyPackageRequirements
   import librosa
   mel_filterbank = librosa.feature.melspectrogram(
     audio, sr=sample_rate,
@@ -998,7 +1284,9 @@ def _get_random_permuted_audio(audio, sample_rate, opts, random_state):
   :return: audio randomly permuted
   :rtype: numpy.ndarray
   """
+  # noinspection PyPackageRequirements
   import librosa
+  # noinspection PyPackageRequirements
   import scipy.ndimage
   import warnings
   audio = audio * random_state.uniform(opts.get("rnd_scale_lower", 0.8), opts.get("rnd_scale_upper", 1.0))
@@ -1026,7 +1314,8 @@ class TimitDataset(CachedDataset2):
   Demo:
 
       tools/dump-dataset.py "{'class': 'TimitDataset', 'timit_dir': '...'}"
-      tools/dump-dataset.py "{'class': 'TimitDataset', 'timit_dir': '...', 'demo_play_audio': True, 'random_permute_audio': True}"
+      tools/dump-dataset.py "{'class': 'TimitDataset', 'timit_dir': '...',
+                              'demo_play_audio': True, 'random_permute_audio': True}"
 
   The full train data has 3696 utterances and the core test data has 192 utterances
   (24-speaker core test set).
@@ -1108,7 +1397,7 @@ class TimitDataset(CachedDataset2):
                random_permute_audio=None, num_phones=61,
                demo_play_audio=False, fixed_random_seed=None, **kwargs):
     """
-    :param str timit_dir: directory of TIMIT. should contain train/filelist.phn and test/filelist.core.phn
+    :param str|None timit_dir: directory of TIMIT. should contain train/filelist.phn and test/filelist.core.phn
     :param bool train: whether to use the train or core test data
     :param bool preload: if True, here at __init__, we will wait until we loaded all the data
     :param int num_feature_filters: e.g. number of MFCCs
@@ -1148,6 +1437,7 @@ class TimitDataset(CachedDataset2):
     from Util import CollectionReadCheckCovered
     self._random_permute_audio = CollectionReadCheckCovered.from_bool_or_dict(random_permute_audio)
 
+    self._seq_order = None  # type: typing.Optional[typing.List[int]]
     self._init_timit()
 
     self._audio_data = {}  # seq_tag -> (audio, sample_rate). loaded by self._reader_thread_main
@@ -1213,15 +1503,26 @@ class TimitDataset(CachedDataset2):
   def _reader_thread_main(self):
     import sys
     from Util import interrupt_main
+    # noinspection PyBroadException
     try:
       import better_exchook
       better_exchook.install()
 
+      # noinspection PyPackageRequirements
       import librosa
 
       for seq_tag in self._seq_tags:
         audio_filename = "%s/%s.wav" % (self._timit_dir, seq_tag)
-        audio, sample_rate = librosa.load(audio_filename, sr=None)
+        # Don't use librosa.load which internally uses audioread which would use Gstreamer as a backend,
+        # which has multiple issues:
+        # https://github.com/beetbox/audioread/issues/62
+        # https://github.com/beetbox/audioread/issues/63
+        # Instead, use PySoundFile, which is also faster. See here for discussions:
+        # https://github.com/beetbox/audioread/issues/64
+        # https://github.com/librosa/librosa/issues/681
+        # noinspection PyPackageRequirements
+        import soundfile  # pip install pysoundfile
+        audio, sample_rate = soundfile.read(audio_filename)
         with self._lock:
           self._audio_data[seq_tag] = (audio, sample_rate)
         phone_seq = self._read_phone_seq(seq_tag)
@@ -1300,6 +1601,7 @@ class TimitDataset(CachedDataset2):
         last_print_time = time.time()
       time.sleep(1)
 
+  # noinspection PyMethodMayBeStatic
   def _demo_audio_play(self, audio, sample_rate):
     """
     :param numpy.ndarray audio: shape (sample_len,)
@@ -1308,6 +1610,7 @@ class TimitDataset(CachedDataset2):
     assert audio.dtype == numpy.float32
     assert audio.ndim == 1
     try:
+      # noinspection PyPackageRequirements
       import pyaudio
     except ImportError:
       print("pip3 install --user pyaudio")
@@ -1329,6 +1632,11 @@ class TimitDataset(CachedDataset2):
     p.terminate()
 
   def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :param int epoch:
+    :param list[str]|None seq_list:
+    :rtype: bool
+    """
     assert seq_list is None
     super(TimitDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list)
     self._num_seqs = len(self._seq_tags)
@@ -1370,7 +1678,7 @@ class TimitDataset(CachedDataset2):
       norm_mean=self._norm_mean, norm_std_dev=self._norm_std_dev,
       random_permute=self._random_permute_audio, random_state=self._random)
     mfccs = audio_feature_extractor.get_audio_features(
-      audio=audio, sample_rate=sample_rate, )
+      audio=audio, sample_rate=sample_rate, seq_name=seq_tag)
     return DatasetSeq(seq_idx=seq_idx, seq_tag=seq_tag, features=mfccs, targets=phone_id_seq)
 
 
@@ -1394,6 +1702,7 @@ class NltkTimitDataset(TimitDataset):
     self._nltk_download_dir = nltk_download_dir
     super(NltkTimitDataset, self).__init__(timit_dir=None, **kwargs)
 
+  # noinspection PyPackageRequirements
   def _init_timit(self):
     """
     Sets self._seq_tags, _num_seqs, _seq_order, and _timit_dir.
@@ -1444,7 +1753,7 @@ class Vocabulary(object):
   def create_vocab(cls, **opts):
     """
     :param opts: kwargs for class
-    :rtype: Vocabulary|BytePairEncoding
+    :rtype: Vocabulary|BytePairEncoding|CharacterTargets
     """
     opts = opts.copy()
     clz = cls
@@ -1488,6 +1797,11 @@ class Vocabulary(object):
         d = pickle.load(open(filename, "rb"))
       else:
         d = eval(open(filename, "r", encoding='utf-8').read())
+        if not PY3:
+          # Any utf8 string will not be a unicode string automatically, so enforce this.
+          assert isinstance(d, dict)
+          from Util import py2_utf8_str_to_unicode
+          d = {py2_utf8_str_to_unicode(s): i for (s, i) in d.items()}
       assert isinstance(d, dict)
       assert self.unknown_label is None or self.unknown_label in d
       labels = {idx: label for (label, idx) in sorted(d.items())}
@@ -1589,10 +1903,10 @@ class BytePairEncoding(Vocabulary):
         [int(x) for x in re.sub(r'(\.0+)*$', '', bpe_file_first_line.split()[-1]).split(".")])
     else:
       self._bpe_file_version = (0, 1)
-    self._bpe_codes = [tuple(item.split()) for item in open(bpe_file, "r", encoding='utf-8').read().splitlines()]
+    self._bpe_codes = [tuple(item.split()) for item in open(bpe_file, "rb").read().decode("utf8").splitlines()]
     # some hacking to deal with duplicates (only consider first instance)
     self._bpe_codes = dict([(code, i) for (i, code) in reversed(list(enumerate(self._bpe_codes)))])
-    self._bpe_codes_reverse = dict([(pair[0] + pair[1], pair) for pair,i in self._bpe_codes.items()])
+    self._bpe_codes_reverse = dict([(pair[0] + pair[1], pair) for pair, i in self._bpe_codes.items()])
     self._bpe_encode_cache = {}
     self._bpe_separator = '@@'
 
@@ -1622,8 +1936,8 @@ class BytePairEncoding(Vocabulary):
 
     if self._bpe_file_version == (0, 1):
       word = tuple(orig) + ('</w>',)
-    elif self._bpe_file_version == (0, 2): # more consistent handling of word-final segments
-      word = tuple(orig[:-1]) + ( orig[-1] + '</w>',)
+    elif self._bpe_file_version == (0, 2):  # more consistent handling of word-final segments
+      word = tuple(orig[:-1]) + (orig[-1] + '</w>',)
     else:
       raise NotImplementedError
 
@@ -1698,15 +2012,16 @@ class BytePairEncoding(Vocabulary):
 
   def recursive_split(self, segment, bpe_codes, vocab, separator, final=False):
     """Recursively split segment into smaller units (by reversing BPE merges)
-    until all units are either in-vocabulary, or cannot be split futher."""
+    until all units are either in-vocabulary, or cannot be split further."""
 
+    # noinspection PyBroadException
     try:
       if final:
         left, right = bpe_codes[segment + '</w>']
         right = right[:-4]
       else:
         left, right = bpe_codes[segment]
-    except Exception:
+    except Exception:  # TODO fix
       # sys.stderr.write('cannot split {0} further.\n'.format(segment))
       yield segment
       return
@@ -1792,9 +2107,9 @@ class CharacterTargets(Vocabulary):
 
 class BlissDataset(CachedDataset2):
   """
-  Reads in a Bliss XML corpus (similar as :class:`LmDataset`),
-  and provides the features (similar as :class:`TimitDataset`)
-  and the orthography as words, subwords or chars (similar as :class:`TranslationDataset`).
+  Reads in a Bliss XML corpus (similar to :class:`LmDataset`),
+  and provides the features (similar to :class:`TimitDataset`)
+  and the orthography as words, subwords or chars (similar to :class:`TranslationDataset`).
 
   Example:
     ./tools/dump-dataset.py "
@@ -1805,6 +2120,9 @@ class BlissDataset(CachedDataset2):
   """
 
   class SeqInfo:
+    """
+    Covers all relevant seq info.
+    """
     __slots__ = ("idx", "tag", "orth_raw", "orth_seq", "audio_path", "audio_start", "audio_end")
 
   def __init__(self, path, vocab_file, bpe_file=None,
@@ -1819,6 +2137,7 @@ class BlissDataset(CachedDataset2):
     :param bool|int with_delta: whether to add delta features (doubles the features dim). if int, up to this degree
     """
     super(BlissDataset, self).__init__(**kwargs)
+    assert norm_mean is None and norm_std_dev is None, "%s, not yet implemented..." % self
     from Util import hms_fraction
     import time
     start_time = time.time()
@@ -1832,8 +2151,8 @@ class BlissDataset(CachedDataset2):
     self._with_delta = with_delta
     self.num_inputs *= (1 + with_delta)
     self._bpe_file = open(bpe_file, "r")
-    self._seqs = []  # type: list[BlissDataset.SeqInfo]
-    self._vocab = {}  # type: dict[str,int]  # set in self._parse_vocab
+    self._seqs = []  # type: typing.List[BlissDataset.SeqInfo]
+    self._vocab = {}  # type: typing.Dict[str,int]  # set in self._parse_vocab
     self._parse_bliss_xml(filename=path)
     # TODO: loading audio like in TimitDataset, and in parallel
     self._bpe = BytePairEncoding(vocab_file=vocab_file, bpe_file=bpe_file)
@@ -1852,12 +2171,12 @@ class BlissDataset(CachedDataset2):
     """
     # Also see LmDataset._iter_bliss.
     import gzip
-    import xml.etree.ElementTree as etree
+    import xml.etree.ElementTree as ElementTree
     corpus_file = open(filename, 'rb')
     if filename.endswith(".gz"):
       corpus_file = gzip.GzipFile(fileobj=corpus_file)
     SeqInfo = self.SeqInfo
-    context = iter(etree.iterparse(corpus_file, events=('start', 'end')))
+    context = iter(ElementTree.iterparse(corpus_file, events=('start', 'end')))
     elem_tree = []
     name_tree = []
     cur_recording = None
@@ -1930,9 +2249,9 @@ class LibriSpeechCorpus(CachedDataset2):
     :param str prefix: "train", "dev", "test", "dev-clean", "dev-other", ...
     :param str|list[str]|None orth_post_process: :func:`get_post_processor_function`, applied on orth
     :param str|None targets: "bpe" or "chars" currently, if `None`, then "bpe"
-    :param dict[str] audio: options for :class:`ExtractAudioFeatures`
-    :param dict[str] bpe: options for :class:`BytePairEncoding`
-    :param dict[str] chars: options for :class:`CharacterTargets`
+    :param dict[str]|None audio: options for :class:`ExtractAudioFeatures`
+    :param dict[str]|None bpe: options for :class:`BytePairEncoding`
+    :param dict[str]|None chars: options for :class:`CharacterTargets`
     :param bool use_zip: whether to use the ZIP files instead (better for NFS)
     :param bool use_ogg: add .ogg postfix to all files
     :param bool use_cache_manager: uses :func:`Util.cf`
@@ -1940,7 +2259,7 @@ class LibriSpeechCorpus(CachedDataset2):
     :param float|int|None fixed_random_subset:
       Value in [0,1] to specify the fraction, or integer >=1 which specifies number of seqs.
       If given, will use this random subset. This will be applied initially at loading time,
-      i.e. not dependent on the epoch. It will use an internally hardcoded fixed random seed, i.e. its deterministic.
+      i.e. not dependent on the epoch. It will use an internally hardcoded fixed random seed, i.e. it's deterministic.
     :param dict|None epoch_wise_filter: see init_seq_order
     """
     if not name:
@@ -1985,10 +2304,13 @@ class LibriSpeechCorpus(CachedDataset2):
       raise Exception("invalid targets %r. provide bpe or chars" % targets)
     self._fixed_random_seed = fixed_random_seed
     self._audio_random = numpy.random.RandomState(1)
-    self.feature_extractor = ExtractAudioFeatures(random_state=self._audio_random, **audio)
-    self.num_inputs = self.feature_extractor.get_feature_dimension()
+    self.feature_extractor = (
+      ExtractAudioFeatures(random_state=self._audio_random, **audio) if audio is not None else None)
+    self.num_inputs = self.feature_extractor.get_feature_dimension() if self.feature_extractor else 0
     self.num_outputs = {
-      "data": [self.num_inputs, 2], "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
+      "classes": [self.targets.num_labels, 1], "raw": {"dtype": "string", "shape": ()}}
+    if self.feature_extractor:
+      self.num_outputs["data"] = [self.num_inputs, 2]
     self.transs = self._collect_trans()
     self._reference_seq_order = sorted(self.transs.keys())
     if fixed_random_subset:
@@ -2002,13 +2324,14 @@ class LibriSpeechCorpus(CachedDataset2):
       self._reference_seq_order = seqs
       self.transs = {s: self.transs[s] for s in seqs}
     self.epoch_wise_filter = epoch_wise_filter
+    self._seq_order = None  # type: typing.Optional[typing.List[int]]
     self.init_seq_order()
 
   def _collect_trans(self):
     from glob import glob
     import os
     import zipfile
-    transs = {}  # type: dict[(str,int,int,int),str]  # (subdir, speaker-id, chapter-id, seq-id) -> transcription
+    transs = {}  # type: typing.Dict[typing.Tuple[str,int,int,int],str]  # (subdir, speaker-id, chapter-id, seq-id) -> transcription  # nopep8
     if self.use_zip:
       for name, zip_file in self._zip_files.items():
         assert isinstance(zip_file, zipfile.ZipFile)
@@ -2064,6 +2387,14 @@ class LibriSpeechCorpus(CachedDataset2):
     if not epoch:
       epoch = 1
     self._audio_random.seed(self._fixed_random_seed or epoch or 1)
+
+    def get_seq_len(i):
+      """
+      :param int i:
+      :rtype: int
+      """
+      return len(self.transs[self._reference_seq_order[i]])
+
     if seq_list is not None:
       seqs = [i for i in range(len(self._reference_seq_order)) if self._get_tag(i) in seq_list]
       seqs = {self._get_tag(i): i for i in seqs}
@@ -2074,10 +2405,11 @@ class LibriSpeechCorpus(CachedDataset2):
     else:
       num_seqs = len(self._reference_seq_order)
       self._seq_order = self.get_seq_order_for_epoch(
-        epoch=epoch, num_seqs=num_seqs, get_seq_len=lambda i: len(self.transs[self._reference_seq_order[i]]))
+        epoch=epoch, num_seqs=num_seqs, get_seq_len=get_seq_len)
       self._num_seqs = len(self._seq_order)
     if self.epoch_wise_filter:
       # Note: A more generic variant of this code is :class:`MetaDataset.EpochWiseFilter`.
+      from MetaDataset import EpochWiseFilter
       old_num_seqs = self._num_seqs
       any_filter = False
       for (ep_start, ep_end), value in sorted(self.epoch_wise_filter.items()):
@@ -2089,27 +2421,35 @@ class LibriSpeechCorpus(CachedDataset2):
         assert isinstance(value, dict)
         if ep_start <= epoch <= ep_end:
           any_filter = True
-          opts = CollectionReadCheckCovered(value)
+          opts = CollectionReadCheckCovered(value.copy())
           if opts.get("subdirs") is not None:
             subdirs = opts.get("subdirs", None)
             assert isinstance(subdirs, list)
             self._seq_order = [idx for idx in self._seq_order if self._reference_seq_order[idx][0] in subdirs]
             assert self._seq_order, "subdir filter %r invalid?" % (subdirs,)
-          if opts.get("max_mean_len"):
-            max_mean_len = opts.get("max_mean_len")
-            seqs = numpy.array(
-              sorted([(len(self.transs[self._reference_seq_order[idx]]), idx) for idx in self._seq_order]))
-            # Note: This is somewhat incorrect. But keep the behavior, such that old setups are reproducible.
-            num = Util.binary_search_any(
-              cmp=lambda num: numpy.mean(seqs[:num, 0]) > max_mean_len, low=1, high=len(seqs) + 1)
-            assert num is not None
-            self._seq_order = list(seqs[:num, 1])
-            print(
-              ("%s, epoch %i. Old mean seq len (transcription) is %f, new is %f, requested max is %f."
-               " Old num seqs is %i, new num seqs is %i.") %
-              (self, epoch, float(numpy.mean(seqs[:, 0])), float(numpy.mean(seqs[:num, 0])), max_mean_len,
-               len(seqs), num),
-              file=log.v4)
+          if opts.get("use_new_filter"):
+            if "subdirs" in opts.collection:
+              opts.collection.pop("subdirs")
+            self._seq_order = EpochWiseFilter.filter_epoch(
+              opts=opts, debug_msg_prefix="%s, epoch %i. " % (self, epoch),
+              get_seq_len=get_seq_len, seq_order=self._seq_order)
+          else:
+            if opts.get("max_mean_len"):
+              max_mean_len = opts.get("max_mean_len")
+              seqs = numpy.array(
+                sorted([(len(self.transs[self._reference_seq_order[idx]]), idx) for idx in self._seq_order]))
+              # Note: This is somewhat incorrect. But keep the behavior, such that old setups are reproducible.
+              # You can use the option `use_new_filter` to get a better behavior.
+              num = Util.binary_search_any(
+                cmp=lambda num_: numpy.mean(seqs[:num_, 0]) > max_mean_len, low=1, high=len(seqs) + 1)
+              assert num is not None
+              self._seq_order = list(seqs[:num, 1])
+              print(
+                ("%s, epoch %i. Old mean seq len (transcription) is %f, new is %f, requested max is %f."
+                 " Old num seqs is %i, new num seqs is %i.") %
+                (self, epoch, float(numpy.mean(seqs[:, 0])), float(numpy.mean(seqs[:num, 0])), max_mean_len,
+                 len(seqs), num),
+                file=log.v4)
           opts.assert_all_read()
           self._num_seqs = len(self._seq_order)
       if any_filter:
@@ -2120,6 +2460,10 @@ class LibriSpeechCorpus(CachedDataset2):
     return True
 
   def get_current_seq_order(self):
+    """
+    :rtype: list[int]
+    """
+    assert self._seq_order is not None
     return self._seq_order
 
   def _get_ref_seq_idx(self, seq_idx):
@@ -2131,9 +2475,16 @@ class LibriSpeechCorpus(CachedDataset2):
     return self._seq_order[seq_idx]
 
   def have_corpus_seq_idx(self):
+    """
+    :rtype: bool
+    """
     return True
 
   def get_corpus_seq_idx(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: int
+    """
     return self._get_ref_seq_idx(seq_idx)
 
   def _get_tag(self, ref_seq_idx):
@@ -2153,9 +2504,15 @@ class LibriSpeechCorpus(CachedDataset2):
     return self._get_tag(self._get_ref_seq_idx(seq_idx))
 
   def get_all_tags(self):
+    """
+    :rtype: list[str]
+    """
     return [self._get_tag(i) for i in range(len(self._reference_seq_order))]
 
   def get_total_num_seqs(self):
+    """
+    :rtype: int
+    """
     return len(self._reference_seq_order)
 
   def _get_transcription(self, seq_idx):
@@ -2201,8 +2558,12 @@ class LibriSpeechCorpus(CachedDataset2):
     :param int seq_idx:
     :rtype: DatasetSeq
     """
-    with self._open_audio_file(seq_idx) as audio_file:
-      features = self.feature_extractor.get_audio_features_from_raw_bytes(audio_file)
+    seq_tag = self.get_tag(seq_idx)
+    if self.feature_extractor:
+      with self._open_audio_file(seq_idx) as audio_file:
+        features = self.feature_extractor.get_audio_features_from_raw_bytes(audio_file, seq_name=seq_tag)
+    else:
+      features = numpy.zeros(())  # currently the API requires some dummy values...
     bpe, txt = self._get_transcription(seq_idx)
     targets = numpy.array(bpe, dtype="int32")
     raw = numpy.array(txt, dtype="object")
@@ -2210,7 +2571,303 @@ class LibriSpeechCorpus(CachedDataset2):
       features=features,
       targets={"classes": targets, "raw": raw},
       seq_idx=seq_idx,
-      seq_tag=self.get_tag(seq_idx))
+      seq_tag=seq_tag)
+
+
+class OggZipDataset(CachedDataset2):
+  """
+  Generic dataset which reads a Zip file containing Ogg files for each sequence and a text document.
+  The feature extraction settings are determined by the ``audio`` option, which is passed to :class:`ExtractAudioFeatures`.
+  Does also support Wav files, and might even support other file formats readable by the 'soundfile'
+  library (not tested). By setting ``audio`` or ``targets`` to ``None``, the dataset can be used in
+  text only or audio only mode. The content of the zip file is:
+
+    - a .txt file with the same name as the zipfile, containing a python list of dictionaries
+    - a subfolder with the same name as the zipfile, containing the audio files
+
+  The dictionaries in the .txt file must have the following structure:
+
+  .. code::
+
+    [{'seq_name': 'arbitrary_sequence_name', 'text': 'some utterance text', 'duration': 2.3, 'file': 'sequence0.wav'}, ...]
+
+  If ``seq_name`` is not included, the seq_tag will be the name of the file. ``duration`` is mandatory, as this information
+  is needed for the sequence sorting.
+
+  """
+
+  def __init__(self, path, audio, targets,
+               targets_post_process=None,
+               use_cache_manager=False,
+               fixed_random_seed=None, fixed_random_subset=None,
+               epoch_wise_filter=None,
+               **kwargs):
+    """
+    :param str path: filename to zip
+    :param dict[str]|None audio: options for :class:`ExtractAudioFeatures`. use {} for default. None means to disable.
+    :param dict[str]|None targets: options for :func:`Vocabulary.create_vocab` (e.g. :class:`BytePairEncoding`)
+    :param str|list[str]|((str)->str)|None targets_post_process: :func:`get_post_processor_function`, applied on orth
+    :param bool use_cache_manager: uses :func:`Util.cf`
+    :param int|None fixed_random_seed: for the shuffling, e.g. for seq_ordering='random'. otherwise epoch will be used
+    :param float|int|None fixed_random_subset:
+      Value in [0,1] to specify the fraction, or integer >=1 which specifies number of seqs.
+      If given, will use this random subset. This will be applied initially at loading time,
+      i.e. not dependent on the epoch. It will use an internally hardcoded fixed random seed, i.e. it's deterministic.
+    :param dict|None epoch_wise_filter: see init_seq_order
+    """
+    import os
+    import zipfile
+    import Util
+    from MetaDataset import EpochWiseFilter
+    if not isinstance(path, list) and os.path.splitext(path)[1] != ".zip" and os.path.isdir(path) and os.path.isfile(path + ".txt"):
+      # Special case (mostly for debugging) to directly access the filesystem, not via zip-file.
+      self.paths = [os.path.dirname(path)]
+      self._names = [os.path.basename(path)]
+      self._zip_files = None
+      assert not use_cache_manager, "cache manager only for zip file"
+    else:
+      self.paths = path if isinstance(path, list) else [path]
+      for path in self.paths:
+        assert os.path.splitext(path)[1] == ".zip"
+      self._names = [os.path.splitext(os.path.basename(path))[0] for path in self.paths]
+      if use_cache_manager:
+        self.paths = [Util.cf(path) for path in self.paths]
+      self._zip_files = [zipfile.ZipFile(path) for path in self.paths]
+    kwargs.setdefault("name", self._names[0])
+    super(OggZipDataset, self).__init__(**kwargs)
+    self.targets = Vocabulary.create_vocab(**targets) if targets is not None else None
+    if self.targets:
+      self.labels["classes"] = self.targets.labels
+    self.targets_post_process = None  # type: typing.Optional[typing.Callable[[str],str]]
+    if targets_post_process:
+      if callable(targets_post_process):
+        self.targets_post_process = targets_post_process
+      else:
+        from LmDataset import get_post_processor_function
+        self.targets_post_process = get_post_processor_function(targets_post_process)
+    self._fixed_random_seed = fixed_random_seed
+    self._audio_random = numpy.random.RandomState(1)
+    self.feature_extractor = (
+      ExtractAudioFeatures(random_state=self._audio_random, **audio) if audio is not None else None)
+    self.num_inputs = self.feature_extractor.get_feature_dimension() if self.feature_extractor else 0
+    self.num_outputs = {"raw": {"dtype": "string", "shape": ()}}
+    if self.targets:
+      self.num_outputs["classes"] = [self.targets.num_labels, 1]
+    if self.feature_extractor:
+      self.num_outputs["data"] = [self.num_inputs, 2]
+    self._data = self._collect_data()
+    if fixed_random_subset:
+      self._filter_fixed_random_subset(fixed_random_subset)
+    self.epoch_wise_filter = EpochWiseFilter(epoch_wise_filter) if epoch_wise_filter else None
+    self._seq_order = None  # type: typing.Optional[typing.List[int]]
+    self.init_seq_order()
+
+  def _read(self, filename, zip_index):
+    """
+    :param str filename: in zip-file
+    :param int zip_index: index of the zip file to load, unused when loading without zip
+    :rtype: bytes
+    """
+    if self._zip_files is not None:
+      return self._zip_files[zip_index].read(filename)
+    return open("%s/%s" % (self.paths[0], filename), "rb").read()
+
+  def _collect_data_part(self, zip_index):
+    """
+    collect all the entries of a single zip-file or txt file
+    :param int zip_index: index of the zip-file in self._zip_files, unused when loading without zip
+    :return: data entries
+    :rtype: list[dict[str]]
+    """
+    data = eval(self._read("%s.txt" % self._names[zip_index], zip_index))  # type: typing.List[typing.Dict[str]]
+    assert data and isinstance(data, list)
+    first_entry = data[0]
+    assert isinstance(first_entry, dict)
+    assert isinstance(first_entry["text"], str)
+    assert isinstance(first_entry["duration"], float)
+    # when 'audio' is None and sequence names are given, this dataset can be used in text-only mode
+    if "file" in first_entry:
+      assert isinstance(first_entry["file"], str)
+    else:
+      assert self.feature_extractor, "feature extraction is enabled, but no audio files are specified"
+      assert isinstance(first_entry["seq_name"], str)
+    # add index to data list
+    for entry in data:
+      entry['_zip_file_index'] = zip_index
+    return data
+
+  def _collect_data(self):
+    """
+    :return: entries
+    :rtype: list[dict[str]]
+    """
+    data = []
+    if self._zip_files:
+      for zip_index in range(len(self._zip_files)):
+        zip_data = self._collect_data_part(zip_index)
+        data += zip_data
+    else:
+      # collect data from a txt file
+      data = self._collect_data_part(0)
+    return data
+
+  def _filter_fixed_random_subset(self, fixed_random_subset):
+    """
+    :param int fixed_random_subset:
+    """
+    if 0 < fixed_random_subset < 1:
+      fixed_random_subset = int(len(self._data) * fixed_random_subset)
+    assert isinstance(fixed_random_subset, int) and fixed_random_subset > 0
+    rnd = numpy.random.RandomState(42)
+    seqs = self._data
+    rnd.shuffle(seqs)
+    seqs = seqs[:fixed_random_subset]
+    self._data = seqs
+
+  def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    If random_shuffle_epoch1, for epoch 1 with "random" ordering, we leave the given order as is.
+    Otherwise, this is mostly the default behavior.
+
+    :param int|None epoch:
+    :param list[str]|None seq_list: In case we want to set a predefined order.
+    :rtype: bool
+    :returns whether the order changed (True is always safe to return)
+    """
+    super(OggZipDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list)
+    if not epoch:
+      epoch = 1
+    self._audio_random.seed(self._fixed_random_seed or epoch or 1)
+
+    def get_seq_len(i):
+      """
+      Returns the length based on the duration entry of the dataset,
+      multiplied by 100 to avoid similar rounded durations.
+      It is also used when using the dataset in text-only-mode (`audio` is None).
+      :param int i:
+      :rtype: int
+      """
+      return int(self._data[i]["duration"] * 100)
+
+    if seq_list is not None:
+      seqs = {seq["file"]: i for i, seq in enumerate(self._data) if seq["file"] in seq_list}
+      for seq_tag in seq_list:
+        assert seq_tag in seqs, "did not found all requested seqs. we have eg: %s" % (self._data[0]["file"],)
+      self._seq_order = [seqs[seq_tag] for seq_tag in seq_list]
+      self._num_seqs = len(self._seq_order)
+    else:
+      num_seqs = len(self._data)
+      self._seq_order = self.get_seq_order_for_epoch(
+        epoch=epoch, num_seqs=num_seqs, get_seq_len=get_seq_len)
+      if self.epoch_wise_filter:
+        self.epoch_wise_filter.debug_msg_prefix = str(self)
+        self._seq_order = self.epoch_wise_filter.filter(epoch=epoch, seq_order=self._seq_order, get_seq_len=get_seq_len)
+      self._num_seqs = len(self._seq_order)
+
+    return True
+
+  def get_current_seq_order(self):
+    """
+    :rtype: list[int]
+    """
+    assert self._seq_order is not None
+    return self._seq_order
+
+  def _get_ref_seq_idx(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: idx in self._reference_seq_order
+    :rtype: int
+    """
+    return self._seq_order[seq_idx]
+
+  def have_corpus_seq_idx(self):
+    """
+    :rtype: bool
+    """
+    return True
+
+  def get_corpus_seq_idx(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: int
+    """
+    return self._get_ref_seq_idx(seq_idx)
+
+  @staticmethod
+  def _get_tag_from_info_dict(info):
+    """
+    :param dict[str] info:
+    :rtype: str
+    """
+    return info.get("seq_name", info["file"])
+
+  def get_tag(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: str
+    """
+    return self._get_tag_from_info_dict(self._data[self._get_ref_seq_idx(seq_idx)])
+
+  def get_all_tags(self):
+    """
+    :rtype: list[str]
+    """
+    return [self._get_tag_from_info_dict(seq) for seq in self._data]
+
+  def get_total_num_seqs(self):
+    """
+    :rtype: int
+    """
+    return len(self._data)
+
+  def _get_transcription(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: (targets (e.g. bpe), txt)
+    :rtype: (list[int], str)
+    """
+    seq = self._data[self._get_ref_seq_idx(seq_idx)]
+    raw_targets_txt = seq["text"]
+    targets_txt = raw_targets_txt
+    if self.targets:
+      if self.targets_post_process:
+        targets_txt = self.targets_post_process(targets_txt)
+      targets_seq = self.targets.get_seq(targets_txt)
+    else:
+      targets_seq = []
+    return targets_seq, raw_targets_txt
+
+  def _open_audio_file(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: io.FileIO
+    """
+    import io
+    seq = self._data[self._get_ref_seq_idx(seq_idx)]
+    audio_fn = "%s/%s" % (self._names[seq['_zip_file_index']], seq["file"])
+    raw_bytes = self._read(audio_fn, seq['_zip_file_index'])
+    return io.BytesIO(raw_bytes)
+
+  def _collect_single_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :rtype: DatasetSeq
+    """
+    seq_tag = self.get_tag(seq_idx)
+    if self.feature_extractor:
+      with self._open_audio_file(seq_idx) as audio_file:
+        features = self.feature_extractor.get_audio_features_from_raw_bytes(audio_file, seq_name=seq_tag)
+    else:
+      features = numpy.zeros(())  # currently the API requires some dummy values...
+    targets, txt = self._get_transcription(seq_idx)
+    targets = numpy.array(targets, dtype="int32")
+    txt = numpy.array(txt, dtype="object")
+    return DatasetSeq(
+      features=features,
+      targets={"classes": targets, "raw": txt},
+      seq_idx=seq_idx,
+      seq_tag=seq_tag)
 
 
 
@@ -3841,11 +4498,21 @@ class Enwik8Corpus(CachedDataset2):
     self._batch_num_seqs = batch_num_seqs
     self._random = numpy.random.RandomState(1)  # seed will be set in init_seq_order
     self._seq_starts = numpy.arange(0, len(self._data) - 1, seq_len)
+    self._seq_order = None  # type: typing.Optional[typing.List[int]]
 
   def get_data_dtype(self, key):
+    """
+    :param str key:
+    :rtype: str
+    """
     return "uint8"
 
   def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :param int epoch:
+    :param list[str]|None seq_list:
+    :rtype: bool
+    """
     super(Enwik8Corpus, self).init_seq_order(epoch=epoch, seq_list=seq_list)
     if not epoch:
       epoch = 1
@@ -3959,11 +4626,15 @@ class Enwik8Corpus(CachedDataset2):
   def _download_zip(self):
     url = 'http://mattmahoney.net/dc/enwik8.zip'
     print("%s: download %s" % (self, url), file=log.v2)
+    # noinspection PyPackageRequirements
     from six.moves.urllib.request import urlretrieve
     urlretrieve(url, self._zip_filename)
 
 
 def demo():
+  """
+  Some demo for some of the :class:`GeneratingDataset`.
+  """
   import better_exchook
   better_exchook.install()
   log.initialize(verbosity=[5])
@@ -3972,6 +4643,7 @@ def demo():
   dataset = eval(dsclazzeval)
   assert isinstance(dataset, Dataset)
   assert isinstance(dataset, GeneratingDataset), "use tools/dump-dataset.py for a generic demo instead"
+  # noinspection PyProtectedMember
   assert dataset._input_classes and dataset._output_classes
   assert dataset.num_outputs["data"][1] == 2  # expect 1-hot
   assert dataset.num_outputs["classes"][1] == 1  # expect sparse
@@ -3984,7 +4656,9 @@ def demo():
     assert features.ndim == 2
     assert output_seq.ndim == 1
     input_seq = numpy.argmax(features, axis=1)
+    # noinspection PyProtectedMember
     input_seq_str = "".join([dataset._input_classes[i] for i in input_seq])
+    # noinspection PyProtectedMember
     output_seq_str = "".join([dataset._output_classes[i] for i in output_seq])
     print(" %r" % input_seq_str)
     print(" %r" % output_seq_str)

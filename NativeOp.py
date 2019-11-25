@@ -8,21 +8,36 @@ Generic interface which automatically creates:
 
 import copy
 import os
-import sys
+from Util import make_hashable, escape_c_str, BackendEngine, PY3
 
 import numpy
-import theano
-import theano.sandbox.cuda
-import theano.tensor as T
-from theano.compile import optdb
-from theano import gof
-from theano.gof.opt import OpSub
+if BackendEngine.is_theano_selected():
+  # noinspection PyPackageRequirements,PyUnresolvedReferences
+  import theano
+  # noinspection PyPackageRequirements,PyUnresolvedReferences
+  import theano.sandbox.cuda
+  # noinspection PyPackageRequirements,PyUnresolvedReferences
+  import theano.tensor as T
+  # noinspection PyPackageRequirements,PyUnresolvedReferences
+  from theano.compile import optdb
+  # noinspection PyPackageRequirements,PyUnresolvedReferences
+  from theano import gof
+  # noinspection PyPackageRequirements,PyUnresolvedReferences
+  from theano.gof.opt import OpSub
+  from TheanoUtil import try_register_gpu_opt, make_var_tuple, softmax
 
-from Util import make_hashable, make_dll_name, escape_c_str
-from TheanoUtil import try_register_gpu_opt, make_var_tuple, softmax
+  NativeOpBase = theano.Op
+  GpuNativeOpBase = theano.sandbox.cuda.GpuOp
 
+else:  # no Theano
+  theano = None
 
-PY3 = sys.version_info[0] >= 3
+  class NativeOpBase:
+    """Dummy native op base."""
+
+  class GpuNativeOpBase:
+    """Dummy. Not used if not Theano."""
+
 
 if PY3:
   unicode = str
@@ -229,13 +244,14 @@ class NativeOpBaseMixin(object):
 
   def make_results_of_gradient(self, grad_op_outputs, disconnected_type=None):
     """
-    :param list[T] grad_op_outputs: this is already with dummy outputs removed
+    :param list[T]|tuple[T] grad_op_outputs: this is already with dummy outputs removed
     :param S disconnected_type:
     :return: gradient for each input of our op
     :rtype: list[T|S]
     """
     if disconnected_type is None:
-      disconnected_type = lambda: None
+      def disconnected_type():
+        """Dummy"""
     grad_op_outputs = list(grad_op_outputs)
     results = []
     for info in self.in_info:
@@ -250,7 +266,7 @@ class NativeOpBaseMixin(object):
 
 
 
-class NativeOp(theano.Op, NativeOpBaseMixin):
+class NativeOp(NativeOpBase, NativeOpBaseMixin):
   """
   We wrap some C code which can define a forward pass
   and optionally a backward pass (for gradient calculation).
@@ -261,7 +277,7 @@ class NativeOp(theano.Op, NativeOpBaseMixin):
 
   All output variables are created automatically with the right shape
    but their content is not initialized,
-   except when its used by some input variable as the inplace output
+   except when it's used by some input variable as the inplace output
    - in that case, it is either the input variable or it has a copy of its data.
   """
 
@@ -315,6 +331,13 @@ class NativeOp(theano.Op, NativeOpBaseMixin):
     return v
 
   def grad(self, inputs, output_grads):
+    """
+    For Theano.
+
+    :param inputs:
+    :param output_grads:
+    :return:
+    """
     if self.custom_grad:
       return self.custom_grad(self, inputs, output_grads)
 
@@ -335,32 +358,37 @@ class NativeOp(theano.Op, NativeOpBaseMixin):
     kwargs_for_grad = self.kwargs_for_grad_op()
     grad_op = self.__class__(**kwargs_for_grad)
 
+    # noinspection PyCallingNonCallable
     grad_inputs = inputs + list(make_var_tuple(self(*inputs))) + output_grads
     grad_inputs = self._filter_grad_inputs(grad_inputs)
     assert len(grad_op.in_info) == len(grad_inputs)
+    # noinspection PyCallingNonCallable
     grad_outputs = make_var_tuple(grad_op(*grad_inputs))
     assert len(grad_op.out_info) == len(grad_outputs)
     if grad_op.num_dummy_outs > 0:
       grad_outputs = grad_outputs[:-grad_op.num_dummy_outs]  # remove any dummy outputs
 
-    def print_fn(op, x):
-      import numpy
-      first = x[(0,) * x.ndim]
-      stats = (first, x.shape, numpy.min(x), numpy.max(x), numpy.mean(x), numpy.std(x),
-               numpy.isinf(x).any(), numpy.isnan(x).any())
-      print(op.message, "first/shape/min/max/mean/std/any-inf/any-nan:", stats)
-    #input_grads = [theano.printing.Print("in grad %i" % i, global_fn=print_fn)(v)
-    #               for (i, v) in enumerate(input_grads)]
-
     return self.make_results_of_gradient(grad_outputs, disconnected_type=T.DisconnectedType())
 
   def connection_pattern(self, node):
+    """
+    For Theano.
+
+    :param node:
+    :return:
+    """
     assert len(node.inputs) == len(self.in_info)
     pattern = [[info.get("gradient", "") != "disconnected"] * len(self.out_info)
                for info in self.in_info]
     return pattern
 
   def make_node(self, *args):
+    """
+    For Theano.
+
+    :param args:
+    :return:
+    """
     assert len(args) == len(self.in_info)
     args = [self._convert_input_var(arg, info) for arg, info in zip(args, self.in_info)]
     outputs = [self.tensor_type(dtype=info.get("dtype", "float32"), ndim=info["ndim"])()
@@ -368,12 +396,27 @@ class NativeOp(theano.Op, NativeOpBaseMixin):
     return theano.Apply(self, args, outputs)
 
   def perform(self, node, inputs, output_storage):
+    """
+    For Theano.
+
+    :param node:
+    :param inputs:
+    :param output_storage:
+    :return:
+    """
     raise NotImplementedError("NativeOp: no pure Python implementation, only C implementation")
 
   def c_code_cache_version(self):
+    """
+    :type: tuple[int]
+    """
     return self.code_version
 
   def c_support_code(self):
+    """
+    :return: Theano C++ code
+    :rtype: str
+    """
     base_src = open(os.path.dirname(__file__) + "/NativeOp.cpp").read()
     return "\n\n".join([
       T.blas.blas_header_text(),
@@ -381,19 +424,47 @@ class NativeOp(theano.Op, NativeOpBaseMixin):
       base_src,
       self.c_extra_support_code])
 
+  # noinspection PyMethodMayBeStatic
   def c_libraries(self):
+    """
+    :return: Theano libs
+    :rtype: list[str]
+    """
     return T.blas.ldflags()
 
+  # noinspection PyMethodMayBeStatic
   def c_compile_args(self):
+    """
+    :return: Theano compile args
+    :rtype: list[str]
+    """
     return T.blas.ldflags(libs=False, flags=True)
 
+  # noinspection PyMethodMayBeStatic
   def c_lib_dirs(self):
+    """
+    :return: Theano lib dirs
+    :rtype: list[str]
+    """
     return T.blas.ldflags(libs=False, libs_dir=True)
 
+  # noinspection PyMethodMayBeStatic
   def c_header_dirs(self):
+    """
+    :return: Theano header dirs
+    :rtype: list[str]
+    """
     return T.blas.ldflags(libs=False, include_dir=True)
 
   def c_code(self, node, name, inputs, outputs, sub):
+    """
+    :param node:
+    :param name:
+    :param inputs:
+    :param outputs:
+    :param sub:
+    :return:
+    """
     assert len(inputs) == len(self.in_info)
     assert len(outputs) == len(self.out_info)
     return """
@@ -486,15 +557,20 @@ class NativeOp(theano.Op, NativeOpBaseMixin):
     }
 
 
-class GpuNativeOp(NativeOp, theano.sandbox.cuda.GpuOp):
+class GpuNativeOp(NativeOp, GpuNativeOpBase):
+  """
+  Theano GPU native op.
+  """
 
   @classmethod
   def as_tensor_var(cls, v):
+    # noinspection PyUnresolvedReferences,PyPackageRequirements
     from theano.sandbox.cuda.basic_ops import as_cuda_ndarray_variable
     return as_cuda_ndarray_variable(v)
 
   @classmethod
   def tensor_type(cls, dtype, ndim):
+    # noinspection PyUnresolvedReferences,PyPackageRequirements
     from theano.sandbox.cuda import CudaNdarrayType
     if dtype != "float32":
       print("%s: WARNING: cannot handle type %r, will use float32 instead" % ("GpuNativeOp", dtype))
@@ -503,6 +579,7 @@ class GpuNativeOp(NativeOp, theano.sandbox.cuda.GpuOp):
 
   @classmethod
   def contiguous(cls, v):
+    # noinspection PyUnresolvedReferences,PyPackageRequirements
     from theano.sandbox.cuda.basic_ops import gpu_contiguous
     assert isinstance(v, (theano.sandbox.cuda.CudaNdarrayVariable, theano.sandbox.cuda.CudaNdarrayConstant))
     if getattr(v, 'owner', None):
@@ -512,6 +589,9 @@ class GpuNativeOp(NativeOp, theano.sandbox.cuda.GpuOp):
     return gpu_contiguous(v)
 
   def c_support_code(self):
+    """
+    :rtype: str
+    """
     src = open(os.path.dirname(__file__) + "/NativeOp.cpp").read()
     return "\n\n".join([
       "#define CUDA 1",
@@ -520,49 +600,54 @@ class GpuNativeOp(NativeOp, theano.sandbox.cuda.GpuOp):
       "// end of c_support_code\n\n\n"])
 
 
-@gof.local_optimizer([NativeOp], inplace=True)
-def inplace_NativeOp(node):
-  if isinstance(node.op, NativeOp) and not node.op.destroy_map:
-    kwargs = {k: getattr(node.op, k) for k in node.op.__props__}
-    # TODO: We could try to make each input inplace individually.
-    # What we do now is just to try to make all inplace.
-    kwargs["in_info"] = [dict(info) for info in node.op.in_info]
-    any_inplace = False
-    for info in kwargs["in_info"]:
-      if info.get("want_inplace", -1) >= 0:
-        any_inplace = True
-        info["is_inplace"] = True
-    if not any_inplace:
-      return False
-    new_op = node.op.__class__(**kwargs)
-    from TheanoUtil import make_var_tuple
-    new_v = make_var_tuple(new_op(*node.inputs))
-    return new_v
-  return False
-
-try:
-  optdb.register('inplace_NativeOp',
-                 gof.TopoOptimizer(inplace_NativeOp
-                                   , failure_callback=gof.TopoOptimizer.warn_inplace
-                                   ),
-                 60, 'fast_run', 'inplace')
-except ValueError:  # can happen if it was already registered before, e.g. when we reload the module
-  pass
-
-
-@try_register_gpu_opt(NativeOp)
-def local_gpu_NativeOp(node):
-  if isinstance(node.op, NativeOp):
-    # see also: https://github.com/Theano/Theano/blob/master/theano/sandbox/cuda/opt.py
-    from theano.sandbox.cuda import host_from_gpu, gpu_from_host, as_cuda_ndarray_variable
-    args = node.inputs
-    if any([(x.owner and x.owner.op == host_from_gpu) for x in args]):
-      gpu_op = GpuNativeOp(**{key: getattr(node.op, key) for key in node.op.__props__})
-      args = [x.owner.inputs[0] if (x.owner and x.owner.op == host_from_gpu) else x
-              for x in args]
+if theano:
+  @gof.local_optimizer([NativeOp], inplace=True)
+  def _inplace_native_op(node):
+    if isinstance(node.op, NativeOp) and not node.op.destroy_map:
+      kwargs = {k: getattr(node.op, k) for k in node.op.__props__}
+      # TODO: We could try to make each input inplace individually.
+      # What we do now is just to try to make all inplace.
+      kwargs["in_info"] = [dict(info) for info in node.op.in_info]
+      any_inplace = False
+      for info in kwargs["in_info"]:
+        if info.get("want_inplace", -1) >= 0:
+          any_inplace = True
+          info["is_inplace"] = True
+      if not any_inplace:
+        return False
+      new_op = node.op.__class__(**kwargs)
       from TheanoUtil import make_var_tuple
-      outputs = make_var_tuple(gpu_op(*args))
-      return [host_from_gpu(out) for out in outputs]
+      # noinspection PyCallingNonCallable
+      new_v = make_var_tuple(new_op(*node.inputs))
+      return new_v
+    return False
+
+
+  try:
+    optdb.register('inplace_NativeOp',
+                   gof.TopoOptimizer(_inplace_native_op
+                                     , failure_callback=gof.TopoOptimizer.warn_inplace
+                                     ),
+                   60, 'fast_run', 'inplace')
+  except ValueError:  # can happen if it was already registered before, e.g. when we reload the module
+    pass
+
+
+  @try_register_gpu_opt(NativeOp)
+  def _local_gpu_native_op(node):
+    if isinstance(node.op, NativeOp):
+      # see also: https://github.com/Theano/Theano/blob/master/theano/sandbox/cuda/opt.py
+      # noinspection PyUnresolvedReferences,PyPackageRequirements
+      from theano.sandbox.cuda import host_from_gpu, gpu_from_host, as_cuda_ndarray_variable
+      args = node.inputs
+      if any([(x.owner and x.owner.op == host_from_gpu) for x in args]):
+        gpu_op = GpuNativeOp(**{key: getattr(node.op, key) for key in node.op.__props__})
+        args = [x.owner.inputs[0] if (x.owner and x.owner.op == host_from_gpu) else x
+                for x in args]
+        from TheanoUtil import make_var_tuple
+        # noinspection PyCallingNonCallable
+        outputs = make_var_tuple(gpu_op(*args))
+        return [host_from_gpu(out) for out in outputs]
 
 
 class NativeOpGenBase:
@@ -601,6 +686,7 @@ class NativeOpGenBase:
 
 
 class LstmGenericBase(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
   """
   inputs:
     :param Z: {input,output,forget} gate + cell state. 3d (time,batch,dim*4)
@@ -628,6 +714,7 @@ class LstmGenericBase(NativeOpGenBase):
      "bw_in_var": {"want_inplace": 0}},
     {"name": "d", "ndim": 2, "shape": ((2, 0), (2, 1)), "need_contiguous": True}
   )
+
   @classmethod
   def grad_input_map(cls, Z, V_h, c, i,  Y, H, d,  DY, DH, Dd):
     return (V_h, c, i,  Y, H,  DY, Dd)
@@ -832,6 +919,7 @@ class LstmGenericBase(NativeOpGenBase):
 
 
 class LstmLowMem(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
   """
   This is designed to require minimal memory during training.
   It only stores the outputs and the cell states,
@@ -1274,6 +1362,7 @@ class LstmLowMem(NativeOpGenBase):
 
 
 class NativeLstm2(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
   """
   Yet another LSTM kernel.
   This kernel is about 27% than NativeLstm,
@@ -1681,6 +1770,7 @@ class NativeLstm2(NativeOpGenBase):
 
 
 class TwoDLSTM(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
   """
   inputs:
     :param X: {input,output,forget,lambda} gate + cell state. 3d (timeT,timeS,batch,dim*5) // dim*5 or dim*1 ?
@@ -2393,7 +2483,8 @@ class TwoDLSTM(NativeOpGenBase):
     // Currently, the bias is not trained
     //Db = (1 ... 1) * delta
 
-    //copy left/right part to workmem2 and set to 0 (could be done more efficient, but profiling shows, it's not worth it)
+    //copy left/right part to workmem2 and set to 0
+    // (could be done more efficient, but profiling shows, it's not worth it)
     Ndarray_DIMS_Type H_dim = Ndarray_HOST_DIMS(H);
     const int block_size = H_dim[2] * H_dim[3];
     for(int y = 0; y < Y_dim[0]; ++y)
@@ -2578,7 +2669,8 @@ class Chunking(NativeOpGenBase):
     chunk_size = chunk_params[0]
     chunk_step = chunk_params[1]
     out, oindex = op(*inputs)
-    Dinput, _, factors = unchunk(Dout, index=oindex, chunk_size=chunk_size, chunk_step=chunk_step, n_time=n_time, n_batch=n_batch)
+    Dinput, _, factors = unchunk(
+      Dout, index=oindex, chunk_size=chunk_size, chunk_step=chunk_step, n_time=n_time, n_batch=n_batch)
     # We applied the factor in unchunk, but for this gradient, we actually don't want that, so undo it.
     Dinput /= factors.dimshuffle(0, 1, 'x')
 
@@ -3173,7 +3265,7 @@ def max_and_argmax_sparse(s0, s1, weight, mask, out_max, out_arg):
 class CrossEntropySoftmaxAndGradientZSparse(NativeOpGenBase):
   """
   y_target is given in sparse COOrdinate format.
-  We will calculate CE[t,b] = \sum_i y_target[t,b,i] * log(softmax(z[t,b])[i]),
+  We will calculate CE[t,b] = \\sum_i y_target[t,b,i] * log(softmax(z[t,b])[i]),
   for any timeframe t and batch b,
   and grad(CE[t,b], z[t,b]) = softmax(z[t,b]) - y_target[t,b].
   We also support an index-mask for z, i.e. for the possible [t,b].
@@ -3355,14 +3447,14 @@ def crossentropy_softmax_and_gradient_z_sparse__slow(z, z_mask, y_target_t, y_ta
 
 common_fast_bw_kernels = {
   "001_set_start_states" : """
-    __global__
+    DEF_KERNEL
     void set_start_states(float* states, unsigned* start_states) {
       unsigned state_idx = start_states[blockIdx.x * blockDim.x + threadIdx.x];
       states[state_idx] = 0.0;
     }
   """,
   "010_fill_array" : """
-    __global__
+    DEF_KERNEL
     void fill_array(float* array, float value, unsigned size) {
       unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
       if (idx < size) {
@@ -3371,7 +3463,7 @@ common_fast_bw_kernels = {
     }
   """,
   "011_remove_inf": """
-  __global__
+  DEF_KERNEL
   void remove_inf(float* array, unsigned size) {
     unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -3380,26 +3472,26 @@ common_fast_bw_kernels = {
   }
   """,
   "012_prob_add": """
-    __device__
+    DEV_FUNC
     float prob_add(float a, float b) {
       float diff = a - b;
       if (isnan(diff)) {
-        return CUDART_INF_F;
+        return INF_F;
       }
       else {
-        return -log1p(exp(-abs(diff))) + min(a, b);
+        return -log1pf(expf(-fabsf(diff))) + fminf(a, b);
       }
     }
   """,
   "013_atomic_prob_add": """
-    __device__
+    DEV_FUNC
     void atomic_prob_add(float* a, float b) {
       int* addr = (int*)a;
-      int old   = __float_as_int(*a);
+      int old   = float_as_int(*a);
       int assumed;
       do {
         assumed = old;
-        old     = atomicCAS(addr, assumed, __float_as_int(prob_add(__int_as_float(old), b)));
+        old     = elem_atomic_cas(addr, assumed, float_as_int(prob_add(int_as_float(old), b)));
       } while (old != assumed);
     }
   """,
@@ -3407,12 +3499,12 @@ common_fast_bw_kernels = {
     template<typename T>
     void dump_to_file_1d(T* d_mem, unsigned n_d1, std::string const& path) {
       std::vector<T> buffer(n_d1);
-      cudaMemcpy(buffer.data(), d_mem, buffer.size() * sizeof(T), cudaMemcpyDeviceToHost);
+      //cudaMemcpy(buffer.data(), d_mem, buffer.size() * sizeof(T), cudaMemcpyDeviceToHost);
 
       std::ofstream output(path.c_str(), std::ios::trunc | std::ios::out);
       for (size_t i1 = 0ul; i1 < n_d1; i1++) {
         T val = buffer[i1];
-        if (!std::numeric_limits<T>::has_infinity or !std::isinf(val)) {
+        if (!std::numeric_limits<T>::has_infinity or !isinf(val)) {
           output << i1 << ' ' << val << '\\n';
         }
       }
@@ -3421,13 +3513,13 @@ common_fast_bw_kernels = {
     template<typename T>
     void dump_to_file_2d(T* d_mem, unsigned n_d1, unsigned n_d2, std::string const& path) {
       std::vector<T> buffer(n_d1 * n_d2);
-      cudaMemcpy(buffer.data(), d_mem, buffer.size() * sizeof(T), cudaMemcpyDeviceToHost);
+      //cudaMemcpy(buffer.data(), d_mem, buffer.size() * sizeof(T), cudaMemcpyDeviceToHost);
 
       std::ofstream output(path.c_str(), std::ios::trunc | std::ios::out);
       for (size_t i1 = 0ul; i1 < n_d1; i1++) {
         for (size_t i2 = 0ul; i2 < n_d2; i2++) {
           T val = buffer[i1 * n_d2 + i2];
-          if (!std::numeric_limits<T>::has_infinity or !std::isinf(val)) {
+          if (!std::numeric_limits<T>::has_infinity or !isinf(val)) {
             output << i1 << ' ' << i2 << ' ' << val << '\\n';
           }
         }
@@ -3437,14 +3529,14 @@ common_fast_bw_kernels = {
     template<typename T>
     void dump_to_file_3d(T* d_mem, unsigned n_d1, unsigned n_d2, unsigned n_d3, std::string const& path) {
       std::vector<T> buffer(n_d1 * n_d2 * n_d3);
-      cudaMemcpy(buffer.data(), d_mem, buffer.size() * sizeof(T), cudaMemcpyDeviceToHost);
+      //cudaMemcpy(buffer.data(), d_mem, buffer.size() * sizeof(T), cudaMemcpyDeviceToHost);
 
       std::ofstream output(path.c_str(), std::ios::trunc | std::ios::out);
       for (size_t i1 = 0ul; i1 < n_d1; i1++) {
         for (size_t i2 = 0ul; i2 < n_d2; i2++) {
           for (size_t i3 = 0ul; i3 < n_d3; i3++) {
             T val = buffer[i1 * n_d2 * n_d3 + i2 * n_d3 + i3];
-            if (!std::numeric_limits<T>::has_infinity or !std::isinf(val)) {
+            if (!std::numeric_limits<T>::has_infinity or !isinf(val)) {
               output << i1 << ' ' << i2 << ' ' << i3 << ' ' << val << '\\n';
             }
           }
@@ -3480,7 +3572,7 @@ class FastBaumWelchOp(NativeOpGenBase):
   c_extra_support_code = copy.copy(common_fast_bw_kernels)
   c_extra_support_code.update({
     "100_init_bwd_state_buffer": """
-      __global__
+      DEF_KERNEL
       void init_bwd_state_buffer(float* states, unsigned* end_states, unsigned t, unsigned max_t, float* index, unsigned index_stride) {
         unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (index[t * index_stride + idx] == 1.0 && (t == max_t || index[(t + 1) * index_stride + idx] == 0.0)) {
@@ -3490,7 +3582,7 @@ class FastBaumWelchOp(NativeOpGenBase):
       }
     """,
     "101_next_frame": """
-      __global__
+      DEF_KERNEL
       void next_frame(bool fwd, unsigned num_edges, unsigned  num_emissions,
                       unsigned* sequence_idxs, unsigned* from_buffer, unsigned* to_buffer, float* weight_buffer, unsigned* emission_idxs,
                       float* prev_frame, float* next_frame, float* am_scores, float* edge_buffer) {
@@ -3502,7 +3594,7 @@ class FastBaumWelchOp(NativeOpGenBase):
         unsigned from     = from_buffer  [idx];
         float    prev_val = prev_frame[from];
         if (isinf(prev_val)) {
-          edge_buffer[idx] = CUDART_INF_F;
+          edge_buffer[idx] = INF_F;
           return;
         }
 
@@ -3523,14 +3615,14 @@ class FastBaumWelchOp(NativeOpGenBase):
       }
     """,
     "102_normalize": """
-      __global__
+      DEF_KERNEL
       void normalize(float* buffer, unsigned* sequence_idxs, unsigned num_edges, unsigned num_seqs, float* sum_output) {
-        extern __shared__ float sum[];
+        DEF_SHARED(float, sum);
 
         buffer += blockIdx.x * num_edges;
 
         for (unsigned s = 0u; s < num_seqs; s++) {
-          sum[s] = CUDART_INF_F;
+          sum[s] = INF_F;
         }
 
         for (unsigned e = 0u; e < num_edges; e++) {
@@ -3555,7 +3647,7 @@ class FastBaumWelchOp(NativeOpGenBase):
       }
     """,
     "103_compute_result": """
-      __global__
+      DEF_KERNEL
       void compute_result(float* edge_buffer, float* out, unsigned* emission_idxs, unsigned* sequence_idxs,
                           unsigned frame_stride, unsigned seq_stride,
                           unsigned num_frames, unsigned num_seqs, unsigned num_edges) {
@@ -3582,10 +3674,10 @@ class FastBaumWelchOp(NativeOpGenBase):
         std::vector<unsigned> start_states(n_seqs);
         std::vector<unsigned> end_states  (n_seqs);
 
-        HANDLE_ERROR(cudaMemcpy(state_buffer.data(), d_state_buffer, state_buffer.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        HANDLE_ERROR(cudaMemcpy(index.data(),        d_index,        index.size()        * sizeof(float), cudaMemcpyDeviceToHost));
-        HANDLE_ERROR(cudaMemcpy(start_states.data(), d_start_states, start_states.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        HANDLE_ERROR(cudaMemcpy(end_states.data(),   d_end_states,   end_states.size()   * sizeof(float), cudaMemcpyDeviceToHost));
+        //HANDLE_ERROR(cudaMemcpy(state_buffer.data(), d_state_buffer, state_buffer.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        //HANDLE_ERROR(cudaMemcpy(index.data(),        d_index,        index.size()        * sizeof(float), cudaMemcpyDeviceToHost));
+        //HANDLE_ERROR(cudaMemcpy(start_states.data(), d_start_states, start_states.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        //HANDLE_ERROR(cudaMemcpy(end_states.data(),   d_end_states,   end_states.size()   * sizeof(float), cudaMemcpyDeviceToHost));
 
         for (unsigned seq = 0u; seq < n_seqs; seq++) {
           std::stringstream filename;
@@ -3600,7 +3692,7 @@ class FastBaumWelchOp(NativeOpGenBase):
               const float val = state_buffer[t * n_states + s];
               float diff = val - sum;
               if (!isnan(diff)) {
-                sum = -log1p(exp(-abs(diff))) + min(sum, val);
+                sum = -log1p(exp(-abs(diff))) + fminf(sum, val);
               }
             }
             for (unsigned s = start_states[seq]; s <= end_states[seq]; s++) {
@@ -3619,8 +3711,8 @@ class FastBaumWelchOp(NativeOpGenBase):
         std::vector<float> buffer(n_frames * n_seqs * n_emissions);
         std::vector<float> index (n_frames * index_stride);
 
-        HANDLE_ERROR(cudaMemcpy(buffer.data(), d_out,   buffer.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        HANDLE_ERROR(cudaMemcpy(index.data(),  d_index, index.size()  * sizeof(float), cudaMemcpyDeviceToHost));
+        //HANDLE_ERROR(cudaMemcpy(buffer.data(), d_out,   buffer.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        //HANDLE_ERROR(cudaMemcpy(index.data(),  d_index, index.size()  * sizeof(float), cudaMemcpyDeviceToHost));
 
         for (unsigned seq = 0u; seq < n_seqs; seq++) {
           std::stringstream filename;
@@ -3721,67 +3813,72 @@ class FastBaumWelchOp(NativeOpGenBase):
 
     // initialize edge buffer
     float* d_edge_buffer = reinterpret_cast<float*>(device_malloc(n_edges * n_frames * sizeof(float)));
-    if(!d_edge_buffer) return;  // error should have been set in device_malloc
+    if(!d_edge_buffer) { HANDLE_LAST_ERROR(); abort(); }  // error should have been set in device_malloc
     unsigned n_fill_blocks = (n_edges * n_frames + n_threads - 1u) / n_threads;
-    fill_array<<<n_fill_blocks, n_threads>>>(d_edge_buffer, 0.0, n_edges * n_frames);
+    start_dev_kernel2(fill_array, n_fill_blocks, n_threads, 0, (d_edge_buffer, 0.0, n_edges * n_frames));
     HANDLE_LAST_ERROR();
 
     // initialize the state buffer
     n_fill_blocks = (n_states + n_threads - 1u) / n_threads;
-    fill_array<<<n_fill_blocks, n_threads>>>(d_state_buffer_prev, std::numeric_limits<float>::infinity(), n_states);
+    start_dev_kernel2(fill_array, n_fill_blocks, n_threads, 0, (d_state_buffer_prev, std::numeric_limits<float>::infinity(), n_states));
     HANDLE_LAST_ERROR();
-    set_start_states<<<1, n_seqs>>>(d_state_buffer_prev, d_start_states);
+    start_dev_kernel2(set_start_states, 1, n_seqs, 0, (d_state_buffer_prev, d_start_states));
     HANDLE_LAST_ERROR();
 
     // initialize full state buffer (only used to dump the alignment)
     float* d_state_buffer_all = NULL;
     if (dump_alignment && batch_idx %% dump_every == 0) {
       d_state_buffer_all = reinterpret_cast<float*>(device_malloc(n_states * (n_frames + 1u) * sizeof(float)));
-      if(!d_state_buffer_all) return;  // error should have been set in device_malloc
-      cudaMemcpy(d_state_buffer_all, d_state_buffer_prev, n_states * sizeof(float), cudaMemcpyDeviceToDevice);
+      if(!d_state_buffer_all) { HANDLE_LAST_ERROR(); abort(); }  // error should have been set in device_malloc
+      Ndarray_memcpy(d_state_buffer_all, d_state_buffer_prev, n_states * sizeof(float));
       HANDLE_LAST_ERROR();
     }
 
     // fwd pass
     for (unsigned t = 0u; t < n_frames; t++) {
-      fill_array<<<n_fill_blocks, n_threads>>>(d_state_buffer_next, std::numeric_limits<float>::infinity(), n_states);
+      start_dev_kernel2(fill_array, n_fill_blocks, n_threads, 0, (d_state_buffer_next, std::numeric_limits<float>::infinity(), n_states));
       HANDLE_LAST_ERROR();
-      next_frame<<<n_blocks, n_threads>>>(true, n_edges, sequence_stride,
-                                          d_sequence_idxs, d_from, d_to, d_weights, d_emission_idxs,
-                                          d_state_buffer_prev, d_state_buffer_next, d_am_scores + t * frame_stride, d_edge_buffer + t * n_edges);
+      start_dev_kernel2(next_frame, n_blocks, n_threads, 0,
+        (true, n_edges, sequence_stride,
+         d_sequence_idxs, d_from, d_to, d_weights, d_emission_idxs,
+         d_state_buffer_prev, d_state_buffer_next, d_am_scores + t * frame_stride, d_edge_buffer + t * n_edges));
       HANDLE_LAST_ERROR();
       if (dump_alignment && batch_idx %% dump_every == 0) {
-        cudaMemcpy(d_state_buffer_all + (t + 1u) * n_states, d_state_buffer_next, n_states * sizeof(float), cudaMemcpyDeviceToDevice);
+        Ndarray_memcpy(d_state_buffer_all + (t + 1u) * n_states, d_state_buffer_next, n_states * sizeof(float));
         HANDLE_LAST_ERROR();
       }
       std::swap(d_state_buffer_prev, d_state_buffer_next);
     }
 
     // bwd pass
-    fill_array<<<n_fill_blocks, n_threads>>>(d_state_buffer_prev, std::numeric_limits<float>::infinity(), n_states);
+    start_dev_kernel2(fill_array, n_fill_blocks, n_threads, 0, (d_state_buffer_prev, std::numeric_limits<float>::infinity(), n_states));
     HANDLE_LAST_ERROR();
     for (unsigned t = n_frames; t > 0; t--) {
-      init_bwd_state_buffer<<<1, n_seqs>>>(d_state_buffer_prev, d_end_states, t - 1, n_frames - 1, d_index, index_stride);
+      start_dev_kernel2(init_bwd_state_buffer, 1, n_seqs, 0,
+        (d_state_buffer_prev, d_end_states, t - 1, n_frames - 1, d_index, index_stride));
       HANDLE_LAST_ERROR();
       if (dump_alignment && batch_idx %% dump_every == 0) {
         float alpha = 1.0f;
-        HANDLE_ERROR(cublasSaxpy(handle, n_states, &alpha, d_state_buffer_prev, 1, d_state_buffer_all + t * n_states, 1));
+        //HANDLE_ERROR(cublasSaxpy(handle, n_states, &alpha, d_state_buffer_prev, 1, d_state_buffer_all + t * n_states, 1));
       }
-      fill_array<<<n_fill_blocks, n_threads>>>(d_state_buffer_next, std::numeric_limits<float>::infinity(), n_states);
+      start_dev_kernel2(fill_array, n_fill_blocks, n_threads, 0, (d_state_buffer_next, std::numeric_limits<float>::infinity(), n_states));
       HANDLE_LAST_ERROR();
-      next_frame<<<n_blocks, n_threads>>>(false, n_edges, sequence_stride,
-                                          d_sequence_idxs, d_to, d_from, d_weights, d_emission_idxs,
-                                          d_state_buffer_prev, d_state_buffer_next, d_am_scores + (t - 1) * frame_stride, d_edge_buffer + (t - 1) * n_edges);
+      start_dev_kernel2(next_frame, n_blocks, n_threads, 0,
+        (false, n_edges, sequence_stride,
+         d_sequence_idxs, d_to, d_from, d_weights, d_emission_idxs,
+         d_state_buffer_prev, d_state_buffer_next, d_am_scores + (t - 1) * frame_stride,
+         d_edge_buffer + (t - 1) * n_edges));
       HANDLE_LAST_ERROR();
       std::swap(d_state_buffer_prev, d_state_buffer_next);
     }
     if (dump_alignment && batch_idx %% dump_every == 0) {
       float alpha = 1.0f;
-      HANDLE_ERROR(cublasSaxpy(handle, n_states, &alpha, d_state_buffer_prev, 1, d_state_buffer_all, 1));
+      //HANDLE_ERROR(cublasSaxpy(handle, n_states, &alpha, d_state_buffer_prev, 1, d_state_buffer_all, 1));
     }
 
     // normalize at each time frame
-    normalize<<<n_frames, 1, n_seqs * sizeof(float)>>>(d_edge_buffer, d_sequence_idxs, n_edges, n_seqs, d_sum_output);
+    start_dev_kernel2(normalize, n_frames, 1, n_seqs * sizeof(float),
+      (d_edge_buffer, d_sequence_idxs, n_edges, n_seqs, d_sum_output));
     HANDLE_LAST_ERROR();
 
     // dump alignment
@@ -3791,14 +3888,15 @@ class FastBaumWelchOp(NativeOpGenBase):
     }
 
     n_fill_blocks = (n_frames * n_seqs * n_emissions + n_threads - 1u) / n_threads;
-    fill_array<<<n_fill_blocks, n_threads>>>(d_out, std::numeric_limits<float>::infinity(), n_frames * n_seqs * n_emissions);
+    start_dev_kernel2(fill_array, n_fill_blocks, n_threads, 0, (d_out, std::numeric_limits<float>::infinity(), n_frames * n_seqs * n_emissions));
     HANDLE_LAST_ERROR();
 
     frame_stride    = Ndarray_STRIDE(out, 0);
     sequence_stride = Ndarray_STRIDE(out, 1);
     n_blocks        = (n_frames * n_edges + n_threads - 1u) / n_threads;
-    compute_result<<<n_blocks, n_threads>>>(d_edge_buffer, d_out, d_emission_idxs, d_sequence_idxs,
-                                            frame_stride, sequence_stride, n_frames, n_seqs, n_edges);
+    start_dev_kernel2(compute_result, n_blocks, n_threads, 0,
+      (d_edge_buffer, d_out, d_emission_idxs, d_sequence_idxs,
+       frame_stride, sequence_stride, n_frames, n_seqs, n_edges));
     HANDLE_LAST_ERROR();
 
     #if TENSORFLOW
@@ -3806,7 +3904,7 @@ class FastBaumWelchOp(NativeOpGenBase):
     // which is helpful for debugging.
     // We replace it by a very high number, so that tf.exp(-out) will still result in 0.0.
     n_blocks = (n_frames * n_seqs * n_emissions + n_threads - 1u) / n_threads;
-    remove_inf<<<n_blocks, n_threads>>>(d_out, n_frames * n_seqs * n_emissions);
+    start_dev_kernel2(remove_inf, n_blocks, n_threads, 0, (d_out, n_frames * n_seqs * n_emissions));
     //debug_print(context, out, "out");
     #endif
     if (dump_output && batch_idx %% dump_every == 0) {
@@ -3822,10 +3920,9 @@ class FastBaumWelchOp(NativeOpGenBase):
 
   c_bw_code = None
 
-  cpu_support = False  # TODO: fix CPU support...
-
 
 class MultiEndFastBaumWelchOp(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
   """
   inputs:
     :param am_scores: scores in -log space. 3d (time,batch,dim)
@@ -4574,3 +4671,1490 @@ class SegmentFastBaumWelchOp(NativeOpGenBase):
 
     self.c_fw_code = '\n'.join(extra_lines) + '\n' + self.c_fw_code
 
+
+class FastViterbiOp(NativeOpGenBase):
+  """
+  inputs:
+    :param am_scores: scores in +log space. 3d (time,batch,dim)
+    :param am_seq_len: (batch,)
+    :param edges: edges of the graph (from,to,emission_idx,sequence_idx), i.e. (4, n_edges)
+    :param weights: weights of the edges (n_edges,)
+    :param start_end_states: (2, batch)
+    :param n_states: scalar, int32
+  outputs:
+    :param output: Viterbi (hard) alignment, scores in +log space. 2d (time,batch)
+    :param scores: (batch,)
+  """
+  in_info = (
+    {"name": "am_scores", "ndim": 3, "shape": (None,   None,    None),
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "am_seq_len", "ndim": 1, "shape": ((0, 0),), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "edges", "ndim": 2, "shape": (4, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "weights", "ndim": 1, "shape": ((3, 1),),
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "start_end_states", "ndim": 2, "shape": (2, (0, 0)), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "n_states", "ndim": 0, "shape": (), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected", "host_memory": True}
+  )
+  out_info = (
+    {"name": "output", "ndim": 2, "shape": ((0, 0), (0, 1)), "dtype": "int32", "need_contiguous": True},
+    {"name": "scores", "ndim": 1, "shape": ((0, 1),), "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "01_IdxAndVal": """
+      struct __attribute__((__packed__)) IdxAndVal {
+        int idx;
+        float val;
+      };    
+    """,
+    "04_select_max":
+    """
+      DEV_FUNC
+      void select_max(IdxAndVal* a, IdxAndVal b) {
+        // fast path
+        if(b.val < a->val)
+          return;
+        // Maybe we could use double compare-and-swap (https://stackoverflow.com/questions/55941382/).
+        // But not sure how.
+        // So instead, we use double-wide compare-and-swap.
+        union U {
+          IdxAndVal s;
+          unsigned long long int v64;
+        };
+        while(true) {
+          U prev;
+          prev.s = *a;
+          if(b.val < prev.s.val)
+            return;
+          if(b.val == prev.s.val && b.idx >= prev.s.idx)
+            return;
+          U updated;
+          updated.s = b;
+          
+          U old;
+          old.v64 = elem_atomic_cas((unsigned long long int*) a, prev.v64, updated.v64);
+          if(old.v64 == prev.v64)
+            return;
+          // Not the same, so repeat.
+        }
+      }
+    """,
+    "05_init_buffer":
+    """
+      DEF_KERNEL
+      void init_buffer
+      (
+        int n_time,
+        int n_states, // for the whole batch
+        IdxAndVal* buffer // (time+1,n_states), states for the whole batch
+      )
+      {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < (n_time + 1) * n_states) {
+          buffer[idx].val = -INF_F;
+          buffer[idx].idx = -1;
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "06_init_first_frame":
+    """
+      DEF_KERNEL
+      void init_first_frame
+      (
+        int n_batch,
+        int n_states, // for the whole batch
+        IdxAndVal* frame, // (n_states,), states for the whole batch
+        const int32_t* d_start_states // (n_batch,)
+      )
+      {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch) {
+          int state_idx = d_start_states[idx];
+          frame[state_idx].val = 0;
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "08_next_frame": """
+      DEF_KERNEL
+      void next_frame
+      (
+        int n_time,
+        int n_states,
+        int n_edges,
+        int n_classes,
+        int t,
+        const float* d_am_scores,
+        const int32_t* d_am_seq_len,
+        const IdxAndVal* prev_frame,
+        IdxAndVal* frame,
+        const int32_t* d_edge_from,
+        const int32_t* d_edge_to,
+        const int32_t* d_edge_emission_idx,
+        const int32_t* d_edge_seq_idx,
+        const float* d_edge_weights,
+        const int32_t* d_end_states // (n_batch,)
+      )
+      {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_edges) {
+          int from_idx = d_edge_from[idx];
+          //assert_cmp(0, <=, from_idx); assert_cmp(from_idx, <, n_states);
+
+          int seq_idx = d_edge_seq_idx[idx];
+          if(t < d_am_seq_len[seq_idx]) {
+            float prev_val = prev_frame[from_idx].val;
+            int emission_idx = d_edge_emission_idx[idx];
+            //assert_cmp(0, <=, emission_idx); assert_cmp(emission_idx, <, n_classes);
+            int to_idx = d_edge_to[idx];
+            //assert_cmp(0, <=, to_idx); assert_cmp(to_idx, <, n_states);
+            IdxAndVal candidate;
+            candidate.val = prev_val + d_edge_weights[idx] + d_am_scores[seq_idx * n_classes + emission_idx];
+            candidate.idx = idx;
+            select_max(&frame[to_idx], candidate);
+          }
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "11_select_scores":
+    """
+      DEF_KERNEL
+      void select_scores
+      (
+        int n_batch,
+        int n_states,
+        int buffer_stride,
+        const IdxAndVal* buffer,
+        const int32_t* d_am_seq_len, // (n_batch,)
+        const int32_t* d_end_states, // (n_batch,)
+        float* d_score // (n_batch,)
+      )
+      {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch) {
+          const IdxAndVal* last_frame = buffer + d_am_seq_len[idx] * buffer_stride;
+          int end_state_idx = d_end_states[idx];
+          d_score[idx] = last_frame[end_state_idx].val;
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "13_select_best_path":
+    """
+      DEF_KERNEL
+      void select_best_path
+      (
+        int n_batch,
+        int n_states,
+        int n_edges,
+        int t,
+        int32* cur_state, // (n_batch,)
+        const IdxAndVal* frame,
+        const int32_t* d_am_seq_len,
+        const int32_t* d_edge_from,
+        const int32_t* d_edge_to,
+        const int32_t* d_edge_emission_idx,
+        int32_t* output
+      )
+      {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch) {
+          if(t < d_am_seq_len[idx]) {
+            int state_idx = cur_state[idx];
+            //assert_cmp(0, <=, state_idx); assert_cmp(state_idx, <, n_states);
+            int edge_idx = frame[state_idx].idx;
+            if(edge_idx >= 0) {
+              //assert_cmp(0, <=, edge_idx); assert_cmp(edge_idx, <, n_edges);
+              //assert_cmp(state_idx, ==, d_edge_to[edge_idx]);
+              cur_state[idx] = d_edge_from[edge_idx];
+              output[idx] = d_edge_emission_idx[edge_idx];
+            }
+            else  // no path found
+              output[idx] = 0;
+          }
+          else {
+            output[idx] = 0;
+          }
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+  }
+
+  c_fw_code = """
+    using namespace std;
+    // am_scores, am_seq_len, edges, weights, start_end_states, n_states = input_names
+    // output, scores = output_names
+    assert(n_inputs == 6);
+    assert(n_outputs == 2);
+    Ndarray* am_scores = inputs[0];
+    Ndarray* am_seq_len = inputs[1];
+    Ndarray* edges = inputs[2];
+    Ndarray* weights = inputs[3];
+    Ndarray* start_end_states = inputs[4];
+    Ndarray* n_states_ref = inputs[5];
+    Ndarray* output = *outputs[0];
+    Ndarray* score = *outputs[1];
+
+    assert_cmp(Ndarray_NDIM(am_scores), ==, 3);
+    assert_cmp(Ndarray_NDIM(am_seq_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(edges), ==, 2);
+    assert_cmp(Ndarray_NDIM(weights), ==, 1);
+    assert_cmp(Ndarray_NDIM(start_end_states), ==, 2);
+    assert_cmp(Ndarray_NDIM(n_states_ref), ==, 0);
+    assert_cmp(Ndarray_NDIM(output), ==, 2);
+    assert_cmp(Ndarray_NDIM(score), ==, 1);
+    int n_time = Ndarray_DIMS(am_scores)[0];
+    int n_batch = Ndarray_DIMS(am_scores)[1];
+    int n_classes = Ndarray_DIMS(am_scores)[2];
+    assert_cmp(Ndarray_DIMS(am_scores)[0], ==, n_time);
+    assert_cmp(Ndarray_DIMS(am_scores)[1], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(am_scores)[2], ==, n_classes);
+    assert_cmp(Ndarray_DIMS(am_seq_len)[0], ==, n_batch);
+    int n_edges = Ndarray_DIMS(edges)[1];
+    assert_cmp(Ndarray_DIMS(edges)[0], ==, 4);
+    assert_cmp(Ndarray_DIMS(edges)[1], ==, n_edges);
+    assert_cmp(Ndarray_DIMS(weights)[0], ==, n_edges);
+    assert_cmp(Ndarray_DIMS(start_end_states)[0], ==, 2);
+    assert_cmp(Ndarray_DIMS(start_end_states)[1], ==, n_batch);
+    int n_states = Ndarray_DEV_DATA_int32_scalar(n_states_ref);
+    assert_cmp(Ndarray_DIMS(output)[0], ==, n_time);
+    assert_cmp(Ndarray_DIMS(output)[1], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(score)[0], ==, n_batch);
+
+    int32_t* d_edge_from = Ndarray_DEV_DATA_int32(edges) + 0 * Ndarray_STRIDE(edges, 0);
+    int32_t* d_edge_to = Ndarray_DEV_DATA_int32(edges) + 1 * Ndarray_STRIDE(edges, 0);
+    int32_t* d_edge_emission_idx = Ndarray_DEV_DATA_int32(edges) + 2 * Ndarray_STRIDE(edges, 0);
+    int32_t* d_edge_seq_idx = Ndarray_DEV_DATA_int32(edges) + 3 * Ndarray_STRIDE(edges, 0);
+    float* d_edge_weights = Ndarray_DEV_DATA(weights);
+    float* d_am_scores = Ndarray_DEV_DATA(am_scores);
+    int am_scores_stride = Ndarray_STRIDE(am_scores, 0);
+    int32_t* d_am_seq_len = Ndarray_DEV_DATA_int32(am_seq_len);
+    int32_t* d_start_states = Ndarray_DEV_DATA_int32(start_end_states) + 0 * Ndarray_STRIDE(start_end_states, 0);
+    int32_t* d_end_states = Ndarray_DEV_DATA_int32(start_end_states) + 1 * Ndarray_STRIDE(start_end_states, 0);
+    int32_t* d_output = Ndarray_DEV_DATA_int32(output);
+    int output_stride = Ndarray_STRIDE(output, 0);
+    float* d_score = Ndarray_DEV_DATA(score);
+
+    IdxAndVal* d_buffer = (IdxAndVal*) device_malloc((n_time + 1) * n_states * sizeof(IdxAndVal));
+    int buffer_stride = n_states;
+    start_dev_kernel(init_buffer, (n_time, n_states, d_buffer));
+    start_dev_kernel(init_first_frame, (n_batch, n_states, d_buffer, d_start_states));    
+
+    for(int t = 0; t < n_time; ++t) {
+      start_dev_kernel(next_frame, (
+        n_time,
+        n_states,
+        n_edges,
+        n_classes,
+        t,
+        d_am_scores + t * am_scores_stride,
+        d_am_seq_len,
+        d_buffer + t * buffer_stride,
+        d_buffer + (t + 1) * buffer_stride,
+        d_edge_from,
+        d_edge_to,
+        d_edge_emission_idx,
+        d_edge_seq_idx,
+        d_edge_weights,
+        d_end_states      
+      ));
+    }
+    
+    start_dev_kernel(select_scores, (
+      n_batch,
+      n_states,
+      buffer_stride,
+      d_buffer,
+      d_am_seq_len,
+      d_end_states,
+      d_score // out
+    ));
+    
+    int32_t* d_cur_state = (int32_t*) device_malloc(n_batch * sizeof(int32_t));
+    Ndarray_memcpy(d_cur_state, d_end_states, n_batch * sizeof(int32_t));
+    
+    for(int t = n_time - 1; t >= 0; --t) {
+      start_dev_kernel(select_best_path, (
+        n_batch,
+        n_states,
+        n_edges,
+        t,
+        d_cur_state,
+        d_buffer + (t + 1) * buffer_stride,
+        d_am_seq_len,
+        d_edge_from,
+        d_edge_to,
+        d_edge_emission_idx,
+        d_output + t * output_stride // out
+      ));
+    }
+        
+    device_free(d_cur_state);
+    device_free(d_buffer);
+  """
+
+  c_bw_code = None
+
+
+class GetCtcFsaFastBwOp(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
+  """
+  This implements :func:`Fsa.get_ctc_fsa_fast_bw` as a native op.
+  This is for constructing a FSA with a CTC topology.
+  The output format is compatible to the FastBaumWelch native op.
+
+  inputs:
+    :param targets: shape (batch,time), int32
+    :param seq_lens: shape (batch), int32
+    :param blank_idx: scalar, int32
+    :param weights: shape (num_edges,), float32 (not used, except for target shape)
+  outputs:
+    :param edges: (4,num_edges), int32, edges of the graph (from,to,emission_idx,sequence_idx)
+    :param start_end_states: (2,batch), int32, (start,end) state idx in FSA
+
+  To construct `weights` (for FastBaumWelch), `weights` should be just `tf.zeros((num_edges,))`.
+  `num_edges` should be `n_batch * (5 * (n_time - 1) + 10)`
+    (see construction in kernel why that number).
+  """
+  in_info = (
+    {"name": "targets", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "seq_lens", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "blank_idx", "ndim": 0, "shape": (), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected", "host_memory": True},
+    {"name": "weights", "ndim": 1, "shape": (None,), "dtype": "float32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "edges", "ndim": 2, "shape": (4, (3, 0)), "dtype": "int32", "need_contiguous": True},
+    {"name": "start_end_states", "ndim": 2, "shape": (2, (1, 0)), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "01_kernel": """
+      DEF_KERNEL
+      void construct_kernel
+        (
+        int n_batch, int n_time, int n_edges,
+        const int32_t* targets, const int32_t* seq_lens,
+        int32_t blank_idx,
+        int32_t* edges, int32_t* start_end_states
+        )
+      {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        // n_edges should be n_batch * (5 * (n_time - 1) + 10).
+        assert(n_edges % n_batch == 0);
+        while(idx < n_edges) {
+          int batch_idx = idx / (n_edges / n_batch);
+          int rel_edge_idx = idx % (n_edges / n_batch);
+          int32_t seq_len = seq_lens[batch_idx];
+          // state_idx: 0 b, 1 l, 2 b, 3 l, ..., (T-1)*2 b, T*2-1 l, T*2 b, T*2+1 dummy, T*2+2 end
+          // i.e. T*2+3 states per seq.
+          int state_idx_offset = (n_time * 2 + 3) * batch_idx;
+          int t = -1; // pos in targets
+          int srel_edge_idx = -1; // state relative edge
+          // (seq_len * 2) - 1 is last label state idx. seq_len * 2 is last blank state idx. 
+          int32_t dummy_state_idx = seq_len * 2 + 1;
+          int32_t end_state_idx = seq_len * 2 + 2;
+          int32_t state_idx = dummy_state_idx;
+          int32_t to_state_idx = dummy_state_idx;
+          if(rel_edge_idx == 0) {
+            start_end_states[0 * n_batch + batch_idx] = state_idx_offset; // start
+            start_end_states[1 * n_batch + batch_idx] = state_idx_offset + end_state_idx; // end   
+          }
+          int32_t emission_idx = blank_idx;
+          int32_t label_idx = -1, next_label_idx = -1;
+          if(seq_len == 0) {
+            t = -1;
+            emission_idx = blank_idx;
+            // 1 single blank loop
+            if(rel_edge_idx == 0) {
+              state_idx = 0;
+              to_state_idx = 0;
+              srel_edge_idx = 0;
+            }
+            else if(rel_edge_idx == 1) {
+              state_idx = 0;
+              to_state_idx = end_state_idx;
+              srel_edge_idx = 1;
+            }
+            else {
+              state_idx = dummy_state_idx;
+              srel_edge_idx = -1;
+            }
+          }
+          else if(seq_len == 1) {
+            label_idx = targets[batch_idx * n_time + 0];
+            // 3 edges for first / prev last blank
+            if(rel_edge_idx < 3) {
+              t = 0;
+              state_idx = 0;
+              srel_edge_idx = rel_edge_idx;
+              if(srel_edge_idx == 0) {
+                to_state_idx = state_idx;
+                emission_idx = blank_idx;
+              }
+              else if(srel_edge_idx == 1) {
+                to_state_idx = state_idx + 1;
+                emission_idx = label_idx;
+              }
+              else if(srel_edge_idx == 2) {
+                to_state_idx = end_state_idx;
+                emission_idx = label_idx;
+              }
+            }
+            // 4 edges for first / last label
+            else if(rel_edge_idx < 7) {
+              t = 0;
+              state_idx = 1;
+              srel_edge_idx = rel_edge_idx - 3;
+              if(srel_edge_idx == 0) {
+                to_state_idx = state_idx;
+                emission_idx = label_idx;
+              }
+              else if(srel_edge_idx == 1) {
+                to_state_idx = state_idx + 1;
+                emission_idx = blank_idx;
+              }
+              else if(srel_edge_idx == 2) {
+                to_state_idx = end_state_idx;
+                emission_idx = label_idx;              
+              }
+              else if(srel_edge_idx == 3) {
+                to_state_idx = end_state_idx;
+                emission_idx = blank_idx;
+              }
+            }
+            // 2 edges for last blank
+            else if(rel_edge_idx < 9) {
+              t = -1;
+              emission_idx = blank_idx;
+              state_idx = 2;
+              srel_edge_idx = rel_edge_idx - 7;
+              if(srel_edge_idx == 0)
+                to_state_idx = state_idx;
+              else
+                to_state_idx = end_state_idx;
+            }
+            else {
+              t = -1;
+              state_idx = dummy_state_idx;
+              srel_edge_idx = -1;
+            }
+          }
+          else { // seq_len >= 2
+            // 2 edges for each blank, 3 for each label. up to prev last.
+            if(rel_edge_idx < 5 * (seq_len - 1)) {
+              t = rel_edge_idx / 5;
+              label_idx = targets[batch_idx * n_time + t];
+              next_label_idx = targets[batch_idx * n_time + t + 1];
+              state_idx = 2 * (rel_edge_idx / 5);
+              srel_edge_idx = rel_edge_idx % 5;
+              if(srel_edge_idx >= 2) {
+                srel_edge_idx -= 2;
+                state_idx += 1;
+              }
+              if(state_idx % 2 == 0) { // blank loop state
+                if(srel_edge_idx == 0) {
+                  to_state_idx = state_idx;
+                  emission_idx = blank_idx;
+                }
+                else if(srel_edge_idx == 1) {
+                  to_state_idx = state_idx + 1;
+                  emission_idx = label_idx;
+                }
+              }
+              else { // label loop state
+                if(srel_edge_idx == 0) {
+                  to_state_idx = state_idx;
+                  emission_idx = label_idx;
+                }
+                else if(srel_edge_idx == 1) {
+                  to_state_idx = state_idx + 1;
+                  emission_idx = blank_idx;
+                }
+                else if(srel_edge_idx == 2) {
+                  // skip over blank to next label (if allowed <=> next label is different)
+                  if(label_idx != next_label_idx) {
+                    to_state_idx = state_idx + 2;
+                    emission_idx = next_label_idx;
+                  }
+                }
+              }
+            }
+            // 1 more edge for prev last label
+            else if(rel_edge_idx == 5 * (seq_len - 1)) {
+              t = seq_len - 2;
+              label_idx = targets[batch_idx * n_time + t];
+              next_label_idx = targets[batch_idx * n_time + t + 1];
+              state_idx = (seq_len - 2) * 2 + 1;
+              srel_edge_idx = 3;
+              // skip over blank to next label / end state (if allowed <=> next label is different)
+              if(label_idx != next_label_idx) {
+                to_state_idx = end_state_idx;              
+                emission_idx = next_label_idx;
+              }
+            }
+            // 3 edges for prev last blank
+            else if(rel_edge_idx <= 5 * (seq_len - 1) + 3) {
+              t = seq_len - 1;
+              label_idx = targets[batch_idx * n_time + t];
+              state_idx = (seq_len - 1) * 2;
+              srel_edge_idx = rel_edge_idx - (5 * (seq_len - 1) + 1);
+              if(srel_edge_idx == 0) {
+                to_state_idx = state_idx;
+                emission_idx = blank_idx;
+              }
+              else if(srel_edge_idx == 1) {
+                to_state_idx = state_idx + 1;
+                emission_idx = label_idx;
+              }
+              else if(srel_edge_idx == 2) {
+                to_state_idx = end_state_idx;
+                emission_idx = label_idx;
+              }
+            }
+            // 4 edges for last label
+            else if(rel_edge_idx <= 5 * (seq_len - 1) + 7) {
+              t = seq_len - 1;
+              label_idx = targets[batch_idx * n_time + t];
+              state_idx = (seq_len - 1) * 2 + 1;
+              srel_edge_idx = rel_edge_idx - (5 * (seq_len - 1) + 4);
+              if(srel_edge_idx == 0) {
+                to_state_idx = state_idx;
+                emission_idx = label_idx;
+              }
+              else if(srel_edge_idx == 1) {
+                to_state_idx = state_idx + 1;
+                emission_idx = blank_idx;
+              }
+              else if(srel_edge_idx == 2) {
+                to_state_idx = end_state_idx;
+                emission_idx = label_idx;              
+              }
+              else if(srel_edge_idx == 3) {
+                to_state_idx = end_state_idx;
+                emission_idx = blank_idx;
+              }
+            }
+            // 2 edges for last blank
+            else if(rel_edge_idx <= 5 * (seq_len - 1) + 9) {
+              t = -1;
+              emission_idx = blank_idx;
+              state_idx = (seq_len - 1) * 2 + 2;
+              srel_edge_idx = rel_edge_idx - (5 * (seq_len - 1) + 8);            
+              if(srel_edge_idx == 0)
+                to_state_idx = state_idx;
+              else
+                to_state_idx = end_state_idx;
+            }
+            else {
+              t = -1;
+              state_idx = dummy_state_idx;
+              srel_edge_idx = -1;
+            }
+          }
+          
+          edges[0 * n_edges + idx] = state_idx_offset + state_idx; // from
+          edges[1 * n_edges + idx] = state_idx_offset + to_state_idx; // to
+          edges[2 * n_edges + idx] = emission_idx; // emission
+          edges[3 * n_edges + idx] = batch_idx; // batch
+          
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 4);
+    assert(n_outputs == 2);
+    Ndarray* targets = inputs[0];
+    Ndarray* seq_lens = inputs[1];
+    Ndarray* blank_idx_ref = inputs[2];
+    Ndarray* weights = inputs[3];
+    Ndarray* edges = *outputs[0];
+    Ndarray* start_end_states = *outputs[1];
+    assert_cmp(Ndarray_NDIM(targets), ==, 2);
+    assert_cmp(Ndarray_NDIM(seq_lens), ==, 1);
+    assert_cmp(Ndarray_NDIM(blank_idx_ref), ==, 0);
+    assert_cmp(Ndarray_NDIM(weights), ==, 1);
+    assert_cmp(Ndarray_NDIM(edges), ==, 2);
+    assert_cmp(Ndarray_NDIM(start_end_states), ==, 2);
+    int n_batch = Ndarray_DIMS(seq_lens)[0];
+    assert_cmp(Ndarray_DIMS(targets)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(seq_lens)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(start_end_states)[1], ==, n_batch);
+    int n_time = Ndarray_DIMS(targets)[1];
+    int n_edges = Ndarray_DIMS(weights)[0];
+    assert_cmp(Ndarray_DIMS(start_end_states)[0], ==, 2);
+    assert_cmp(Ndarray_DIMS(edges)[0], ==, 4);
+    assert_cmp(Ndarray_DIMS(edges)[1], ==, n_edges);
+
+    assert_cmp(n_edges, ==, n_batch * (5 * (n_time - 1) + 10));
+
+    Ndarray_memset(Ndarray_DEV_DATA_int32(edges), 255, 4 * n_edges * sizeof(int32_t));
+    Ndarray_memset(Ndarray_DEV_DATA_int32(start_end_states), 255, 2 * n_batch * sizeof(int32_t));
+    int32_t blank_idx = Ndarray_DEV_DATA_int32_scalar(blank_idx_ref);
+    
+    start_dev_kernel(construct_kernel, (
+      n_batch, n_time, n_edges,
+      Ndarray_DEV_DATA_int32(targets), Ndarray_DEV_DATA_int32(seq_lens),
+      blank_idx,
+      Ndarray_DEV_DATA_int32(edges), Ndarray_DEV_DATA_int32(start_end_states)
+    ));
+  """
+
+
+class EditDistanceOp(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
+  """
+  Similar to :func:`tf.edit_distance`.
+  Calculates the `edit distance / Levenshtein distance <https://en.wikipedia.org/wiki/Levenshtein_distance>`__.
+
+  The naive implementation either goes over ``a`` and then ``b``, thus results in O(|a|*|b|) time complexity.
+  To calculate a new entry in the table (over then length of ``a`` and ``b``),
+  it depends on the prev symbol in ``a`` (left) (deletion error),
+  the prev symbol in ``b`` (up) (insertion error),
+  and the left-up diagonal (substitution error, or no error).
+
+  To take advantage of the parallelism of the GPU, we follow a diagonal iteration scheme, such that
+  in every iteration, all entries on the diagonal can be computed in parallel, as they do not depend on each other.
+  After implementing this, we found that this algorithm is described here::
+
+    Using GPUs to Speed-Up Levenshtein Edit Distance Computation, Balhaf et al, 2016,
+    https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=7476090&tag=1
+
+  inputs:
+    :param a: symbols. 2d (batch,time), int32
+    :param a_len: 1d (batch,), int32
+    :param b: symbols. 2d (batch,time), int32
+    :param b_len: 1d (batch,), int32
+  outputs:
+    :param output: 1d (batch,), int32, unnormalized edit distance
+  """
+  in_info = (
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 1, "shape": ((0, 0),), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_next_step": """
+      DEF_KERNEL
+      void next_step_kernel(
+            int n_batch, int n_a_max_len, int n_b_max_len,
+            int diag_idx,
+            const int32_t* a, const int32_t* b,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* last1_dist, const int32_t* last2_dist, int32_t* cur_dist,
+            int32_t* result) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        // We are going diagonal!
+        int num_entries;
+        if(diag_idx <= n_a_max_len) {
+          num_entries = diag_idx + 1;
+          if(num_entries > n_b_max_len + 1)
+            num_entries = n_b_max_len + 1;
+        } else {
+          num_entries = n_b_max_len + 1 - (diag_idx - n_a_max_len);
+          if(num_entries > n_a_max_len + 1)
+            num_entries = n_a_max_len + 1;
+        }
+        int max_num_entries = n_a_max_len + 1;
+        if(max_num_entries > n_b_max_len + 1)
+          max_num_entries = n_b_max_len + 1;
+        while(idx < n_batch * num_entries) {
+          int batch_idx = idx / num_entries;
+          int entry_idx = idx % num_entries;
+          int dist_idx = batch_idx * max_num_entries + entry_idx;
+
+          int t_a, t_b;
+          if(diag_idx <= n_a_max_len) {
+            t_a = diag_idx - entry_idx;
+            t_b = entry_idx;
+          } else {
+            t_a = n_a_max_len - entry_idx;
+            t_b = diag_idx - n_a_max_len + entry_idx;
+          }
+
+          if(t_a == 0)
+            cur_dist[dist_idx] = t_b;  // distance == how much to delete from b
+          else if(t_b == 0)
+            cur_dist[dist_idx] = t_a;  // distance == how much to delete from a
+          else {
+            // last1 is with diag_idx - 2. Needed for substitution cost.
+            // last2 is with diag_idx - 1. Needed for insertion or deletion cost.
+            // last2 refers to the first, for deletion. last2_idx + 1 is for insertion.
+            int last1_idx, last2_idx;
+            if(diag_idx - 1 < n_a_max_len)
+              last1_idx = dist_idx - 1;
+            else if(diag_idx - 1 == n_a_max_len)
+              last1_idx = dist_idx;
+            else
+              last1_idx = dist_idx + 1;
+            if(diag_idx <= n_a_max_len)
+              last2_idx = dist_idx - 1;
+            else
+              last2_idx = dist_idx;
+
+            int del_cost, ins_cost, sub_cost;
+            del_cost = last2_dist[last2_idx] + 1;
+            ins_cost = last2_dist[last2_idx + 1] + 1;
+            sub_cost = last1_dist[last1_idx];
+            if(a[batch_idx * n_a_max_len + t_a - 1] != b[batch_idx * n_b_max_len + t_b - 1])
+              ++sub_cost;
+            //printf("t_a %i, t_b %i, del %i, ins %i, sub %i\\n", t_a, t_b, del_cost, ins_cost, sub_cost);
+            int min_cost = del_cost;
+            if(min_cost > ins_cost) min_cost = ins_cost;
+            if(min_cost > sub_cost) min_cost = sub_cost;
+            cur_dist[dist_idx] = min_cost;
+          }
+          //printf("t_a %i, t_b %i, dist %i\\n", t_a, t_b, cur_dist[dist_idx]);
+
+          if(t_a == a_len[batch_idx] && t_b == b_len[batch_idx])
+            result[batch_idx] = cur_dist[dist_idx];
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 4);
+    assert(n_outputs == 1);
+    Ndarray* a = inputs[0];
+    Ndarray* a_len = inputs[1];
+    Ndarray* b = inputs[2];
+    Ndarray* b_len = inputs[3];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 1);
+    int n_batch = Ndarray_DIMS(out)[0];
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_len)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+    int n_a_max_len = Ndarray_DIMS(a)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    Ndarray_memset(Ndarray_DEV_DATA_int32(out), 255, n_batch * sizeof(int32_t));
+
+    // Working buffer.
+    int max_num_entries = std::min(n_a_max_len + 1, n_b_max_len + 1);
+    int32_t* buffer = (int32_t*) device_malloc(3 * n_batch * max_num_entries * sizeof(int32_t));
+    int32_t* last1_dist = buffer;
+    int32_t* last2_dist = buffer + n_batch * max_num_entries;
+    int32_t* cur_dist = buffer + 2 * n_batch * max_num_entries;
+
+    int num_diag = n_a_max_len + n_b_max_len + 1;
+    for(int diag_idx = 0; diag_idx < num_diag; ++diag_idx) {
+      start_dev_kernel(next_step_kernel, (
+        n_batch, n_a_max_len, n_b_max_len,
+        diag_idx,
+        Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(b),
+        Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+        last1_dist, last2_dist, cur_dist,
+        Ndarray_DEV_DATA_int32(out)));
+      // Rotate. last1_dist not needed anymore.
+      int32_t* tmp = last1_dist;
+      last1_dist = last2_dist;
+      last2_dist = cur_dist;
+      cur_dist = tmp;
+    }
+
+    device_free(buffer);
+  """
+
+  c_bw_code = None
+
+
+class OptimalCompletionEditDistanceOp(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
+  """
+  Given some prefix ``a``, what is the minimum possible edit distance to ``b`` with any possible suffix on ``a`` ?
+  This is described in `Optimal Completion Distillation (OCD) <https://arxiv.org/abs/1810.01398>`__.
+  The implementation is derived from :class:`EditDistanceOp`.
+
+  inputs:
+    :param a: symbols. 2d (batch,time), int32. prefix.
+    :param a_len: 1d (batch,), int32
+    :param b: symbols. 2d (batch,time), int32
+    :param b_len: 1d (batch,), int32
+  outputs:
+    :param output: 1d (batch,), int32, unnormalized edit distance
+  """
+  in_info = (
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 1, "shape": ((0, 0),), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_init_result": """
+      DEF_KERNEL
+      void init_result_kernel(int n_batch, int32_t* result) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch) {
+          result[idx] = 2147483647;  // biggest int32
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "002_next_step": """
+      DEF_KERNEL
+      void next_step_kernel(
+            int n_batch, int n_a_max_len, int n_b_max_len,
+            int diag_idx,
+            const int32_t* a, const int32_t* b,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* last1_dist, const int32_t* last2_dist, int32_t* cur_dist,
+            int32_t* result) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        // We are going diagonal!
+        int num_entries;
+        if(diag_idx <= n_a_max_len) {
+          num_entries = diag_idx + 1;
+          if(num_entries > n_b_max_len + 1)
+            num_entries = n_b_max_len + 1;
+        } else {
+          num_entries = n_b_max_len + 1 - (diag_idx - n_a_max_len);
+          if(num_entries > n_a_max_len + 1)
+            num_entries = n_a_max_len + 1;
+        }
+        int max_num_entries = n_a_max_len + 1;
+        if(max_num_entries > n_b_max_len + 1)
+          max_num_entries = n_b_max_len + 1;
+        while(idx < n_batch * num_entries) {
+          int batch_idx = idx / num_entries;
+          int entry_idx = idx % num_entries;
+          int dist_idx = batch_idx * max_num_entries + entry_idx;
+
+          int t_a, t_b;
+          if(diag_idx <= n_a_max_len) {
+            t_a = diag_idx - entry_idx;
+            t_b = entry_idx;
+          } else {
+            t_a = n_a_max_len - entry_idx;
+            t_b = diag_idx - n_a_max_len + entry_idx;
+          }
+
+          if(t_a == 0)
+            cur_dist[dist_idx] = t_b;  // distance == how much to delete from b
+          else if(t_b == 0)
+            cur_dist[dist_idx] = t_a;  // distance == how much to delete from a
+          else {
+            // last1 is with diag_idx - 2. Needed for substitution cost.
+            // last2 is with diag_idx - 1. Needed for insertion or deletion cost.
+            // last2 refers to the first, for deletion. last2_idx + 1 is for insertion.
+            int last1_idx, last2_idx;
+            if(diag_idx - 1 < n_a_max_len)
+              last1_idx = dist_idx - 1;
+            else if(diag_idx - 1 == n_a_max_len)
+              last1_idx = dist_idx;
+            else
+              last1_idx = dist_idx + 1;
+            if(diag_idx <= n_a_max_len)
+              last2_idx = dist_idx - 1;
+            else
+              last2_idx = dist_idx;
+
+            int del_cost, ins_cost, sub_cost;
+            del_cost = last2_dist[last2_idx] + 1;
+            ins_cost = last2_dist[last2_idx + 1] + 1;
+            sub_cost = last1_dist[last1_idx];
+            if(a[batch_idx * n_a_max_len + t_a - 1] != b[batch_idx * n_b_max_len + t_b - 1])
+              ++sub_cost;
+            int min_cost = del_cost;
+            if(min_cost > ins_cost) min_cost = ins_cost;
+            if(min_cost > sub_cost) min_cost = sub_cost;
+            cur_dist[dist_idx] = min_cost;
+          }
+
+          if(t_a == a_len[batch_idx] && t_b <= b_len[batch_idx])
+            elem_atomic_min(&result[batch_idx], cur_dist[dist_idx]);
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 4);
+    assert(n_outputs == 1);
+    Ndarray* a = inputs[0];
+    Ndarray* a_len = inputs[1];
+    Ndarray* b = inputs[2];
+    Ndarray* b_len = inputs[3];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 1);
+    int n_batch = Ndarray_DIMS(out)[0];
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_len)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+    int n_a_max_len = Ndarray_DIMS(a)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    start_dev_kernel(init_result_kernel, (n_batch, Ndarray_DEV_DATA_int32(out)));
+
+    // Working buffer.
+    int max_num_entries = std::min(n_a_max_len + 1, n_b_max_len + 1);
+    int32_t* buffer = (int32_t*) device_malloc(3 * n_batch * max_num_entries * sizeof(int32_t));
+    int32_t* last1_dist = buffer;
+    int32_t* last2_dist = buffer + n_batch * max_num_entries;
+    int32_t* cur_dist = buffer + 2 * n_batch * max_num_entries;
+
+    int num_diag = n_a_max_len + n_b_max_len + 1;
+    for(int diag_idx = 0; diag_idx < num_diag; ++diag_idx) {
+      start_dev_kernel(next_step_kernel, (
+        n_batch, n_a_max_len, n_b_max_len,
+        diag_idx,
+        Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(b),
+        Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+        last1_dist, last2_dist, cur_dist,
+        Ndarray_DEV_DATA_int32(out)));
+      // Rotate. last1_dist not needed anymore.
+      int32_t* tmp = last1_dist;
+      last1_dist = last2_dist;
+      last2_dist = cur_dist;
+      cur_dist = tmp;
+    }
+
+    device_free(buffer);
+  """
+
+  c_bw_code = None
+
+
+class OptimalCompletionEditDistancePerSuccessorOp(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
+  """
+  Given some prefix ``a`` + successor,
+  what is the minimum possible edit distance to ``b`` with any possible suffix on ``a`` + successor,
+  for successor in ``successors``.
+  This is described in `Optimal Completion Distillation (OCD) <https://arxiv.org/abs/1810.01398>`__.
+  The implementation is derived from :class:`OptimalCompletionEditDistanceOp`.
+
+  inputs:
+    :param a: symbols. 2d (batch,time), int32. prefix.
+    :param a_len: 1d (batch,), int32
+    :param b: symbols. 2d (batch,time), int32
+    :param b_len: 1d (batch,), int32
+    :param successors: 1d (num_labels,), int32
+  outputs:
+    :param output: 2d (batch,num_labels), int32, unnormalized edit distance
+  """
+  in_info = (
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "successors", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 2, "shape": ((0, 0), (4, 0)), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_next_step": """
+      DEF_KERNEL
+      void next_step_kernel(
+            int n_batch, int n_a_max_len, int n_b_max_len,
+            int diag_idx,
+            const int32_t* a, const int32_t* b,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* last1_dist, const int32_t* last2_dist, int32_t* cur_dist, int32_t* a_last_row) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        // We are going diagonal!
+        int num_entries;
+        if(diag_idx <= n_a_max_len) {
+          num_entries = diag_idx + 1;
+          if(num_entries > n_b_max_len + 1)
+            num_entries = n_b_max_len + 1;
+        } else {
+          num_entries = n_b_max_len + 1 - (diag_idx - n_a_max_len);
+          if(num_entries > n_a_max_len + 1)
+            num_entries = n_a_max_len + 1;
+        }
+        int max_num_entries = n_a_max_len + 1;
+        if(max_num_entries > n_b_max_len + 1)
+          max_num_entries = n_b_max_len + 1;
+        while(idx < n_batch * num_entries) {
+          int batch_idx = idx / num_entries;
+          int entry_idx = idx % num_entries;
+          int dist_idx = batch_idx * max_num_entries + entry_idx;
+
+          int t_a, t_b;
+          if(diag_idx <= n_a_max_len) {
+            t_a = diag_idx - entry_idx;
+            t_b = entry_idx;
+          } else {
+            t_a = n_a_max_len - entry_idx;
+            t_b = diag_idx - n_a_max_len + entry_idx;
+          }
+
+          if(t_a == 0)
+            cur_dist[dist_idx] = t_b;  // distance == how much to delete from b
+          else if(t_b == 0)
+            cur_dist[dist_idx] = t_a;  // distance == how much to delete from a
+          else {
+            // last1 is with diag_idx - 2. Needed for substitution cost.
+            // last2 is with diag_idx - 1. Needed for insertion or deletion cost.
+            // last2 refers to the first, for deletion. last2_idx + 1 is for insertion.
+            int last1_idx, last2_idx;
+            if(diag_idx - 1 < n_a_max_len)
+              last1_idx = dist_idx - 1;
+            else if(diag_idx - 1 == n_a_max_len)
+              last1_idx = dist_idx;
+            else
+              last1_idx = dist_idx + 1;
+            if(diag_idx <= n_a_max_len)
+              last2_idx = dist_idx - 1;
+            else
+              last2_idx = dist_idx;
+
+            int del_cost, ins_cost, sub_cost;
+            del_cost = last2_dist[last2_idx] + 1;
+            ins_cost = last2_dist[last2_idx + 1] + 1;
+            sub_cost = last1_dist[last1_idx];
+            if(a[batch_idx * n_a_max_len + t_a - 1] != b[batch_idx * n_b_max_len + t_b - 1])
+              ++sub_cost;
+            int min_cost = del_cost;
+            if(min_cost > ins_cost) min_cost = ins_cost;
+            if(min_cost > sub_cost) min_cost = sub_cost;
+            cur_dist[dist_idx] = min_cost;
+          }
+
+          if(t_a == a_len[batch_idx] && t_b <= b_len[batch_idx])
+            a_last_row[batch_idx * (n_b_max_len + 1) + t_b] = cur_dist[dist_idx];
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "002_init_result": """
+      DEF_KERNEL
+      void init_result_kernel(
+            int n_batch, int n_b_max_len, int n_labels,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* a_last_row,
+            int32_t* result
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch * n_labels) {
+          int batch_idx = idx / n_labels;
+          int successor_idx = idx % n_labels;
+
+          // Initial insertion, last deletion.
+          int t_a = a_len[batch_idx] + 1;
+          int min_cost = t_a;
+          int last_del_cost = a_last_row[batch_idx * (n_b_max_len + 1) + b_len[batch_idx]] + 1;
+          if(min_cost > last_del_cost) min_cost = last_del_cost;
+          result[batch_idx * n_labels + successor_idx] = min_cost;
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "003_expand": """
+      DEF_KERNEL
+      void expand_kernel(
+            int n_batch, int n_b_max_len, int n_labels,
+            const int32_t* b,
+            const int32_t* b_len,
+            const int32_t* a_last_row,
+            const int32_t* successors,
+            int32_t* result
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch * n_labels * n_b_max_len) {
+          int batch_idx = idx / n_b_max_len / n_labels;
+          int successor_idx = (idx / n_b_max_len) % n_labels;
+          int t_b = idx % n_b_max_len;
+          int successor = successors[successor_idx];
+
+          if(t_b < b_len[batch_idx]) {
+            // We can ignore insertion/deletion
+            // (except initial insertion / last deletion, see init_result_kernel).
+            int sub_cost = a_last_row[batch_idx * (n_b_max_len + 1) + t_b];
+            if(successor != b[batch_idx * n_b_max_len + t_b])
+              ++sub_cost;
+            elem_atomic_min(&result[batch_idx * n_labels + successor_idx], sub_cost);
+          }
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 5);
+    assert(n_outputs == 1);
+    Ndarray* a = inputs[0];
+    Ndarray* a_len = inputs[1];
+    Ndarray* b = inputs[2];
+    Ndarray* b_len = inputs[3];
+    Ndarray* successors = inputs[4];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(successors), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 2);
+    int n_batch = Ndarray_DIMS(out)[0];
+    int n_labels = Ndarray_DIMS(successors)[0];
+    assert_cmp(Ndarray_DIMS(out)[1], ==, n_labels);
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_len)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+    int n_a_max_len = Ndarray_DIMS(a)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    Ndarray_memset(Ndarray_DEV_DATA_int32(out), 255, n_batch * n_labels * sizeof(int32_t));
+
+    // Working buffer.
+    int max_num_entries = std::min(n_a_max_len + 1, n_b_max_len + 1);
+    int32_t* buffer = (int32_t*) device_malloc(3 * n_batch * max_num_entries * sizeof(int32_t));
+    int32_t* last1_dist = buffer;
+    int32_t* last2_dist = buffer + n_batch * max_num_entries;
+    int32_t* cur_dist = buffer + 2 * n_batch * max_num_entries;
+    int32_t* a_last_row = (int32_t*) device_malloc(n_batch * (n_b_max_len + 1) * sizeof(int32_t));
+
+    int num_diag = n_a_max_len + n_b_max_len + 1;
+    for(int diag_idx = 0; diag_idx < num_diag; ++diag_idx) {
+      start_dev_kernel(next_step_kernel, (
+        n_batch, n_a_max_len, n_b_max_len,
+        diag_idx,
+        Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(b),
+        Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+        last1_dist, last2_dist, cur_dist, a_last_row
+      ));
+      // Rotate. last1_dist not needed anymore.
+      int32_t* tmp = last1_dist;
+      last1_dist = last2_dist;
+      last2_dist = cur_dist;
+      cur_dist = tmp;
+    }
+
+    start_dev_kernel(init_result_kernel, (
+      n_batch, n_b_max_len, n_labels,
+      Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+      a_last_row,
+      Ndarray_DEV_DATA_int32(out)
+    ));
+
+    start_dev_kernel(expand_kernel, (
+      n_batch, n_b_max_len, n_labels,
+      Ndarray_DEV_DATA_int32(b),
+      Ndarray_DEV_DATA_int32(b_len),
+      a_last_row,
+      Ndarray_DEV_DATA_int32(successors),
+      Ndarray_DEV_DATA_int32(out)
+    ));
+
+    device_free(buffer);
+    device_free(a_last_row);
+  """
+
+  c_bw_code = None
+
+
+class NextEditDistanceRowOp(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
+  """
+  This does a single step in calculating the edit distance table, going over the symbols in ``a``.
+  Note that when you have the full sequence ``a`` in advance, :class:`EditDistanceOp` should be faster.
+  However, this iterative op is useful when ``a`` is constructed step by step.
+
+  inputs:
+    :param last_row: 2d (batch,b_time + 1), int32. last edit distances
+    :param a: symbols. 1d (batch,), int32. current.
+    :param a_n: scalar, int32. current position
+    :param a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
+    :param b: symbols. 2d (batch,b_time), int32
+    :param b_len: 1d (batch,), int32
+  outputs:
+    :param output: 2d (batch,b_time + 1), int32, next (unnormalized) edit distance row
+  """
+  in_info = (
+    {"name": "last_row", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_n", "ndim": 0, "shape": (), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_ended", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 2, "shape": ((0, 0), (0, 1)), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_next_row": """
+      DEF_KERNEL
+      void next_row_kernel(
+            int n_batch, int n_b_max_len,
+            const int32_t* last_row,
+            const int32_t* a, const int32_t* a_n, const int32_t* a_ended,
+            const int32_t* b, const int32_t* b_len,
+            int32_t* next_row
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch) {
+          int batch_idx = idx;
+
+          int last_dist;
+          if(!a_ended[batch_idx]) {
+            last_dist = *a_n + 1;  // Initial deletion error.
+            next_row[batch_idx * (n_b_max_len + 1)] = last_dist;
+            for(int t_b = 1; t_b <= b_len[batch_idx]; ++t_b) {
+              int ins_error = last_row[batch_idx * (n_b_max_len + 1) + t_b] + 1;
+              int del_error = last_dist + 1;
+              int sub_error = last_row[batch_idx * (n_b_max_len + 1) + t_b - 1];
+              if(a[batch_idx] != b[batch_idx * n_b_max_len + t_b - 1])
+                ++sub_error;
+              last_dist = ins_error;
+              if(last_dist > del_error) last_dist = del_error;
+              if(last_dist > sub_error) last_dist = sub_error;
+              next_row[batch_idx * (n_b_max_len + 1) + t_b] = last_dist;
+            }
+          }
+          else {  // a ended
+            // Just copy over.
+            for(int t_b = 0; t_b <= b_len[batch_idx]; ++t_b) {
+              last_dist = last_row[batch_idx * (n_b_max_len + 1) + t_b];
+              next_row[batch_idx * (n_b_max_len + 1) + t_b] = last_dist;
+            }
+          }
+          // Repeat last entry.
+          for(int t_b = b_len[batch_idx] + 1; t_b < n_b_max_len + 1; ++t_b)
+            next_row[batch_idx * (n_b_max_len + 1) + t_b] = last_dist;
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 6);
+    assert(n_outputs == 1);
+    Ndarray* last_row = inputs[0];
+    Ndarray* a = inputs[1];
+    Ndarray* a_n = inputs[2];
+    Ndarray* a_ended = inputs[3];
+    Ndarray* b = inputs[4];
+    Ndarray* b_len = inputs[5];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(last_row), ==, 2);
+    assert_cmp(Ndarray_NDIM(a), ==, 1);
+    assert_cmp(Ndarray_NDIM(a_n), ==, 0);
+    assert_cmp(Ndarray_NDIM(a_ended), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 2);
+    int n_batch = Ndarray_DIMS(out)[0];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    assert_cmp(Ndarray_DIMS(out)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(out)[1], ==, n_b_max_len + 1);
+    assert_cmp(Ndarray_DIMS(last_row)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(last_row)[1], ==, n_b_max_len + 1);
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_ended)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[1], ==, n_b_max_len);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+
+    start_dev_kernel(next_row_kernel, (
+      n_batch, n_b_max_len,
+      Ndarray_DEV_DATA_int32(last_row),
+      Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(a_n), Ndarray_DEV_DATA_int32(a_ended),
+      Ndarray_DEV_DATA_int32(b), Ndarray_DEV_DATA_int32(b_len),
+      Ndarray_DEV_DATA_int32(out)
+    ));
+  """
+
+  c_bw_code = None
+
+
+class NextEditDistanceReduceOp(NativeOpGenBase):
+  # noinspection PyUnresolvedReferences
+  """
+  Code derived from :class:`NextEditDistanceRowOp`.
+
+  inputs:
+    :param last_row: 2d (batch,b_time + 1), int32. last edit distances
+    :param a: symbols. 2d (batch|1,n_labels), int32. current.
+    :param a_n: scalar, int32. current position
+    :param a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
+    :param b: symbols. 2d (batch,b_time), int32
+    :param b_len: 1d (batch,), int32
+    :param optimal_completion: scalar, int32 (casted from bool). True -> reduce_min over row; False -> last of row
+  outputs:
+    :param output: 2d (batch,n_labels), int32, next (unnormalized) (maybe optional) edit distance
+  """
+  in_info = (
+    {"name": "last_row", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_n", "ndim": 0, "shape": (), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_ended", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "optimal_completion", "ndim": 0, "shape": (), "dtype": "int32",
+     "gradient": "disconnected", "host_memory": True},
+  )
+  out_info = (
+    {"name": "output", "ndim": 2, "shape": ((0, 0), (1, 1)), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_calc_result": """
+      DEF_KERNEL
+      void calc_result_kernel(
+            int n_batch, int n_b_max_len, int n_labels,
+            const int32_t* last_row,
+            const int32_t* a, const int32_t* a_n, const int32_t* a_ended,
+            const int32_t* b, const int32_t* b_len,
+            int32_t* result,
+            bool optimal_completion,
+            bool a_broadcast_batch
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch * n_labels) {
+          int batch_idx = idx / n_labels;
+          int label_idx = idx % n_labels;
+          int a_label = a[(a_broadcast_batch ? 0 : batch_idx) * n_labels + label_idx];
+
+          int total_min_error;
+          int last_dist;
+          if(!a_ended[batch_idx]) {
+            last_dist = *a_n + 1;  // Initial deletion error.
+            total_min_error = last_dist;
+            for(int t_b = 1; t_b <= b_len[batch_idx]; ++t_b) {
+              int ins_error = last_row[batch_idx * (n_b_max_len + 1) + t_b] + 1;
+              int del_error = last_dist + 1;
+              int sub_error = last_row[batch_idx * (n_b_max_len + 1) + t_b - 1];
+              if(a_label != b[batch_idx * n_b_max_len + t_b - 1])
+                ++sub_error;
+              int min_error = ins_error;
+              if(min_error > del_error) min_error = del_error;
+              if(min_error > sub_error) min_error = sub_error;
+              last_dist = min_error;
+              if(total_min_error > last_dist) total_min_error = last_dist;
+            }
+          }
+          else {  // a ended
+            // Just copy over.
+            total_min_error = last_row[batch_idx * (n_b_max_len + 1)];
+            for(int t_b = 0; t_b <= b_len[batch_idx]; ++t_b) {
+              last_dist = last_row[batch_idx * (n_b_max_len + 1) + t_b];
+              if(total_min_error > last_dist) total_min_error = last_dist;
+            }
+          }
+
+          result[batch_idx * n_labels + label_idx] = optimal_completion ? total_min_error : last_dist;
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 7);
+    assert(n_outputs == 1);
+    Ndarray* last_row = inputs[0];
+    Ndarray* a = inputs[1];
+    Ndarray* a_n = inputs[2];
+    Ndarray* a_ended = inputs[3];
+    Ndarray* b = inputs[4];
+    Ndarray* b_len = inputs[5];
+    bool optimal_completion = (bool) Ndarray_DEV_DATA_int32_scalar(inputs[6]);
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(last_row), ==, 2);
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_n), ==, 0);
+    assert_cmp(Ndarray_NDIM(a_ended), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 2);
+    int n_batch = Ndarray_DIMS(out)[0];
+    int n_labels = Ndarray_DIMS(out)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    assert_cmp(Ndarray_DIMS(out)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(out)[1], ==, n_labels);
+    assert_cmp(Ndarray_DIMS(last_row)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(last_row)[1], ==, n_b_max_len + 1);
+    bool a_broadcast_batch = Ndarray_DIMS(a)[0] == 1;
+    if(!a_broadcast_batch)
+      assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a)[1], ==, n_labels);
+    assert_cmp(Ndarray_DIMS(a_ended)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[1], ==, n_b_max_len);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+
+    start_dev_kernel(calc_result_kernel, (
+      n_batch, n_b_max_len, n_labels,
+      Ndarray_DEV_DATA_int32(last_row),
+      Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(a_n), Ndarray_DEV_DATA_int32(a_ended),
+      Ndarray_DEV_DATA_int32(b), Ndarray_DEV_DATA_int32(b_len),
+      Ndarray_DEV_DATA_int32(out),
+      optimal_completion,
+      a_broadcast_batch
+    ));
+  """
+
+  c_bw_code = None

@@ -15,6 +15,7 @@ from __future__ import print_function
 import os
 import sys
 import time
+import typing
 try:
   # noinspection PyCompatibility
   from Queue import Queue
@@ -26,23 +27,29 @@ import numpy
 import tensorflow as tf
 from tensorflow.python.client import timeline
 
+from EngineBase import EngineBase
 from Dataset import Dataset, Batch, BatchSetGenerator
-from Engine import Engine as TheanoEngine
-from LearningRateControl import loadLearningRateControlFromConfig, LearningRateControl
+from LearningRateControl import load_learning_rate_control_from_config, LearningRateControl
 from Log import log
-from Network import LayerNetwork
-from Pretrain import pretrainFromConfig
-from TFNetwork import TFNetwork, ExternData, help_on_tf_exception
+from Pretrain import pretrain_from_config
+from TFNetwork import TFNetwork, help_on_tf_exception
 from TFUpdater import Updater
-from Util import hms, NumbersDict, PY3, BackendEngine
+from Util import hms, NumbersDict, BackendEngine
 from pprint import pprint
 
 
 class CancelTrainingException(Exception):
-  pass
+  """
+  Training was cancelled.
+  """
 
 
 class Runner(object):
+  """
+  This encapsulates the logic around TF ``session.run``, i.e. iterating over the dataset.
+  """
+
+  # noinspection PyShadowingBuiltins
   def __init__(self, engine, dataset, batches, train, eval=True, train_flag=None,
                extra_fetches=None, extra_fetches_callback=None):
     """
@@ -52,16 +59,18 @@ class Runner(object):
     :param bool train: whether to do updates on the model
     :param bool|None train_flag: normally just as train. but e.g. maybe you want to have the train_flag but not train
     :param bool eval: whether to evaluate (i.e. calculate loss/error)
-    :param dict[str,tf.Tensor|TFUtil.Data|TFNetworkLayer.LayerBase]|None extra_fetches: additional fetches per step.
+    :param dict[str,tf.Tensor|TFUtil.Data|TFNetworkLayer.LayerBase|()->tf.Tensor)]|None extra_fetches:
+      additional fetches per step.
       `extra_fetches_callback` will be called with these. In case of Data/LayerBase, it will return a list,
       where each item corresponds to the batch-seq.
       It might also be useful to add `network.get_extern_data("seq_idx")` and `network.get_extern_data("seq_tag")`.
     :param (**dict[str,numpy.ndarray|str|list[numpy.ndarray|str])->None extra_fetches_callback: called if extra_fetches
     """
-    from TFDataPipeline import FeedDictDataProvider, DataProviderBase
+    from TFDataPipeline import DataProviderBase
     engine.network.extern_data.check_matched_dataset(
-      dataset=dataset, used_data_keys=engine.network.used_data_keys)
+      dataset=dataset, used_data_keys=engine.network.get_used_data_keys())
     self.engine = engine
+    # noinspection PyProtectedMember
     self.data_provider = self.engine._get_new_data_provider(dataset=dataset, batches=batches)
     assert isinstance(self.data_provider, DataProviderBase)
     if train_flag is None:
@@ -75,16 +84,16 @@ class Runner(object):
     self.cancel_flag = False
     self.run_exception = None
     self.num_steps = None
-    self.device_crash_batch = None  # type: int|None
+    self.device_crash_batch = None  # type: typing.Optional[int]
     self.start_time = None
     self.elapsed = None
     self._results_accumulated = NumbersDict()  # entries like "cost:output" or "loss"
     self._inv_norm_accumulated = NumbersDict()  # entries like "output"
     self.num_frames_accumulated = NumbersDict()  # for each data key (eg. "classes"), corresponding number of frames
-    self.results = {}  # type: dict[str,float]  # entries like "cost:output" or "loss"
-    self.score = {}  # type: dict[str,float]  # entries like "cost:output"
-    self.error = {}  # type: dict[str,float]  # entries like "error:output"
-    self.stats = {}  # type: dict[str,float|numpy.ndarray|Util.Stats]  # entries like "stats:..."
+    self.results = {}  # type: typing.Dict[str,float]  # entries like "cost:output" or "loss"
+    self.score = {}  # type: typing.Dict[str,float]  # entries like "cost:output"
+    self.error = {}  # type: typing.Dict[str,float]  # entries like "error:output"
+    self.stats = {}  # type: typing.Dict[str,typing.Union[float,numpy.ndarray,'Util.Stats']]  # entries like "stats:..."
     self.extra_fetches = extra_fetches
     if extra_fetches is not None:
       assert extra_fetches_callback
@@ -100,68 +109,34 @@ class Runner(object):
     :return: values and actions which should be calculated and executed in self.run() by the TF session for each step
     :rtype: dict[str,tf.Tensor|tf.Operation]
     """
-    # Note that it is important that we do not recreate graph nodes for every call to this function.
-    # Thus everything which we access here should be cached.
-
-    def reduce_sum(x, name, average=False):
-      if not self.engine.config.is_true("use_horovod"):
-        return x
-      from TFUtil import global_tensor
-      import horovod.tensorflow as hvd
-      return global_tensor(
-        lambda: hvd.allreduce(x, average=average),
-        name="fetch_reduce_sum__" + name.replace(":", "__").replace("/", "_"))
-
-    def inv_reduce_sum(x, name):
-      if not self.engine.config.is_true("use_horovod"):
-        return x
-      from TFUtil import global_tensor
-      return global_tensor(
-        lambda: tf.reciprocal(reduce_sum(tf.reciprocal(x), name=name)),
-        name="fetch_inv_reduce_sum__" + name.replace(":", "__").replace("/", "_"))
-
     d = {}
-    for key in self.data_provider.data_keys:
-      data = self.data_provider.extern_data.get_data(key)
-      for dim, v in data.size_placeholder.items():
-        d["size:%s:%i" % (key, dim)] = v
-    if self._should_train or self._should_eval:
-      # These values are cached internally and the graph nodes are created on the first call.
-      loss = self.engine.network.get_objective()
-      if loss is 0:
-        loss = self.engine.get_const_tensor(key="zero_loss", value=0.0)
-      else:  # non-constant-zero loss
-        assert self.engine.network.losses_dict
-      d["loss"] = reduce_sum(loss, name="loss", average=True)
-      for loss_name, loss in self.engine.network.losses_dict.items():
-        if loss.get_only_on_eval() and self._should_train:
-          continue
-        if loss.get_loss_value_for_fetch() is not None:
-          d["cost:%s" % loss_name] = reduce_sum(loss.get_loss_value_for_fetch(), name="cost:%s" % loss_name)
-        if loss.get_error_value() is not None:
-          d["error:%s" % loss_name] = reduce_sum(loss.get_error_value(), name="error:%s" % loss_name)
-        d["loss_norm_factor:%s" % loss_name] = inv_reduce_sum(
-          loss.get_norm_factor(), name="loss_norm_factor:%s" % loss_name)
-      for layer in self.engine.network.layers.values():
-        if layer.only_on_eval and self._should_train:
-          continue
-        # Maybe store additional size info of layer targets.
-        if layer.target and layer.target.startswith("layer:"):
-          target_data = layer.loss.target
-          for dim, v in target_data.size_placeholder.items():
-            d["size:%s:%i" % (layer.target, dim)] = v
-    for layer in self.engine.network.layers.values():
-      for k, v in layer.stats.items():
-        d["stats:%s:%s" % (layer.name, k)] = v
+    optim_op = None
     if self._should_train:
       assert self.engine.updater
+
       def callback_on_new():
+        """
+        Called when we have something new.
+        """
         # Force a new check.
         self.engine._checked_uninitialized_vars = False
         self.engine.updater.init_optimizer_vars(session=self.engine.tf_session)
-      d["optim_op"] = self.engine.updater.get_optim_op(callback_on_new=callback_on_new)
-      if self.engine.updater.optim_meta_losses:
-        d.update(self.engine.updater.optim_meta_losses)
+      # This function has to be called before `get_fetches_dict(..., with_summary=True)`,
+      # because it may introduce new summaries to the graph which are later collected.
+      optim_op = self.engine.updater.get_optim_op(callback_on_new=callback_on_new)
+
+    # Note that it is important that we do not recreate graph nodes for every call to this function.
+    # Thus everything which we access here should be cached.
+    d_fetches = self.engine.network.get_fetches_dict(
+      config=self.engine.config,
+      should_train=self._should_train, should_eval=self._should_eval,
+      with_summary=True, with_size=True)
+    d.update(d_fetches)
+    if optim_op is not None:
+      d["optim_op"] = optim_op
+      if self.engine.updater.optim_meta_losses_dict:
+        d.update(self.engine.updater.optim_meta_losses_dict)
+
     if self.extra_fetches is not None:
       from TFNetworkLayer import LayerBase
       from TFUtil import Data
@@ -173,21 +148,16 @@ class Runner(object):
           continue
         if isinstance(v, LayerBase):
           v = v.output
+        if callable(v):
+          v = v()
+          assert isinstance(v, tf.Tensor)
+          d["extra:%s" % k] = v
+          continue
         assert isinstance(v, Data)
         d["extra:%s" % k] = v.placeholder  # see _maybe_handle_extra_fetches, it will transform to batch-major there
         for i, s in v.size_placeholder.items():
           d["extra:%s:size_%i" % (k, i)] = s
-    if self.engine.get_all_merged_summaries() is not None:
-      d["summary"] = self.engine.get_all_merged_summaries()
-    if self.engine.config.bool("tf_log_memory_usage", False):
-      from TFUtil import mem_usage_for_dev
-      for dev in self.engine.tf_session.list_devices():
-        if dev.device_type != "GPU":
-          # mem_usage_for_dev currently only works for GPU
-          continue
-        d["mem_usage:%s" % os.path.basename(dev.name.replace("/device:", "/"))] = mem_usage_for_dev(dev.name)
-    if self.engine.network.get_post_control_dependencies():
-      d["post_control_dependencies"] = self.engine.network.get_post_control_dependencies()
+
     return d
 
   def _print_process(self, report_prefix, step, step_duration, eval_info):
@@ -241,6 +211,7 @@ class Runner(object):
   def _finalize(self, num_steps):
     """
     Called at the end of an epoch.
+
     :param int num_steps: number of steps we did for this epoch
     """
     results = {key: self._normalize_loss(value, key, self._inv_norm_accumulated)
@@ -251,6 +222,7 @@ class Runner(object):
       self.score.update({key + ":exp": numpy.exp(value) for (key, value) in results.items() if key.startswith("cost:")})
     self.error = {key: value for (key, value) in results.items() if key.startswith("error:")}
     self.num_steps = num_steps
+    self.data_provider.dataset.finish_epoch()
     self.finalized = True
 
   def _get_batch_dim_from_fetches(self, fetches_results):
@@ -283,6 +255,7 @@ class Runner(object):
       # We assume that this data-key has no time axis. Use the batch-dim instead.
       return self._get_batch_dim_from_fetches(fetches_results)
 
+  # noinspection PyMethodMayBeStatic
   def _normalize_loss(self, value, key, inv_loss_norm_factors):
     """
     :param T value:
@@ -361,7 +334,7 @@ class Runner(object):
         from Util import human_bytes_size, Stats
         self.stats.setdefault(k, Stats(format_str=human_bytes_size))
         self.stats[k].collect([v])
-        eval_info[k] = human_bytes_size(v)
+        eval_info[k] = human_bytes_size(int(v))
 
     return eval_info
 
@@ -384,6 +357,9 @@ class Runner(object):
         continue
       if isinstance(v, LayerBase):
         v = v.output
+      if callable(v):
+        d[k] = fetches_results["extra:%s" % k]
+        continue
       assert isinstance(v, Data)
       if v.batch_dim_axis != 0:
         r = numpy.moveaxis(r, v.batch_dim_axis, 0)
@@ -422,6 +398,7 @@ class Runner(object):
     # Stopped before? Keep in sync -> Don't send anything anymore, other peers do not expect it.
     if self._horovod_stopped_runner:
       return True, False
+    # noinspection PyUnresolvedReferences,PyPackageRequirements
     import horovod.tensorflow as hvd
     from TFUtil import global_tensor
     have_more_data_placeholder = global_tensor(
@@ -447,8 +424,8 @@ class Runner(object):
       # This means we should stop. Other peers will not expect further signals.
       stop = True
       self._horovod_stopped_runner = True
-    error_occured = sum_have_error > 0
-    return stop, error_occured
+    error_occurred = sum_have_error > 0
+    return stop, error_occurred
 
   def _horovod_sync_params(self, local_step, is_final=False):
     """
@@ -471,8 +448,10 @@ class Runner(object):
     if not is_final and local_step % sync_step != sync_step - 1:
       return 0.0
     from TFUtil import global_tensor
+    # noinspection PyUnresolvedReferences,PyPackageRequirements
     import horovod.tensorflow as hvd
 
+    # noinspection PyShadowingNames
     def assign_avg_var(var):
       """
       :param tf.Variable var:
@@ -510,6 +489,9 @@ class Runner(object):
       if self.engine.use_search_flag:
         logdir += "-search"
       logdir += "-%s" % get_utc_start_time_filename_part()
+      if self.engine.config.is_true("dry_run"):
+        logdir += "-dryrun"
+      # noinspection PyProtectedMember
       if self.engine._do_save():
         log_runtime_info_to_dir(logdir, config=self.engine.config)
       writer = tf.summary.FileWriter(logdir)
@@ -589,7 +571,7 @@ class Runner(object):
               fetches_dict,
               feed_dict=feed_dict,
               options=run_options,
-              run_metadata=run_metadata)  # type: dict[str,numpy.ndarray|str]
+              run_metadata=run_metadata)  # type: typing.Dict[str,typing.Union[numpy.ndarray,str]]
             elapsed_time_tf += time.time() - session_run_start_time
             writer.add_summary(fetches_results["summary"], step + step_offset)
             writer.add_run_metadata(run_metadata, 'step_{:04d}'.format(step + step_offset))
@@ -599,7 +581,8 @@ class Runner(object):
               f.write(tl.generate_chrome_trace_format(show_memory=True))
           else:
             session_run_start_time = time.time()
-            fetches_results = sess.run(fetches_dict, feed_dict=feed_dict)  # type: dict[str,numpy.ndarray|str]
+            fetches_results = sess.run(
+              fetches_dict, feed_dict=feed_dict)  # type: typing.Dict[str,typing.Union[numpy.ndarray,str]]
             elapsed_time_tf += time.time() - session_run_start_time
             if writer and "summary" in fetches_results:
               writer.add_summary(fetches_results["summary"], step + step_offset)
@@ -613,10 +596,14 @@ class Runner(object):
         elapsed_time_tf += self._horovod_sync_params(local_step=step)
         duration = time.time() - start_time
         self._print_process(report_prefix=report_prefix, step=step, step_duration=duration, eval_info=eval_info)
-        if step <= 10 and writer:
-          writer.flush()
-          if PY3:
-            os.sync()
+
+        if self.engine.config.bool("stop_on_nonfinite_train_score", True):
+          score_values = self._results_accumulated.values()
+          if any(numpy.isinf(score_values)) or any(numpy.isnan(score_values)):
+            print("Model seems broken, got inf or nan score.", file=log.v1)
+            print("Accumulated scores:", self._results_accumulated, file=log.v1)
+            raise Exception("Inf/nan score in step %i." % step)
+
         step += 1
         if self.cancel_flag:
           raise CancelTrainingException("cancel_flag is set")
@@ -651,7 +638,8 @@ class Runner(object):
       print("Exception %r in step %r." % (exc, step), file=log.v1)
       if not isinstance(exc, CancelTrainingException):
         help_on_tf_exception(
-          exception=exc, feed_dict=feed_dict, meta_step_info=meta_step_info,
+          session=sess,
+          exception=exc, fetches=fetches_dict, feed_dict=feed_dict, meta_step_info=meta_step_info,
           extern_data=self.data_provider.extern_data, file=log.v2)
         sys.excepthook(*sys.exc_info())
       self.device_crash_batch = step
@@ -671,11 +659,16 @@ class Runner(object):
       self.elapsed = time.time() - self.start_time
 
 
-class Engine(object):
+class Engine(EngineBase):
+  """
+  TF backend engine.
+  """
+
   def __init__(self, config=None):
     """
     :param Config.Config|None config:
     """
+    super(Engine, self).__init__()
     if config is None:
       from Config import get_global_config
       config = get_global_config(auto_create=True)
@@ -688,28 +681,37 @@ class Engine(object):
     self.orig_config = {}  # see _maybe_update_config
     self.devices_config = self._get_devices_config()
     self._check_devices()
-    self.tf_session = None  # type: tf.Session
-    self.network = None  # type: TFNetwork
-    self.updater = None  # type: Updater
-    self.learning_rate_control = None  # type: LearningRateControl
+    self.tf_session = None  # type: typing.Optional[tf.Session]
+    self.network = None  # type: typing.Optional[TFNetwork]
+    self.updater = None  # type: typing.Optional[Updater]
+    self.learning_rate_control = None  # type: typing.Optional[LearningRateControl]
     self._checked_uninitialized_vars = False
     self._merge_all_summaries = None
-    self.dataset_batches = {}  # type: dict[str,BatchSetGenerator]
-    self.train_data = None  # type: Dataset
-    self.start_epoch = None
+    self.dataset_batches = {}  # type: typing.Dict[str,BatchSetGenerator]
+    self.train_data = None  # type: typing.Optional[Dataset]
+    self.start_epoch = None  # type: typing.Optional[int]
     self.use_dynamic_train_flag = False
     self.use_search_flag = config.value("task", None) == "search"
     self.use_eval_flag = config.value("task", None) != "forward"
-    self._const_cache = {}  # type: dict[str,tf.Tensor]
+    self.learning_rate = 0.0  # set in init_train_epoch
+    self._const_cache = {}  # type: typing.Dict[str,tf.Tensor]
+    self.preload_from_files = None  # type: typing.Optional[typing.Dict[str,typing.Dict[str]]]
+    self.max_seqs = None  # type: typing.Optional[int]
 
   def finalize(self):
+    """
+    Finalizes the TF session, network, graph.
+    """
     self._close_tf_session()
-    tf.reset_default_graph()
-    self.network = None
-    self.updater = None
-    self._merge_all_summaries = None
+    self._reset_graph()
 
   def get_const_tensor(self, key, value):
+    """
+    :param key:
+    :param value:
+    :return: tf.constant(value)
+    :rtype: tf.Tensor
+    """
     if key not in self._const_cache:
       self._const_cache[key] = tf.constant(value=value, name="const_%s" % key)
     return self._const_cache[key]
@@ -718,7 +720,7 @@ class Engine(object):
     """
     :rtype: list[dict[str]]
     """
-    from Device import getDevicesInitArgs
+    from Config import get_devices_init_args
     if not self.config.value("device", None):
       # Better default: Use GPU if available.
       from TFUtil import is_gpu_available
@@ -727,9 +729,12 @@ class Engine(object):
         self.config.set("device", "gpu")
       else:
         print("Device not set explicitly, and no GPU found.", file=log.v2)
-    return getDevicesInitArgs(self.config)
+    return get_devices_init_args(self.config)
 
   def is_requesting_for_gpu(self):
+    """
+    :rtype: bool
+    """
     return any([d["device"].startswith("gpu") for d in self.devices_config])
 
   def _check_devices(self):
@@ -761,7 +766,7 @@ class Engine(object):
     else:
       opts["device_count"].setdefault("GPU", 0)
     # Note: We don't set intra_op_parallelism_threads and inter_op_parallelism_threads here anymore
-    # because it is saver to do it via setup_tf_thread_pools() which we call very early.
+    # because it is safer to do it via setup_tf_thread_pools() which we call very early.
     print("Setup tf.Session with options %r ..." % opts, file=log.v2)
     config = tf.ConfigProto(**opts)
     # config.gpu_options.allow_growth=True
@@ -773,36 +778,24 @@ class Engine(object):
     Resets the default graph (of the current thread),
     and clears up any cached tensors created in it.
     """
+    if self.network:
+      self.network.call_graph_reset_callbacks()
     tf.reset_default_graph()
     self._checked_uninitialized_vars = False
     self._merge_all_summaries = None
     self._const_cache.clear()
-
-  get_train_start_epoch_batch = TheanoEngine.get_train_start_epoch_batch
-  config_get_final_epoch = TheanoEngine.config_get_final_epoch
-  get_epoch_model = TheanoEngine.get_epoch_model
-  epoch_model_filename = TheanoEngine.epoch_model_filename
-
-  def get_epoch_model_filename(self, epoch=None):
-    if not epoch:
-      epoch = self.epoch
-    return self.epoch_model_filename(self.model_filename, epoch, self.is_pretrain_epoch(epoch=epoch))
-
-  def get_epoch_str(self):
-    return ("pretrain " if self.is_pretrain_epoch() else "") + "epoch %s" % self.epoch
-
-  def is_pretrain_epoch(self, epoch=None):
-    if not epoch:
-      epoch = self.epoch
-    return self.pretrain and epoch <= self.pretrain.get_train_num_epochs()
-
-  def is_first_epoch_after_pretrain(self):
-    return self.pretrain and self.epoch == self.pretrain.get_train_num_epochs() + 1
+    self.network = None
+    self.updater = None
 
   def get_eval_datasets(self):
-    eval_datasets = {}; """ :type: dict[str,Dataset.Dataset] """
+    """
+    :return: dict of datasets used for eval (dev, eval)
+    :rtype: dict[str,Dataset]
+    """
+    eval_datasets = {}  # type: typing.Dict[str,Dataset]
     for name, dataset in [("dev", self.dev_data), ("eval", self.eval_data)]:
-      if not dataset: continue
+      if not dataset:
+        continue
       eval_datasets[name] = dataset
     return eval_datasets
 
@@ -850,6 +843,7 @@ class Engine(object):
     assert count_bytes > 0
     return count_bytes
 
+  # noinspection PyAttributeOutsideInit
   def init_train_from_config(self, config=None, train_data=None, dev_data=None, eval_data=None):
     """
     :param Config.Config|None config:
@@ -873,8 +867,8 @@ class Engine(object):
     self.update_batch_size = config.int('update_batch_size', 0)
     self.save_model_epoch_interval = config.int('save_interval', 1)
     self.save_epoch1_initial_model = config.bool('save_epoch1_initial_model', False)
-    self.learning_rate_control = loadLearningRateControlFromConfig(config)
-    self.learning_rate = self.learning_rate_control.defaultLearningRate
+    self.learning_rate_control = load_learning_rate_control_from_config(config)
+    self.learning_rate = self.learning_rate_control.default_learning_rate
     self.initial_learning_rate = self.learning_rate
     self.pretrain_learning_rate = config.float('pretrain_learning_rate', self.learning_rate)
     self.final_epoch = self.config_get_final_epoch(config)  # Inclusive.
@@ -888,10 +882,11 @@ class Engine(object):
     self.max_seq_length = config.typed_value('max_seq_length', None) or config.float('max_seq_length', 0)
     self.inc_seq_length = config.float('inc_seq_length', 0)
     if not self.max_seq_length:
-      self.max_seq_length = sys.maxsize  # type: int|float|dict[str,int]|NumbersDict
+      self.max_seq_length = sys.maxsize  # type: typing.Union[int,float,typing.Dict[str,int]|NumbersDict]
     if isinstance(self.max_seq_length, dict):
       self.max_seq_length = NumbersDict(self.max_seq_length)
     assert isinstance(self.max_seq_length, (int, float, NumbersDict))
+    self.max_pad_size = config.typed_value("max_pad_size", None)
     # And also initialize the network. That depends on some vars here such as pretrain.
     self.init_network_from_config(config)
 
@@ -904,7 +899,7 @@ class Engine(object):
       config = self.config
     self.model_filename = config.value('model', None)
     self.preload_from_files = config.typed_value('preload_from_files', {})
-    self.pretrain = pretrainFromConfig(config)
+    self.pretrain = pretrain_from_config(config)
     self.max_seqs = config.int('max_seqs', -1)
 
     epoch, model_epoch_filename = self.get_epoch_model(config)
@@ -930,10 +925,12 @@ class Engine(object):
       # In self.init_train_epoch(), we initialize a new model.
       net_dict = self.pretrain.get_network_json_for_epoch(self.epoch)
     else:
-      net_dict = LayerNetwork.json_from_config(config)
+      from Config import network_json_from_config
+      net_dict = network_json_from_config(config)
     if net_dict_post_proc:
       net_dict = net_dict_post_proc(net_dict)
 
+    self._maybe_update_config(net_desc=net_dict, epoch=self.epoch)
     self._init_network(net_desc=net_dict, epoch=self.epoch)
 
     if self.preload_from_files:
@@ -942,6 +939,8 @@ class Engine(object):
       # - SubnetworkLayer also has a load_on_init option.
       # - LayerBase has custom_param_importer which is quite flexible.
       print("Start pre-loading weights...", file=log.v2)
+      # model_name will not be used directly, but it defines the order in which we apply the preloading.
+      # Variables are initialized by the first preload.
       for model_name, opts in sorted(self.preload_from_files.items()):
         assert isinstance(opts, dict)
         if opts.get("init_for_train", False):
@@ -960,8 +959,10 @@ class Engine(object):
           saveable_params=self.network.get_params_list(),
           params_prefix=self_prefix, load_if_prefix=load_if_prefix,
           ignore_missing=opts.get("ignore_missing", False))
+        # `set_as_custom_init` is also a marker for the vars, that they are preloaded,
+        # such that further checkpoint loaders will not load them again.
         loader.set_as_custom_init()
-      self.network.initialize_params(session=self.tf_session)
+        loader.load_now(session=self.tf_session)
 
     if model_epoch_filename:
       print("loading weights from", model_epoch_filename, file=log.v2)
@@ -979,6 +980,9 @@ class Engine(object):
     :param dict[str,dict[str]] net_desc:
     :param int epoch:
     """
+    updated_datasets = {}  # type: typing.Dict[str,Dataset]
+
+    # noinspection PyShadowingNames
     def set_value(key, value):
       """
       :param str key:
@@ -998,25 +1002,37 @@ class Engine(object):
         # To be sure, never keep the batch order.
         self.dataset_batches.clear()
         setattr(self, key, value)
+      if key in ["train", "dev", "eval"]:
+        self.dataset_batches.pop(key, None)
+        from Dataset import init_dataset
+        dataset_kwargs = {"name": key}
+        if key != "train":
+          dataset_kwargs.update(Dataset.get_default_kwargs_eval(config=self.config))
+        Dataset.kwargs_update_from_config(config=self.config, kwargs=dataset_kwargs)
+        dataset = init_dataset(value, default_kwargs=dataset_kwargs)
+        old_dataset = getattr(self, "%s_data" % key)
+        if old_dataset:
+          assert isinstance(old_dataset, Dataset)
+          old_dataset.finish_epoch()
+        setattr(self, "%s_data" % key, dataset)
+        updated_datasets[key] = dataset
 
     if self.orig_config:
       # We have updated the config before. Now, first, recover all entries.
       for key, value in self.orig_config.items():
         set_value(key, value)
       self.orig_config.clear()
-    if "#config" not in net_desc:
-      return
 
-    config_overwrites = net_desc["#config"]
+    config_overwrites = net_desc.get("#config", {})
     for key, value in config_overwrites.items():
       if key == "learning_rate":
         if not self.learning_rate_control:
           print("No lr control, ignore learning rate %r for epoch %i" % (value, epoch), file=log.v3)
           continue
-        old_lr = self.learning_rate_control.getLearningRateForEpoch(epoch)
+        old_lr = self.learning_rate_control.get_learning_rate_for_epoch(epoch)
         print("Overwrite learning rate for epoch %i: %r -> %r" % (epoch, old_lr, value), file=log.v3)
         assert self.config.is_true("use_learning_rate_control_always")
-        self.learning_rate_control.epochData[epoch].learningRate = value
+        self.learning_rate_control.epoch_data[epoch].learning_rate = value
         continue
 
       assert key in self.config.typed_dict, "config update key %r -> %r expected to be in orig. config" % (key, value)
@@ -1024,6 +1040,9 @@ class Engine(object):
       print("Update config key %r for epoch %i: %r -> %r" % (key, epoch, orig_value, value), file=log.v3)
       self.orig_config[key] = orig_value
       set_value(key, value)
+
+    for dataset in updated_datasets.values():
+      dataset.init_seq_order(epoch=self.epoch)
 
   def _init_network(self, net_desc, epoch=None):
     """
@@ -1034,7 +1053,6 @@ class Engine(object):
       epoch = self.epoch
     self._close_tf_session()
     self._reset_graph()
-    self._maybe_update_config(net_desc=net_desc, epoch=epoch)
     # The new session will by default use the newly created default graph.
     self._make_tf_session()
     tf_random_seed = 42
@@ -1049,10 +1067,10 @@ class Engine(object):
       train_flag = get_global_train_flag_placeholder()
     else:
       train_flag = False
-    if False:  # TODO ...
-      extern_data = ExternData()
-      extern_data.init_from_config(self.config)
-      # TODO...
+    # if False:  # TODO ...
+    #   extern_data = ExternData()
+    #   extern_data.init_from_config(self.config)
+    #   TODO...
     self.network, self.updater = self.create_network(
       config=self.config,
       rnd_seed=net_random_seed,
@@ -1062,6 +1080,7 @@ class Engine(object):
     self.network.initialize_params(session=self.tf_session)
     if self.config.is_true("use_horovod"):
       # Note: Might not be needed as it should be deterministic. But just to be sure...
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
       import horovod.tensorflow as hvd
       # like hvd.broadcast_global_variables but selected vars only:
       bcast_op = tf.group(*[
@@ -1092,17 +1111,9 @@ class Engine(object):
     network.construct_from_dict(net_dict)
     if train_flag is not False and config.list("search_train_network_layers"):
       network.construct_extra_net(
-        net_dict, layer_list=config.list("search_train_network_layers"), search_flag=True)
-      print("search train network layers:")
-      for layer_name, layer in sorted(network.extra_net.layers.items()):
-        print("  layer %s %r #: %s" % (layer.layer_class, layer_name, layer.output.dim), file=log.v2)
-      if not network.extra_net.layers:
-        print("  (no layers)", file=log.v2)
-      # We don't expect any new params (for now). Check that.
-      net_params = network.get_params_list()
-      for extra_param in network.extra_net.get_params_list():
-        assert extra_param in net_params
-    network.layers_desc = net_dict
+        net_dict, layer_list=config.list("search_train_network_layers"), search_flag=True,
+        dep_layers_in_extra=True,
+        net_name="search train extra net")
     updater = None
     if train_flag is not False:
       # Need to create new Updater because it has the learning_rate var which must be in the current graph.
@@ -1113,15 +1124,31 @@ class Engine(object):
     network.print_network_info()
     return network, updater
 
-  def maybe_init_new_network(self, net_desc):
+  def need_init_new_network(self, net_desc=None):
     """
-    :param dict[str,dict[str]] net_desc: layer name -> layer description dict
+    :param dict[str,dict[str]]|None net_desc: layer name -> layer description dict
+    :rtype: bool
     """
-    if self.network.layers_desc == net_desc:
-      return
-    from Util import dict_diff_str
-    print("reinit because network description differs. Diff:",
-          dict_diff_str(self.network.layers_desc, net_desc), file=log.v3)
+    if self.config.is_true("reinit_network_each_epoch"):
+      return True
+    if net_desc is None:
+      return False
+    return self.network.layers_desc != net_desc
+
+  def init_new_network(self, net_desc=None):
+    """
+    Reinitializes the network, and copies over the parameter from the current network.
+
+    :param dict[str,dict[str]]|None net_desc: layer name -> layer description dict. use existing by default
+    """
+    assert self.network
+    if net_desc is None:
+      net_desc = self.network.layers_desc
+      print("reinit network", file=log.v3)
+    else:
+      from Util import dict_diff_str
+      print("reinit because network description differs. Diff:",
+            dict_diff_str(self.network.layers_desc, net_desc), file=log.v3)
     old_network_params = self.network.get_params_serialized(self.tf_session)
     self._init_network(net_desc)
     if self.is_pretrain_epoch() and not self.pretrain.copy_output_layer:
@@ -1130,6 +1157,12 @@ class Engine(object):
         if l.name in old_network_params.values_dict:
           print("suspend copying of output layer: " + l.name, file=log.v2)
           old_network_params.values_dict.pop(l.name)
+    # Optionally call some callback from config.
+    # Do this before we call network.set_params_by_serialized, to allow to remove entries from old_network_params.
+    if self.config.has("init_new_network_callback"):
+      self.config.typed_value("init_new_network_callback")(
+        session=self.tf_session, new_epoch=self.epoch,
+        new_network=self.network, old_network_params=old_network_params)
     # This copy will copy the old params over and leave the rest randomly initialized.
     # This also works if the old network has just the same topology,
     # e.g. if it is the initial model from self.init_network_from_config().
@@ -1143,6 +1176,9 @@ class Engine(object):
       ignore_non_existing=self.is_pretrain_epoch())
 
   def train(self):
+    """
+    Does the whole training, i.e. the loop over all the epochs.
+    """
     print("start training at epoch %i and step %i" % (self.start_epoch, self.start_batch), file=log.v3)
     print("using batch size: %r, max seqs: %i" % (self.batch_size, self.max_seqs), file=log.v4)
     print("learning rate control:", self.learning_rate_control, file=log.v4)
@@ -1159,6 +1195,7 @@ class Engine(object):
     if isinstance(self.max_seq_length, (int, float)):
       self.max_seq_length += (self.start_epoch - 1) * self.inc_seq_length
 
+    assert isinstance(self.start_epoch, int)
     epoch = self.start_epoch  # Epochs start at 1.
     while epoch <= final_epoch:
       self.epoch = epoch  # type: int
@@ -1193,24 +1230,37 @@ class Engine(object):
     print("Finished training in epoch %i." % self.epoch, file=log.v3)
 
   def init_train_epoch(self):
+    """
+    Init for the current train epoch.
+    """
     if self.is_pretrain_epoch():
       # Note: For pretrain epochs, we ensure that the last pretrain epoch will have exactly the same
       # network as we use after pretraining.
       new_network_desc = self.pretrain.get_network_json_for_epoch(self.epoch)
-      self.maybe_init_new_network(new_network_desc)
+      # Always update config, if needed, even if nothing changed.
+      # This might trigger enforcing some learning rate, or so.
+      if self.need_init_new_network(new_network_desc):
+        # Early call of reset callbacks, which might trigger some HDF dump or other things.
+        self.network.call_graph_reset_callbacks()
+      self._maybe_update_config(net_desc=new_network_desc, epoch=self.epoch)
+      if self.need_init_new_network(new_network_desc):
+        self.init_new_network(new_network_desc)
       self.network.declare_train_params(**self.pretrain.get_train_param_args_for_epoch(self.epoch))
+    else:
+      if self.need_init_new_network():
+        self.init_new_network()
     if self.config.is_true("use_learning_rate_control_always"):
-      self.learning_rate = self.learning_rate_control.getLearningRateForEpoch(self.epoch)
+      self.learning_rate = self.learning_rate_control.get_learning_rate_for_epoch(self.epoch)
     elif self.is_pretrain_epoch():
       # Use constant learning rate.
       self.learning_rate = self.pretrain_learning_rate
-      self.learning_rate_control.setDefaultLearningRateForEpoch(self.epoch, self.learning_rate)
+      self.learning_rate_control.set_default_learning_rate_for_epoch(self.epoch, self.learning_rate)
     elif self.is_first_epoch_after_pretrain():
       # Use constant learning rate.
       self.learning_rate = self.initial_learning_rate
-      self.learning_rate_control.setDefaultLearningRateForEpoch(self.epoch, self.learning_rate)
+      self.learning_rate_control.set_default_learning_rate_for_epoch(self.epoch, self.learning_rate)
     else:
-      self.learning_rate = self.learning_rate_control.getLearningRateForEpoch(self.epoch)
+      self.learning_rate = self.learning_rate_control.get_learning_rate_for_epoch(self.epoch)
 
     if not self.is_pretrain_epoch():
       # Train the whole network.
@@ -1228,25 +1278,28 @@ class Engine(object):
     opts = self.config.get_of_type("use_last_best_model", dict, default={}).copy()
     if self.epoch % opts.pop("modulo", 1) != 0:
       # Normally we would filter those out. One maybe sensible exception is if the last score was really bad.
-      if (self.learning_rate_control.getEpochErrorValue(self.epoch - 1) or 0) \
+      if (self.learning_rate_control.get_epoch_error_value(self.epoch - 1) or 0) \
            <= opts.get("filter_score", float("inf")):
         return
     # Check if the previous epoch model is the best and otherwise take the best last model params.
-    last_best_epoch = self.learning_rate_control.getLastBestEpoch(
+    last_best_epoch = self.learning_rate_control.get_last_best_epoch(
       last_epoch=self.epoch - 1,
       first_epoch=self.pretrain.get_train_num_epochs() if self.pretrain else 1,
       **opts)
     if last_best_epoch and last_best_epoch != self.epoch - 1:
       print("Last epoch %i (score: %f) is not the optimal model" %
-            (self.epoch - 1, self.learning_rate_control.getEpochErrorValue(self.epoch -1))
+            (self.epoch - 1, self.learning_rate_control.get_epoch_error_value(self.epoch - 1))
             + " but epoch %i has better score %f (%r), will use that model." %
-            (last_best_epoch, self.learning_rate_control.getEpochErrorValue(last_best_epoch),
-             self.learning_rate_control.getEpochErrorDict(last_best_epoch)),
+            (last_best_epoch, self.learning_rate_control.get_epoch_error_value(last_best_epoch),
+             self.learning_rate_control.get_epoch_error_dict(last_best_epoch)),
             file=log.v2)
       self.load_model(epoch=last_best_epoch)
       self.updater.init_optimizer_vars(session=self.tf_session)  # reset the optimizer vars
 
   def train_epoch(self):
+    """
+    Train a single epoch (self.epoch).
+    """
     print("start", self.get_epoch_str(), "with learning rate", self.learning_rate, "...", file=log.v4)
 
     if self.epoch == 1 and self.save_epoch1_initial_model:
@@ -1255,20 +1308,25 @@ class Engine(object):
       self.save_model(epoch0_model_filename)
 
     if 'train' not in self.dataset_batches or not self.train_data.batch_set_generator_cache_whole_epoch():
-      self.dataset_batches['train'] = self.train_data.generate_batches(recurrent_net=self.network.recurrent,
-                                                                       batch_size=self.batch_size,
-                                                                       max_seqs=self.max_seqs,
-                                                                       max_seq_length=self.max_seq_length,
-                                                                       seq_drop=self.seq_drop,
-                                                                       shuffle_batches=self.shuffle_batches,
-                                                                       used_data_keys=self.network.used_data_keys)
+      self.dataset_batches['train'] = self.train_data.generate_batches(
+        recurrent_net=self.network.recurrent,
+        batch_size=self.batch_size,
+        max_seqs=self.max_seqs,
+        max_seq_length=self.max_seq_length,
+        max_pad_size=self.max_pad_size,
+        seq_drop=self.seq_drop,
+        shuffle_batches=self.shuffle_batches,
+        used_data_keys=self.network.get_used_data_keys())
     else:
       print("reusing previous dataset batch order for 'train' dataset", file=log.v4)
       self.dataset_batches['train'].reset()
     train_batches = self.dataset_batches['train']
 
     self.updater.set_learning_rate(self.learning_rate, session=self.tf_session)
-    trainer = Runner(engine=self, dataset=self.train_data, batches=train_batches, train=True)
+    trainer = Runner(
+      engine=self,
+      dataset=self.train_data, batches=train_batches,
+      train=self.network.layers_desc.get("#trainable", True))
     trainer.run(report_prefix=("pre" if self.is_pretrain_epoch() else "") + "train epoch %s" % self.epoch)
 
     if not trainer.finalized:
@@ -1285,18 +1343,27 @@ class Engine(object):
 
     if self.model_filename and (self.epoch % self.save_model_epoch_interval == 0):
       self.save_model(self.get_epoch_model_filename())
-    self.learning_rate_control.setEpochError(self.epoch, {"train_score": trainer.score, "train_error": trainer.error})
+    self.learning_rate_control.set_epoch_error(self.epoch, {"train_score": trainer.score, "train_error": trainer.error})
     if self._do_save():
       self.learning_rate_control.save()
 
     print(
-      self.get_epoch_str(), "score:", self.format_score(trainer.score), "elapsed:", hms(trainer.elapsed), file=log.v1)
+      self.get_epoch_str(),
+      "score:", self.format_score(trainer.score),
+      "error:", self.format_score(trainer.error),
+      "elapsed:", hms(trainer.elapsed), file=log.v1)
     self.eval_model()
 
     if self.config.bool_or_other("cleanup_old_models", None):
       self.cleanup_old_models()
 
+  # noinspection PyMethodMayBeStatic
   def format_score(self, score):
+    """
+    :param dict[str,float] score:
+    :return: score(s) as str
+    :rtype: str
+    """
     if not score:
       return "None"
     if len(score) == 1:
@@ -1340,12 +1407,16 @@ class Engine(object):
     :rtype: bool
     """
     if self.config.is_true("use_horovod"):
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
       import horovod.tensorflow as hvd
       if hvd.rank() != 0:
         return False
+    if self.config.is_true("dry_run"):
+      return False
     return True
 
-  def eval_model(self, output_file=None, output_per_seq_file=None, loss_name=None, output_per_seq_format=("seq_len", "score", "pos_score")):
+  def eval_model(self, output_file=None, output_per_seq_file=None, loss_name=None,
+                 output_per_seq_format=None, output_per_seq_file_format="txt"):
     """
     Eval the current model on the eval datasets (dev + eval, whatever is set).
     See also :func:`self.search` for performing beam search.
@@ -1354,19 +1425,21 @@ class Engine(object):
     :param str|None output_per_seq_file: if given, will save the err/score for each sequence
     :param str|None loss_name: specifies the loss which will be written to output_file
     :param list[str]|tuple[str]|None output_per_seq_format:
-      which properies of `loss_name` should be written to `output_per_seq_file`.
-      allowed_outputs = {"seq_tags", "seq_len", "score", "error", "pos_score", "pos_error"}
-
+      which properties of `loss_name` should be written to `output_per_seq_file`.
+      allowed_outputs = {"seq_tag", "seq_len", "score", "error", "pos_score", "pos_error"}.
+    :param str output_per_seq_file_format: "txt" or "py"
     :return: nothing
     """
     extra_fetches = None
 
     if output_per_seq_file:
-      allowed_outputs = {"seq_tags", "seq_len", "score", "error", "pos_score", "pos_error"}
+      assert output_per_seq_file_format in {"txt", "py"}
+      allowed_outputs = {"seq_tag", "seq_len", "score", "error", "pos_score", "pos_error"}
 
-      assert isinstance(output_per_seq_format, (tuple, list))
+      assert isinstance(output_per_seq_format, (tuple, list)), "provide output_per_seq_format"
       assert set(output_per_seq_format) - allowed_outputs == set(), (
-        "Only %r are allowed in function eval_model as output_per_seq_format, but got: %r " % (allowed_outputs, output_per_seq_format))
+        "Only %r are allowed in function eval_model as output_per_seq_format, but got: %r " % (
+          allowed_outputs, output_per_seq_format))
 
       # always fetch seq_tag to map loss values to the corresponding line
       extra_fetches = {"seq_idx": self.network.get_extern_data("seq_idx", mark_data_key_as_used=True),
@@ -1392,17 +1465,18 @@ class Engine(object):
       if "error" in output_per_seq_format:
         extra_fetches["error"] = loss_holder.get_normalized_error_value_per_seq()
       if "pos_score" in output_per_seq_format:
-        extra_fetches["pos_score"] = loss_holder.get_normalized_loss_value_per_seq(per_pos=True)
+        extra_fetches["pos_score"] = loss_holder.get_loss_value_per_pos()
       if "pos_error" in output_per_seq_format:
-        extra_fetches["pos_error"] = loss_holder.get_normalized_error_value_per_seq(per_pos=True)
+        extra_fetches["pos_error"] = loss_holder.get_error_value_per_pos()
 
-    seq_idx_to_tag = {}  # we need this in order to write the results in the correct order later
-    results_per_seq = {}  # seq_tag -> dict[str,float]. Results of fetches will be written in this dict
+    seq_idx_to_tag = {}  # type: typing.Dict[int,str]  # we need this in order to write the results in the correct order later  # nopep8
+    results_per_seq = {}  # type: typing.Dict[str,typing.Dict[str,typing.Union[float,str,int]]]  # seq_tag -> dict. Results of fetches will be written in this dict  # nopep8
 
     # function to save the return values of each callback to the dict `results_per_seq`
+    # noinspection PyShadowingNames
     def extra_fetches_callback(seq_idx, seq_tags, **extra_fetches_out):
       """
-      :param list[str] seq_idx:
+      :param list[int] seq_idx:
       :param list[str] seq_tags:
       :param dict[str,numpy.ndarray] extra_fetches_out: see extra_fetches
       """
@@ -1419,23 +1493,24 @@ class Engine(object):
         if name[:4] == "pos_":
           assert 'seq_len' in extra_fetches_out
           seq_lens = extra_fetches_out['seq_len']
-          shorted_scores = [ps[:l] for ps,l in zip(value, seq_lens)]
-          for i, seq_tag in enumerate(seq_tags):
-            results_per_seq.setdefault(seq_tag, {'seq_tags': seq_tag})[name] = shorted_scores[i]
+          shorted_scores = [ps[:l] for ps, l in zip(value, seq_lens)]
+          for i, seq_tag_ in enumerate(seq_tags):
+            results_per_seq.setdefault(seq_tag_, {'seq_tag': seq_tag_})[name] = shorted_scores[i]
         else:
-          for i, seq_tag in enumerate(seq_tags):
-            results_per_seq.setdefault(seq_tag, {'seq_tags': seq_tag})[name] = value[i]
-
+          for i, seq_tag_ in enumerate(seq_tags):
+            results_per_seq.setdefault(seq_tag_, {'seq_tag': seq_tag_})[name] = value[i]
 
     # It's constructed lazily and it will set used_data_keys, so make sure that we have it now.
     self.network.maybe_construct_objective()
     results = {}
     eval_dump_str = []
     train = self._maybe_prepare_train_in_eval()
+    train_flag = self.config.bool("eval_use_train_flag", None)
 
     if output_per_seq_file:
       assert len(self.get_eval_datasets()) == 1, (
-        "output per sequence is only supported for one dataset (dev or eval), provided datasets are %r" % list(self.get_eval_datasets().keys()))
+        ("output per sequence is only supported for one dataset (dev or eval),"
+         "provided datasets are %r") % list(self.get_eval_datasets().keys()))
       # try to sort dataset to minimize zero-padding
       dataset = list(self.get_eval_datasets().values())[0]
       if dataset.have_corpus_seq_idx():
@@ -1454,12 +1529,13 @@ class Engine(object):
           batch_size=self.batch_size,
           max_seqs=self.max_seqs,
           max_seq_length=(self.max_seq_length if dataset_name == 'dev' else sys.maxsize),
-          used_data_keys=self.network.used_data_keys)
+          used_data_keys=self.network.get_used_data_keys())
       else:
         print("reusing previous dataset batch order for %r dataset" % dataset_name, file=log.v4)
         self.dataset_batches[dataset_name].reset()
       tester = Runner(
-        engine=self, dataset=dataset, batches=self.dataset_batches[dataset_name], train=train,
+        engine=self, dataset=dataset, batches=self.dataset_batches[dataset_name],
+        train=train, train_flag=train_flag,
         extra_fetches=extra_fetches, extra_fetches_callback=extra_fetches_callback)
       tester.run(report_prefix=self.get_epoch_str() + " %r eval" % dataset_name)
       if not tester.finalized:
@@ -1469,44 +1545,51 @@ class Engine(object):
                         dataset_name, self.format_score(tester.score), self.format_score(tester.error))]
       results[dataset_name] = {"score": tester.score, "error": tester.error}
       if dataset_name == "dev":
-        self.learning_rate_control.setEpochError(self.epoch, {"dev_score": tester.score, "dev_error": tester.error})
+        self.learning_rate_control.set_epoch_error(self.epoch, {"dev_score": tester.score, "dev_error": tester.error})
         if self._do_save():
           self.learning_rate_control.save()
     print(" ".join(eval_dump_str), file=log.v1)
     if output_file:
       print('Write eval results to %r' % output_file, file=log.v3)
-      from Util import betterRepr
+      from Util import better_repr
       with open(output_file, 'w') as f:
-        f.write(betterRepr(results) + '\n')
+        f.write(better_repr(results) + '\n')
     if output_per_seq_file:
       print('Write eval results per seq to %r' % output_per_seq_file, file=log.v3)
-      from Util import betterRepr
-
-      # write fetches to file
       with open(output_per_seq_file, 'w') as f:
-        def create_output_string(seq_tag):
-          """
-          Creates a colon (;) separated output string in the order given by `requested_outputs`
-          :param str seq_tag:
-          """
-          value_list = [results_per_seq[seq_tag][req_out] for req_out in output_per_seq_format]
-          value_list = [' '.join(map(str, v)) if isinstance(v, numpy.ndarray) else str(v) for v in value_list]
-          assert all([all([c not in "\n;" for c in v]) for v in value_list])
-          return ';'.join(value_list)
-
-        results_per_seq = [create_output_string(seq_idx_to_tag[seq_idx]) for seq_idx in range(len(results_per_seq))]
-
-        for res in results_per_seq:
-          f.write(str(res) + '\n')
+        if output_per_seq_file_format == "txt":
+          for seq_idx in range(len(results_per_seq)):
+            seq_tag = seq_idx_to_tag[seq_idx]
+            value_list = [results_per_seq[seq_tag][req_out] for req_out in output_per_seq_format]
+            value_list = [' '.join(map(str, v)) if isinstance(v, numpy.ndarray) else str(v) for v in value_list]
+            assert all([all([c not in "\n;" for c in v]) for v in value_list])
+            res = ';'.join(value_list)
+            f.write(res + '\n')
+        elif output_per_seq_file_format == "py":
+          f.write("{\n")
+          for seq_idx in range(len(results_per_seq)):
+            seq_tag = seq_idx_to_tag[seq_idx]
+            f.write("%r: {" % seq_tag)
+            f.write(", ".join([
+              "%r: %r" % (req_out, results_per_seq[seq_tag][req_out]) for req_out in output_per_seq_format]))
+            f.write("},\n")
+          f.write("}\n")
+        else:
+          assert False, output_per_seq_file_format
 
   def check_last_epoch(self):
+    """
+    Checks if there are outstanding tasks (eval_model) for the last epoch,
+    and executes them.
+    """
     if self.start_epoch == 1:
       return
+    # noinspection PyAttributeOutsideInit
     self.epoch = self.start_epoch - 1
     if self.learning_rate_control.need_error_info:
       if self.dev_data:
         if all([not k.startswith("dev_score")
-                for k in self.learning_rate_control.getEpochErrorDict(self.epoch).keys()]):
+                for k in self.learning_rate_control.get_epoch_error_dict(self.epoch).keys()]):
           # This can happen when we have a previous model but did not test it yet.
           print("Last epoch model not yet evaluated on dev. Doing that now.", file=log.v4)
           self.eval_model()
@@ -1520,11 +1603,11 @@ class Engine(object):
     from Util import CollectionReadCheckCovered, human_bytes_size, confirm
     from itertools import count
     opts = CollectionReadCheckCovered(self.config.get_of_type("cleanup_old_models", dict, {}))
-    existing_models = TheanoEngine.get_existing_models(config=self.config)
+    existing_models = self.get_existing_models(config=self.config)
     if hasattr(self, "learning_rate_control"):
       lr_control = self.learning_rate_control
     else:
-      lr_control = loadLearningRateControlFromConfig(self.config)
+      lr_control = load_learning_rate_control_from_config(self.config)
     epochs = sorted(existing_models.keys())
     if not epochs:
       print("Cannot cleanup models, no models found.", file=log.v2)
@@ -1538,7 +1621,7 @@ class Engine(object):
          " thus not cleaning up any epochs yet.") % (
           len(epochs), keep_last_n, keep_best_n), file=log.v2)
       return
-    keep_epochs = set()  # type: set[int]
+    keep_epochs = set()  # type: typing.Set[int]
     default_keep_pattern = set()
     if epochs[-1] <= 10:
       keep_every = 4
@@ -1566,13 +1649,13 @@ class Engine(object):
     keep_epochs.update(epochs[-keep_last_n:])
     score_keys = set()  # e.g. "dev_error", "dev_score", etc.
     # Collect all possible score keys. Note that we could have different ones for different epochs.
-    for data in lr_control.epochData.values():
+    for data in lr_control.epoch_data.values():
       score_keys.update(data.error.keys())
     assert score_keys
     score_keys = sorted(score_keys)
     score_values = {key: [] for key in score_keys}
     for epoch in epochs:
-      epoch_scores = lr_control.epochData[epoch].error
+      epoch_scores = lr_control.epoch_data[epoch].error
       for key in epoch_scores.keys():
         score_values[key].append(epoch_scores[key])
     for key in list(score_keys):
@@ -1586,7 +1669,7 @@ class Engine(object):
     worst_score_values = {key: max(scores) for (key, scores) in score_values.items()}
     for key in score_keys:
       scores = sorted([
-        (lr_control.epochData[epoch].error.get(key, worst_score_values[key]), epoch) for epoch in epochs])
+        (lr_control.epoch_data[epoch].error.get(key, worst_score_values[key]), epoch) for epoch in epochs])
       scores = scores[:keep_best_n]
       keep_epochs.update([v[1] for v in scores])
     keep_epochs.intersection_update(epochs)
@@ -1612,17 +1695,6 @@ class Engine(object):
       count_bytes += self.delete_model(existing_models[epoch])
     print("Deleted %s." % human_bytes_size(count_bytes), file=log.v2)
 
-  def get_all_merged_summaries(self):
-    """
-    :return: merged summaries, serialized string
-    :rtype: tf.Tensor
-    """
-    # Note: This assumes that the summaries never change.
-    # Both both training and evaluation on the CV dataset, this is the case.
-    if self._merge_all_summaries is None:
-      self._merge_all_summaries = tf.summary.merge_all()
-    return self._merge_all_summaries
-
   def check_uninitialized_vars(self):
     """
     All vars in TF which are controlled by us should also have been initialized by us.
@@ -1644,7 +1716,8 @@ class Engine(object):
       assert len(var_mask) == len(var_list)
       uninitialized_vars = [v for (v, mask) in zip(var_list, var_mask) if mask]
       if uninitialized_vars:
-        print("Note: There are still these uninitialized variables: %s" % [v.name for v in uninitialized_vars], file=log.v3)
+        print("Note: There are still these uninitialized variables: %s" % [v.name for v in uninitialized_vars],
+              file=log.v3)
         self.tf_session.run(tf.variables_initializer(uninitialized_vars))
       self._checked_uninitialized_vars = True
 
@@ -1656,12 +1729,13 @@ class Engine(object):
     """
     batch_slice = None
     if self.config.is_true("use_horovod"):
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
       import horovod.tensorflow as hvd
       batch_slice = slice(hvd.rank(), None, hvd.size())
     from TFDataPipeline import FeedDictDataProvider
     data_provider = FeedDictDataProvider(
       tf_session=self.tf_session, extern_data=self.network.extern_data,
-      data_keys=self.network.used_data_keys,
+      data_keys=self.network.get_used_data_keys(),
       dataset=dataset, batches=batches,
       batch_slice=batch_slice,
       enforce_min_len1=self.config.is_true("enforce_min_len1", False))
@@ -1680,7 +1754,8 @@ class Engine(object):
     batch = Batch()
     if seq_idx == -1:  # load all sequences in dataset
       for seq_idx_loop in range(dataset.num_seqs):
-        batch.add_sequence_as_slice(seq_idx=seq_idx_loop, seq_start_frame=0, length=dataset.get_seq_length(seq_idx_loop))
+        batch.add_sequence_as_slice(
+          seq_idx=seq_idx_loop, seq_start_frame=0, length=dataset.get_seq_length(seq_idx_loop))
     else:
       batch.init_with_one_full_sequence(seq_idx=seq_idx, dataset=dataset)
     batch_generator = iter([batch])
@@ -1716,7 +1791,8 @@ class Engine(object):
     if not output_layer_name:
       output_layer_name = self.config.value("forward_output_layer", self.network.get_default_output_layer_name())
       assert output_layer_name, "output layer not defined. set forward_output_layer in config"
-    assert output_layer_name in self.network.layers, "output layer %r not found, available layers: %s" % (output_layer_name, ','.join(self.network.layers.keys()))
+    assert output_layer_name in self.network.layers, "output layer %r not found, available layers: %s" % (
+      output_layer_name, ','.join(self.network.layers.keys()))
     return self.network.layers[output_layer_name]
 
   def forward_single(self, dataset, seq_idx, output_layer_name=None):
@@ -1737,6 +1813,7 @@ class Engine(object):
     assert output_value.shape[1] == 1  # batch-dim
     return output_value[:, 0]  # remove batch-dim
 
+  # noinspection PyUnusedLocal
   def forward_to_hdf(self, data, output_file, combine_labels='', batch_size=0, output_layer=None):
     """
     Is aiming at recreating the same interface and output as :func:`Engine.forward_to_hdf`.
@@ -1752,7 +1829,7 @@ class Engine(object):
 
     if not output_layer:
       output_layer = self._get_output_layer()
-    output = output_layer.output.copy_as_batch_major()
+    output = output_layer.output.copy_as_batch_spatial_major()
     # Note: We kind of assume that the target, and its class labels, matches this output layer.
     # Of course this is not true in general.
     # Instead of introducing some more involved logic here, we just check whether the dim matches.
@@ -1764,8 +1841,14 @@ class Engine(object):
         labels = None
 
     assert output_file
-    assert not os.path.exists(output_file)
     print("Forwarding to HDF file: %s" % output_file, file=log.v2)
+    if self.config.is_true("forward_override_hdf_output"):
+      if os.path.exists(output_file):
+        print("HDF file exists, delete now (forward_override_hdf_output).", file=log.v2)
+        os.remove(output_file)
+    else:
+      assert not os.path.exists(output_file)
+    print("Forward output:", output, file=log.v3)
     writer = SimpleHDFWriter(filename=output_file, dim=output.dim, ndim=output.ndim, labels=labels)
 
     def extra_fetches_cb(inputs, seq_tag, **kwargs):
@@ -1778,6 +1861,7 @@ class Engine(object):
       """
       n_batch = len(seq_tag)
       assert n_batch == inputs.shape[0]
+      # noinspection PyShadowingNames
       seq_len = {i: kwargs["seq_len_%i" % i] for i in output.size_placeholder.keys()}
       assert all([len(v) == n_batch for v in seq_len.values()])
       writer.insert_batch(inputs=inputs, seq_len=seq_len, seq_tag=seq_tag)
@@ -1792,7 +1876,7 @@ class Engine(object):
       recurrent_net=self.network.recurrent,
       batch_size=batch_size,
       max_seqs=self.max_seqs,
-      used_data_keys=self.network.used_data_keys)
+      used_data_keys=self.network.get_used_data_keys())
     forwarder = Runner(
       engine=self, dataset=data, batches=batches,
       train=False, eval=False,
@@ -1805,6 +1889,7 @@ class Engine(object):
 
     writer.close()
 
+  # noinspection PyUnusedLocal
   def analyze(self, data, statistics):
     """
     :param Dataset.Dataset data:
@@ -1836,7 +1921,7 @@ class Engine(object):
       batch_size=batch_size,
       max_seqs=max_seqs,
       max_seq_length=max_seq_length,
-      used_data_keys=self.network.used_data_keys)
+      used_data_keys=self.network.get_used_data_keys())
     analyzer = Runner(engine=self, dataset=data, batches=batches, train=False)
     analyzer.run(report_prefix=self.get_epoch_str() + " analyze")
 
@@ -1864,6 +1949,7 @@ class Engine(object):
     :param str output_file:
     :param str output_file_format: "txt" or "py"
     """
+    from TFNetworkLayer import LayerBase
     print("Search with network on %r." % dataset, file=log.v1)
     if not self.use_search_flag or not self.network or self.use_dynamic_train_flag:
       self.use_search_flag = True
@@ -1896,7 +1982,7 @@ class Engine(object):
       batch_size=self.config.int('batch_size', 1),
       max_seqs=self.config.int('max_seqs', -1),
       max_seq_length=max_seq_length,
-      used_data_keys=self.network.used_data_keys)
+      used_data_keys=self.network.get_used_data_keys())
 
     output_is_dict = isinstance(output_layer_names, list)
     if not output_is_dict:
@@ -1904,22 +1990,22 @@ class Engine(object):
     num_targets = len(output_layer_names)
 
     # Create lists with information about the output layers. All of length num_targets.
-    output_layers = []  # list[LayerBase]
-    out_beam_sizes = []  # list[int|None]
-    output_layer_beam_scores = []  # list[tf.Tensor|None]
-    target_keys = []  # list[str]
+    output_layers = []  # type: typing.List[LayerBase]
+    out_beam_sizes = []  # type: typing.List[typing.Optional[int]]
+    output_layer_beam_scores = []  # type: typing.List[typing.Optional[tf.Tensor]]
+    target_keys = []  # type: typing.List[str]
 
     for output_layer_name in output_layer_names:
       output_layer = self.network.layers[output_layer_name]
       output_layers.append(output_layer)
-      out_beam_size = output_layer.output.beam_size
-      if out_beam_size is None:
+      out_beam = output_layer.output.beam
+      if out_beam is None:
         print("Given output %r is after decision (no beam)." % output_layer, file=log.v1)
         output_layer_beam_scores.append(None)
       else:
-        print("Given output %r has beam size %i." % (output_layer, out_beam_size), file=log.v1)
+        print("Given output %r has beam %s." % (output_layer, out_beam), file=log.v1)
         output_layer_beam_scores.append(output_layer.get_search_choices().beam_scores)
-      out_beam_sizes.append(out_beam_size)
+      out_beam_sizes.append(out_beam.beam_size if out_beam else None)
       target_keys.append(output_layer.target or self.network.extern_data.default_target)
 
     out_cache = None
@@ -1950,6 +2036,7 @@ class Engine(object):
       """
 
       outputs, beam_scores, targets = [], [], []
+      # noinspection PyShadowingNames
       for target_idx in range(num_targets):
         outputs.append(kwargs["output_" + output_layer_names[target_idx]])
         beam_scores.append(kwargs["beam_scores_" + output_layer_names[target_idx]])
@@ -1958,6 +2045,7 @@ class Engine(object):
       n_batch = len(seq_idx)  # without beam
       assert n_batch == len(seq_tag)
 
+      # noinspection PyShadowingNames
       for target_idx in range(num_targets):
         if beam_scores[target_idx] is not None:
           assert beam_scores[target_idx].shape == (n_batch, out_beam_sizes[target_idx])
@@ -1979,6 +2067,7 @@ class Engine(object):
           if output_is_dict:
             out_cache[corpus_seq_idx] = {}
 
+        # noinspection PyShadowingNames
         for target_idx in range(num_targets):
           if out_beam_sizes[target_idx] is None:
             print("seq_idx: %i, seq_tag: %r, output %r: %r" % (
@@ -2054,10 +2143,10 @@ class Engine(object):
         for i in range(len(out_cache)):
           output_file.write("%s\n" % out_cache[i])
       elif output_file_format == "py":
-        from Util import betterRepr
+        from Util import better_repr
         output_file.write("{\n")
         for i in range(len(out_cache)):
-          output_file.write("%r: %s,\n" % (seq_idx_to_tag[i], betterRepr(out_cache[i])))
+          output_file.write("%r: %s,\n" % (seq_idx_to_tag[i], better_repr(out_cache[i])))
         output_file.write("}\n")
       else:
         raise Exception("invalid output_file_format %r" % output_file_format)
@@ -2078,7 +2167,7 @@ class Engine(object):
     output_layer = self.network.layers[output_layer_name]
     output_t = output_layer.output.get_placeholder_as_batch_major()
     output_seq_lens_t = output_layer.output.get_sequence_lengths()
-    out_beam_size = output_layer.output.beam_size
+    out_beam_size = output_layer.output.beam.beam_size
     output_layer_beam_scores_t = None
     if out_beam_size is None:
       print("Given output %r is after decision (no beam)." % output_layer, file=log.v4)
@@ -2200,7 +2289,7 @@ class Engine(object):
       batch_size=batch_size,
       max_seq_length=max_seq_length,
       max_seqs=max_seqs,
-      used_data_keys=self.network.used_data_keys)
+      used_data_keys=self.network.get_used_data_keys())
     forwarder = Runner(
       engine=self, dataset=dataset, batches=batches,
       train=False, eval=False,
@@ -2375,8 +2464,10 @@ class Engine(object):
     input_audio_feature_extractor = None
     output_data = self.network.extern_data.get_default_target_data()
     output_vocab = output_data.vocab
-    if isinstance(self.config.typed_dict.get("dev", None), dict) and self.config.typed_dict["dev"]["class"] == "LibriWipoEUCorpus":
+    if (isinstance(self.config.typed_dict.get("dev", None), dict)
+            and self.config.typed_dict["dev"]["class"] == "LibriSpeechCorpus"):
       # A bit hacky. Assumes that this is a dataset description for e.g. LibriSpeechCorpus.
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
       import soundfile  # pip install pysoundfile
       bpe_opts = self.config.typed_dict["dev"]["bpe"]
       audio_opts = self.config.typed_dict["dev"]["audio"]
@@ -2396,7 +2487,7 @@ class Engine(object):
     output_layer = self.network.layers[output_layer_name]
     output_t = output_layer.output.get_placeholder_as_batch_major()
     output_seq_lens_t = output_layer.output.get_sequence_lengths()
-    out_beam_size = output_layer.output.beam_size
+    out_beam_size = output_layer.output.beam.beam_size
     output_layer_beam_scores_t = None
     if out_beam_size is None:
       print("Given output %r is after decision (no beam)." % output_layer, file=log.v1)
@@ -2416,8 +2507,11 @@ class Engine(object):
         print(self.rfile)
   
       def do_POST(self):
+        """
+        Handle POST request.
+        """
         try:
-          self._do_POST()
+          self._do_post()
         except Exception:
           sys.excepthook(*sys.exc_info())
           raise
@@ -2457,7 +2551,7 @@ class Engine(object):
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
 
-      def _do_POST(self):
+      def _do_post(self):
         import cgi
         form = cgi.FieldStorage(
           fp=self.rfile,
@@ -2466,7 +2560,7 @@ class Engine(object):
         print("HTTP server, got POST.", file=log.v3)
         from io import BytesIO
         f = BytesIO(form["file"].file.read())
-        print("Input file size:", f.getbuffer().nbytes, "bytes", file=log.v4)
+        print("Input file size:", len(f.getbuffer().tobytes()), "bytes", file=log.v4)
         audio_len = None
         if input_audio_feature_extractor:
           try:
@@ -2475,7 +2569,8 @@ class Engine(object):
             with open('file_load_audio.pkl','wb') as f:
               pickle.dump(audio, f)
           except Exception as exc:
-            print("Error reading audio (%s). Invalid format? Size %i, first few bytes %r." % (exc, f.getbuffer().nbytes, f.getbuffer().tobytes()[:20]), file=log.v2)
+            print("Error reading audio (%s). Invalid format? Size %i, first few bytes %r." % (
+              exc, len(f.getbuffer().tobytes()), f.getbuffer().tobytes()[:20]), file=log.v2)
             raise
           audio_len = float(len(audio)) / sample_rate
           print("audio len %i (%.1f secs), sample rate %i" % (len(audio), audio_len, sample_rate), file=log.v4)
@@ -2528,13 +2623,14 @@ class Engine(object):
 
     print("Simple search web server, listening on port %i." % port, file=log.v2)
     server_address = ('', port)
+    # noinspection PyAttributeOutsideInit
     self.httpd = HTTPServer(server_address, Handler)
     self.httpd.serve_forever()
 
 
 def get_global_engine():
   """
-  Similar as :func:`Config.get_global_config`.
+  Similar to :func:`Config.get_global_config`.
 
   :rtype: Engine
   """

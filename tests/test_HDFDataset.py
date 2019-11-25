@@ -1,4 +1,6 @@
 
+from __future__ import print_function
+
 import os
 import sys
 my_dir = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +21,7 @@ import unittest
 import better_exchook
 better_exchook.install()
 better_exchook.replace_traceback_format_tb()
-Util.initThreadJoinHack()
+Util.init_thread_join_hack()
 
 from Log import log
 log.initialize(verbosity=[5])
@@ -72,8 +74,11 @@ class TestHDFDataset(object):
 
 
 def generate_dummy_hdf(num_datasets=1):
+  filenames = []
   for idx in range(1, num_datasets + 1):
-    dataset = h5py.File('./dummy.%i.hdf5' % idx, 'w')
+    fn = get_test_tmp_file(".%i.hdf5" % idx)
+    filenames.append(fn)
+    dataset = h5py.File(fn, 'w')
     dataset.create_group('streams')
 
     dataset['streams'].create_group('features')
@@ -109,12 +114,13 @@ def generate_dummy_hdf(num_datasets=1):
       sequence_names_data[ind] = val
 
     dataset.close()
-  return ['./dummy.%i.hdf5' % idx for idx in range(1, num_datasets + 1)]
+  return filenames
 
 
-def _get_tmp_file(suffix):
+# Note that nosetests might even call this function, as it has "test" in its name... Does not matter, though.
+def get_test_tmp_file(suffix=".hdf"):
   """
-  :param str suffix:
+  :param str suffix: e.g. ".hdf"
   :return: filename
   :rtype: str
   """
@@ -130,9 +136,10 @@ def _get_tmp_file(suffix):
 _hdf_cache = {}  # opts -> hdf fn
 
 
-def generate_hdf_from_other(opts):
+def generate_hdf_from_other(opts, suffix=".hdf"):
   """
   :param dict[str] opts:
+  :param str suffix:
   :return: hdf filename
   :rtype: str
   """
@@ -141,7 +148,7 @@ def generate_hdf_from_other(opts):
   cache_key = make_hashable(opts)
   if cache_key in _hdf_cache:
     return _hdf_cache[cache_key]
-  fn = _get_tmp_file(suffix=".hdf")
+  fn = get_test_tmp_file(suffix=suffix)
   from Dataset import init_dataset
   dataset = init_dataset(opts)
   hdf_dataset = HDFDatasetWriter(fn)
@@ -164,7 +171,7 @@ def test_hdf_dump():
   generate_hdf_from_dummy()
 
 
-class _DatasetReader:
+class DatasetTestReader:
   def __init__(self, dataset):
     """
     :param Dataset dataset:
@@ -174,14 +181,17 @@ class _DatasetReader:
     self.data_shape = {}  # key -> shape
     self.data_sparse = {}  # key -> bool
     self.data_dtype = {}  # key -> str
-    self.data = {}  # key -> list
-    self.seq_lens = []  # type: list[Util.NumbersDict]
+    self.data = {}  # type: typing.Dict[str,typing.List[numpy.ndarray]]  # key -> list
+    self.seq_lens = []  # type: typing.List[Util.NumbersDict]
     self.seq_tags = []
-    self.num_seqs = None
+    self.num_seqs = 0
 
-  def read_all(self):
+  def read_all(self, epoch=1):
+    """
+    :param int epoch:
+    """
     dataset = self.dataset
-    dataset.init_seq_order(epoch=1)
+    dataset.init_seq_order(epoch=epoch)
     data_keys = dataset.get_data_keys()
     self.data_keys = data_keys
     self.data_shape = {key: dataset.get_data_shape(key) for key in data_keys}
@@ -199,11 +209,54 @@ class _DatasetReader:
       self.seq_tags.append(seq_tag)
       seq_idx += 1
     print("Iterated through %r, num seqs %i" % (dataset, seq_idx))
-    self.num_seqs = seq_idx
+    self.num_seqs += seq_idx
+
+
+def test_hdf_dump_not_frame_synced():
+  num_seqs = 3
+  from GeneratingDataset import TaskNumberBaseConvertDataset
+  hdf_fn = generate_hdf_from_other({"class": "TaskNumberBaseConvertDataset", "num_seqs": num_seqs})
+  hdf = HDFDataset([hdf_fn])
+  orig = TaskNumberBaseConvertDataset(num_seqs=num_seqs)
+  hdf_reader = DatasetTestReader(hdf)
+  orig_reader = DatasetTestReader(orig)
+  hdf_reader.read_all()
+  orig_reader.read_all()
+  assert hdf_reader.data_keys == orig_reader.data_keys == ["data", "classes"]
+  assert hdf_reader.num_seqs == orig_reader.num_seqs == num_seqs
+  for seq_idx in range(num_seqs):
+    # Not synced, i.e. different lengths:
+    assert_not_equal(orig_reader.seq_lens[seq_idx]["data"], orig_reader.seq_lens[seq_idx]["classes"])
+    for key in orig_reader.data_keys:
+      assert_equal(hdf_reader.seq_lens[seq_idx][key], orig_reader.seq_lens[seq_idx][key])
+      assert_equal(hdf_reader.data[key][seq_idx].tolist(), orig_reader.data[key][seq_idx].tolist())
+
+
+def test_HDFDataset_partition_epoch():
+  partition_epoch = 3
+  num_seqs = 11
+  from GeneratingDataset import TaskNumberBaseConvertDataset
+  hdf_fn = generate_hdf_from_other({"class": "TaskNumberBaseConvertDataset", "num_seqs": num_seqs})
+  hdf = HDFDataset([hdf_fn], partition_epoch=partition_epoch)
+  orig = TaskNumberBaseConvertDataset(num_seqs=num_seqs)
+  hdf_reader = DatasetTestReader(hdf)
+  orig_reader = DatasetTestReader(orig)
+  for epoch in range(1, partition_epoch + 1):
+    hdf_reader.read_all(epoch=epoch)
+  orig_reader.read_all()  # single epoch
+  assert hdf_reader.data_keys == orig_reader.data_keys == ["data", "classes"]
+  assert hdf_reader.num_seqs == orig_reader.num_seqs == num_seqs
+  for seq_idx in range(num_seqs):
+    # Not synced, i.e. different lengths:
+    assert_not_equal(orig_reader.seq_lens[seq_idx]["data"], orig_reader.seq_lens[seq_idx]["classes"])
+    for key in orig_reader.data_keys:
+      assert_equal(hdf_reader.seq_lens[seq_idx][key], orig_reader.seq_lens[seq_idx][key])
+      assert_equal(hdf_reader.data[key][seq_idx].tolist(), orig_reader.data[key][seq_idx].tolist())
 
 
 def test_SimpleHDFWriter():
-  fn = _get_tmp_file(suffix=".hdf")
+  fn = get_test_tmp_file(suffix=".hdf")
+  os.remove(fn)  # SimpleHDFWriter expects that the file does not exist
   n_dim = 13
   writer = SimpleHDFWriter(filename=fn, dim=n_dim, labels=None)
   seq_lens1 = [11, 7, 5]
@@ -220,7 +273,7 @@ def test_SimpleHDFWriter():
   seq_lens = seq_lens1 + seq_lens2
 
   dataset = HDFDataset(files=[fn])
-  reader = _DatasetReader(dataset=dataset)
+  reader = DatasetTestReader(dataset=dataset)
   reader.read_all()
   assert "data" in reader.data_keys  # "classes" might be in there as well, although not really correct/existing
   assert reader.data_sparse["data"] is False
@@ -229,10 +282,14 @@ def test_SimpleHDFWriter():
   assert len(seq_lens) == reader.num_seqs
   for i, seq_len in enumerate(seq_lens):
     assert reader.seq_lens[i]["data"] == seq_len
+  print("tags:", reader.seq_tags)
+  assert_equal(reader.seq_tags, ["seq-%i" % i for i in range(reader.num_seqs)])
+  assert isinstance(reader.seq_tags[0], str)
 
 
 def test_SimpleHDFWriter_small():
-  fn = _get_tmp_file(suffix=".hdf")
+  fn = get_test_tmp_file(suffix=".hdf")
+  os.remove(fn)  # SimpleHDFWriter expects that the file does not exist
   n_dim = 3
   writer = SimpleHDFWriter(filename=fn, dim=n_dim, labels=None)
   seq_lens = [2, 3]
@@ -243,7 +300,7 @@ def test_SimpleHDFWriter_small():
   writer.close()
 
   dataset = HDFDataset(files=[fn])
-  reader = _DatasetReader(dataset=dataset)
+  reader = DatasetTestReader(dataset=dataset)
   reader.read_all()
   assert "data" in reader.data_keys  # "classes" might be in there as well, although not really correct/existing
   assert reader.data_sparse["data"] is False
@@ -287,25 +344,28 @@ def test_read_simple_hdf():
     b'}\xf0\xc7\xbe7\xf5m\xe6\xf2\xe7\xa7\xf6^\xee\xc9\xd6\xefG\xb3\x9d\x87\xcf\x9c\xed_\x1f&\xbf\xbe\xd4\xcet\xae'
     b'\xaf\xbf\x99\xc9~\xda\xdd\xaa/\xbf\xb7\xef.\xeen\xbf^2"\xff\x82\xfd\x07\xf7a\x8c\xa2\xd4>\x00\x00')
   import gzip
-  fn = _get_tmp_file(suffix=".hdf")
+  fn = get_test_tmp_file(suffix=".hdf")
   with open(fn, "wb") as f:
     f.write(gzip.decompress(raw_gzipped))
 
   dataset = HDFDataset(files=[fn])
-  reader = _DatasetReader(dataset=dataset)
+  reader = DatasetTestReader(dataset=dataset)
   reader.read_all()
+  print("tags:", reader.seq_tags)
+  assert len(seq_lens) == reader.num_seqs
+  assert_equal(reader.seq_tags, ["seq-0", "seq-1"])
+  for i, seq_len in enumerate(seq_lens):
+    assert reader.seq_lens[i]["data"] == seq_len
   assert "data" in reader.data_keys  # "classes" might be in there as well, although not really correct/existing
   assert reader.data_sparse["data"] is False
   assert list(reader.data_shape["data"]) == [n_dim]
   assert reader.data_dtype["data"] == "float32"
-  assert len(seq_lens) == reader.num_seqs
-  for i, seq_len in enumerate(seq_lens):
-    assert reader.seq_lens[i]["data"] == seq_len
 
 
 def test_SimpleHDFWriter_ndim1_var_len():
   # E.g. attention weights, shape (dec-time,enc-time) per seq.
-  fn = _get_tmp_file(suffix=".hdf")
+  fn = get_test_tmp_file(suffix=".hdf")
+  os.remove(fn)  # SimpleHDFWriter expects that the file does not exist
   writer = SimpleHDFWriter(filename=fn, dim=None, ndim=2, labels=None)
   dec_seq_lens1 = [11, 7, 5]
   enc_seq_lens1 = [13, 6, 8]
@@ -326,7 +386,7 @@ def test_SimpleHDFWriter_ndim1_var_len():
   enc_seq_lens = enc_seq_lens1 + enc_seq_lens2
 
   dataset = HDFDataset(files=[fn])
-  reader = _DatasetReader(dataset=dataset)
+  reader = DatasetTestReader(dataset=dataset)
   reader.read_all()
   assert "data" in reader.data_keys  # "classes" might be in there as well, although not really correct/existing
   assert reader.data_sparse["data"] is False
@@ -344,6 +404,50 @@ def test_SimpleHDFWriter_ndim1_var_len():
       reader.data["sizes"][i],)
 
 
+@unittest.skip("unfinished...")
+def test_SimpleHDFWriter_swmr():
+  fn = get_test_tmp_file(suffix=".hdf")
+  os.remove(fn)  # SimpleHDFWriter expects that the file does not exist
+  rnd = numpy.random.RandomState(42)
+  n_dim = 13
+  writer = SimpleHDFWriter(filename=fn, dim=n_dim, labels=None, swmr=True)
+
+  # TODO
+  # As we directly want to read it, we must know all the seqs (and seq tags) in advance.
+  # Not only that; we also would need all seq lens in advance, to have the offsets in the HDF.
+  # (Or do we? We could extend MetaDataset to ignore missing.
+  #  But then we would need to enforce a reload at the next epoch. Which we can do.)
+  # In any case though, this would not support overwriting existing seqs,
+  # but we need that...
+  # How to solve this? Different HDF format? But not really possible even in principle in a nice way, or is it?
+  # Or write to new HDF file for each epoch?
+  # Once finished through whole dataset (all sub epochs), delete old and replace?
+  # Then we also don't really need swmr.
+
+  reader = HDFDataset(files=[fn])  # TODO use swmr?
+  reader.init_seq_order(epoch=1)
+
+  seq_lens = [11, 7, 5, 10, 13, 3, 2]
+  # Construct seq tags in a way that the lengths vary.
+  seq_tags = [
+    ("seq-%i-" % i) + "".join(["abcdefghijk"[rnd.randint(0, 10)] for _ in range(rnd.randint(1, 50))])
+    for i in range(len(seq_lens))]
+  seqs = numpy.random.normal(size=(len(seq_lens), max(seq_lens), n_dim)).astype("float32")
+  for (s, e) in [(0, 3), (3, len(seq_lens))]:
+    writer.insert_batch(
+      inputs=seqs[s:e, :max(seq_lens[s:e])],
+      seq_len=seq_lens[s:e],
+      seq_tag=seq_tags[s:e])
+    writer.flush()  # TODO when do we want it?
+
+    # Now read.
+    for seq_idx in range(s, e):
+      reader.load_seqs(seq_idx, seq_idx + 1)
+      # TODO read and check whether it is correct
+
+  writer.close()  # Should not matter.
+
+
 def dummy_iter_dataset(dataset):
   """
   :param Dataset dataset:
@@ -355,6 +459,7 @@ def dummy_iter_dataset(dataset):
     dataset.load_seqs(seq_idx, seq_idx + 1)
     for key in data_keys:
       dataset.get_data(seq_idx=seq_idx, key=key)
+      dataset.get_tag(seq_idx)
     seq_idx += 1
   print("Iterated through %r, num seqs %i" % (dataset, seq_idx))
 
@@ -378,7 +483,7 @@ def test_rnn_getCacheByteSizes_zero():
   config = Config({"cache_size": "0"})
   import rnn
   rnn.config = config
-  sizes = rnn.getCacheByteSizes()
+  sizes = rnn.get_cache_byte_sizes()
   assert len(sizes) == 3
   assert all([s == 0 for s in sizes])
 
@@ -389,7 +494,7 @@ def test_rnn_initData():
   config = Config({"cache_size": "0", "train": hdf_fn, "dev": hdf_fn})
   import rnn
   rnn.config = config
-  rnn.initData()
+  rnn.init_data()
   train, dev = rnn.train_data, rnn.dev_data
   assert train and dev
   assert isinstance(train, HDFDataset)
@@ -431,7 +536,7 @@ def test_hdf_data_short_int_dtype():
   orig_classes_dtype = dataset.get_data_dtype("classes")
   assert orig_data_dtype == "uint8" and orig_classes_dtype == "int16"
 
-  hdf_fn = _get_tmp_file(suffix=".hdf")
+  hdf_fn = get_test_tmp_file(suffix=".hdf")
   hdf_writer = HDFDatasetWriter(filename=hdf_fn)
   hdf_writer.dump_from_dataset(dataset, use_progress_bar=False)
   hdf_writer.close()
@@ -468,7 +573,7 @@ def test_hdf_data_target_int32():
   assert orig_classes_seq.shape == (3,) and orig_classes_seq[0] == 2147483647
   assert orig_classes_seq.dtype == orig_classes_dtype == "int32"
 
-  hdf_fn = _get_tmp_file(suffix=".hdf")
+  hdf_fn = get_test_tmp_file(suffix=".hdf")
   hdf_writer = HDFDatasetWriter(filename=hdf_fn)
   hdf_writer.dump_from_dataset(dataset, use_progress_bar=False)
   hdf_writer.close()
@@ -495,7 +600,7 @@ def test_hdf_target_float_dtype():
   orig_classes_dtype = dataset.get_data_dtype("classes")
   assert orig_data_dtype == "float32" and orig_classes_dtype == "float32"
 
-  hdf_fn = _get_tmp_file(suffix=".hdf")
+  hdf_fn = get_test_tmp_file(suffix=".hdf")
   hdf_writer = HDFDatasetWriter(filename=hdf_fn)
   hdf_writer.dump_from_dataset(dataset, use_progress_bar=False)
   hdf_writer.close()
@@ -530,7 +635,7 @@ def test_hdf_target_float_dense():
   orig_classes_shape = dataset.get_data_shape("classes")
   assert orig_data_shape == [3] and orig_classes_shape == [2]
 
-  hdf_fn = _get_tmp_file(suffix=".hdf")
+  hdf_fn = get_test_tmp_file(suffix=".hdf")
   hdf_writer = HDFDatasetWriter(filename=hdf_fn)
   hdf_writer.dump_from_dataset(dataset, use_progress_bar=False)
   hdf_writer.close()

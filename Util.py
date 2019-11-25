@@ -1,9 +1,15 @@
+# -*- coding: utf8 -*-
+
+"""
+Various generic utilities, which are shared across different backend engines.
+"""
 
 from __future__ import print_function
 from __future__ import division
 
 import subprocess
 from subprocess import CalledProcessError
+
 import h5py
 from collections import deque
 import inspect
@@ -19,6 +25,12 @@ try:
 except ImportError:
   import _thread as thread
 import threading
+try:
+  # noinspection PyCompatibility
+  from StringIO import StringIO
+except ImportError:
+  from io import StringIO
+import typing
 
 PY3 = sys.version_info[0] >= 3
 
@@ -26,18 +38,21 @@ if PY3:
   import builtins
   unicode = str
   long = int
+  # noinspection PyShadowingBuiltins
   input = builtins.input
   from io import BytesIO
 else:
+  # noinspection PyUnresolvedReferences
   import __builtin__ as builtins
-  unicode = builtins.unicode
-  long = builtins.long
+  unicode = builtins.unicode  # type: typing.Type[str]
+  long = builtins.long  # type: typing.Type[int]
+  # noinspection PyShadowingBuiltins
   input = builtins.raw_input
   try:
-    # noinspection PyUnresolvedReferences
+    # noinspection PyUnresolvedReferences,PyCompatibility
     from cStringIO import StringIO as BytesIO
   except ImportError:
-    # noinspection PyUnresolvedReferences
+    # noinspection PyUnresolvedReferences,PyCompatibility
     from StringIO import StringIO as BytesIO
 
 my_dir = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +68,23 @@ class NotSpecified(object):
   def __repr__(self):
     return "<NotSpecified>"
 
+  @classmethod
+  def resolve(cls, value, default):
+    """
+    :param T|NotSpecified|type[NotSpecified] value:
+    :param U default:
+    :rtype: T|U
+    """
+    if value is NotSpecified:
+      return default
+    return value
+
+
+class OptionalNotImplementedError(NotImplementedError):
+  """
+  This can optionally be implemented, but it is not required by the API.
+  """
+
 
 def is_64bit_platform():
   """
@@ -64,15 +96,24 @@ def is_64bit_platform():
 
 
 class BackendEngine:
+  """
+  Stores which backend engine we use in RETURNN.
+  E.g. Theano or TensorFlow.
+  """
+
   Theano = 0
-  Default = Theano
   TensorFlow = 1
-  selectedEngine = None
+  selectedEngine = None  # type: typing.Optional[int]  # One of the possible engines.
+
+  class CannotSelectEngine(Exception):
+    """
+    Cannot select backend engine
+    """
 
   @classmethod
   def select_engine(cls, engine=None, config=None):
     """
-    :param int engine:
+    :param int engine: see the global class attribs for possible values
     :param Config.Config config:
     """
     assert cls.selectedEngine is None, "already set"
@@ -80,7 +121,7 @@ class BackendEngine:
       if config is None:
         from Config import get_global_config
         config = get_global_config()
-      engine = cls.Default
+      engine = cls._get_default_engine()
       if config.bool("use_theano", False):
         engine = cls.Theano
       if config.bool("use_tensorflow", False):
@@ -88,18 +129,53 @@ class BackendEngine:
     cls.selectedEngine = engine
 
   @classmethod
+  def _get_default_engine(cls):
+    """
+    For backward compatibility, we still keep Theano the default.
+    However, we can do it slightly more clever.
+    If TensorFlow is already imported but Theano is not, allow TF as the default.
+    Also, if theano cannot be imported, allow for TF as the default.
+
+    :rtype: int
+    """
+    if "theano" in sys.modules:
+      return cls.Theano
+    if "tensorflow" in sys.modules:
+      return cls.TensorFlow
+    try:
+      import theano
+      return cls.Theano
+    except ImportError:
+      pass
+    try:
+      import tensorflow
+      return cls.TensorFlow
+    except ImportError:
+      pass
+    raise cls.CannotSelectEngine("Neither Theano nor TF available.")
+
+  @classmethod
   def get_selected_engine(cls):
+    """
+    :rtype: int
+    """
     if cls.selectedEngine is not None:
       return cls.selectedEngine
     else:
-      return cls.Default
+      return cls._get_default_engine()
 
   @classmethod
   def is_theano_selected(cls):
+    """
+    :rtype: bool
+    """
     return cls.get_selected_engine() == cls.Theano
 
   @classmethod
   def is_tensorflow_selected(cls):
+    """
+    :rtype: bool
+    """
     return cls.get_selected_engine() == cls.TensorFlow
 
 
@@ -134,45 +210,92 @@ def cmd(s):
   return result
 
 
-def sysexecOut(*args, **kwargs):
+def sysexec_out(*args, **kwargs):
+  """
+  :param args: for subprocess.Popen
+  :param kwargs: for subprocess.Popen
+  :return: stdout as str (assumes utf8)
+  :rtype: str
+  """
   from subprocess import Popen, PIPE
   kwargs.setdefault("shell", False)
   p = Popen(args, stdin=PIPE, stdout=PIPE, **kwargs)
   out, _ = p.communicate()
-  if p.returncode != 0: raise CalledProcessError(p.returncode, args)
+  if p.returncode != 0:
+    raise CalledProcessError(p.returncode, args)
   out = out.decode("utf-8")
   return out
 
-def sysexecRetCode(*args, **kwargs):
+
+def sysexec_ret_code(*args, **kwargs):
+  """
+  :param str args: for subprocess.call
+  :param kwargs: for subprocess.call
+  :return: return code
+  :rtype: int
+  """
   import subprocess
   res = subprocess.call(args, shell=False, **kwargs)
-  valid = kwargs.get("valid", (0,1))
+  valid = kwargs.get("valid", (0, 1))
   if valid is not None:
-    if res not in valid: raise CalledProcessError(res, args)
+    if res not in valid:
+      raise CalledProcessError(res, args)
   return res
 
-def git_commitRev(commit="HEAD", gitdir="."):
-  if commit is None: commit = "HEAD"
-  return sysexecOut("git", "rev-parse", "--short", commit, cwd=gitdir).strip()
 
-def git_isDirty(gitdir="."):
-  r = sysexecRetCode("git", "diff", "--no-ext-diff", "--quiet", "--exit-code", cwd=gitdir)
-  if r == 0: return False
-  if r == 1: return True
+def git_commit_rev(commit="HEAD", gitdir="."):
+  """
+  :param str commit:
+  :param str gitdir:
+  :rtype: str
+  """
+  if commit is None:
+    commit = "HEAD"
+  return sysexec_out("git", "rev-parse", "--short", commit, cwd=gitdir).strip()
+
+
+def git_is_dirty(gitdir="."):
+  """
+  :param str gitdir:
+  :rtype: bool
+  """
+  r = sysexec_ret_code("git", "diff", "--no-ext-diff", "--quiet", "--exit-code", cwd=gitdir)
+  if r == 0:
+    return False
+  if r == 1:
+    return True
   assert False, "bad return %i" % r
 
-def git_commitDate(commit="HEAD", gitdir="."):
-  return sysexecOut("git", "show", "-s", "--format=%ci", commit, cwd=gitdir).strip()[:-6].replace(":", "").replace("-", "").replace(" ", ".")
 
-def git_describeHeadVersion(gitdir="."):
-  cdate = git_commitDate(gitdir=gitdir)
-  rev = git_commitRev(gitdir=gitdir)
-  is_dirty = git_isDirty(gitdir=gitdir)
+def git_commit_date(commit="HEAD", gitdir="."):
+  """
+  :param str commit:
+  :param str gitdir:
+  :rtype: str
+  """
+  return (
+    sysexec_out("git", "show", "-s", "--format=%ci", commit, cwd=gitdir)
+    .strip()[:-6]
+    .replace(":", "")
+    .replace("-", "")
+    .replace(" ", "."))
+
+
+def git_describe_head_version(gitdir="."):
+  """
+  :param str gitdir:
+  :rtype: str
+  """
+  cdate = git_commit_date(gitdir=gitdir)
+  rev = git_commit_rev(gitdir=gitdir)
+  is_dirty = git_is_dirty(gitdir=gitdir)
   return "%s--git-%s%s" % (cdate, rev, "-dirty" if is_dirty else "")
 
-_crnn_version_info = None
 
-def describe_crnn_version():
+_returnn_version_info = None
+
+
+def describe_returnn_version():
   """
   :rtype: str
   :return: string like "20171017.163840--git-ab2a1da", via :func:`git_describeHeadVersion`
@@ -182,22 +305,27 @@ def describe_crnn_version():
   # Or to not trigger any pthread_atfork bugs,
   # e.g. from OpenBlas (https://github.com/tensorflow/tensorflow/issues/13802),
   # which also hopefully should not happen, but it might.
-  global _crnn_version_info
-  if _crnn_version_info:
-    return _crnn_version_info
+  global _returnn_version_info
+  if _returnn_version_info:
+    return _returnn_version_info
   mydir = os.path.dirname(__file__)
   try:
-    _crnn_version_info = git_describeHeadVersion(gitdir=mydir)
+    _returnn_version_info = git_describe_head_version(gitdir=mydir)
   except Exception as e:
-    _crnn_version_info = "unknown(git exception: %r)" % e
-  return _crnn_version_info
+    _returnn_version_info = "unknown(git exception: %r)" % e
+  return _returnn_version_info
+
 
 def describe_theano_version():
+  """
+  :rtype: str
+  """
+  # noinspection PyUnresolvedReferences,PyPackageRequirements
   import theano
   try:
-    tdir = os.path.dirname(theano.__file__)
+    theano_dir = os.path.dirname(theano.__file__)
   except Exception as e:
-    tdir = "<unknown(exception: %r)>" % e
+    theano_dir = "<unknown(exception: %r)>" % e
   try:
     version = theano.__version__
     if len(version) > 20:
@@ -205,19 +333,23 @@ def describe_theano_version():
   except Exception as e:
     version = "<unknown(exception: %r)>" % e
   try:
-    if tdir.startswith("<"):
+    if theano_dir.startswith("<"):
       git_info = "<unknown-dir>"
-    elif os.path.exists(tdir + "/../.git"):
-      git_info = "git:" + git_describeHeadVersion(gitdir=tdir)
-    elif "/site-packages/" in tdir:
+    elif os.path.exists(theano_dir + "/../.git"):
+      git_info = "git:" + git_describe_head_version(gitdir=theano_dir)
+    elif "/site-packages/" in theano_dir:
       git_info = "<site-package>"
     else:
       git_info = "<not-under-git>"
   except Exception as e:
     git_info = "<unknown(git exception: %r)>" % e
-  return "%s (%s in %s)" % (version, git_info, tdir)
+  return "%s (%s in %s)" % (version, git_info, theano_dir)
+
 
 def describe_tensorflow_version():
+  """
+  :rtype: str
+  """
   try:
     import tensorflow as tf
   except ImportError:
@@ -232,7 +364,7 @@ def describe_tensorflow_version():
     if tdir.startswith("<"):
       git_info = "<unknown-dir>"
     elif os.path.exists(tdir + "/../.git"):
-      git_info = "git:" + git_describeHeadVersion(gitdir=tdir)
+      git_info = "git:" + git_describe_head_version(gitdir=tdir)
     elif "/site-packages/" in tdir:
       git_info = "<site-package>"
     else:
@@ -240,6 +372,7 @@ def describe_tensorflow_version():
   except Exception as e:
     git_info = "<unknown(git exception: %r)>" % e
   return "%s (%s in %s)" % (version, git_info, tdir)
+
 
 def get_tensorflow_version_tuple():
   """
@@ -250,28 +383,36 @@ def get_tensorflow_version_tuple():
   import re
   return tuple([int(re.sub('(-rc[0-9]|-dev[0-9]*)', '', s)) for s in tf.__version__.split(".")])
 
+
 def eval_shell_env(token):
+  """
+  :param str token:
+  :return: if "$var", looks in os.environ, otherwise return token as is
+  :rtype: str
+  """
   if token.startswith("$"):
     return os.environ.get(token[1:], "")
   return token
+
 
 def eval_shell_str(s):
   """
   :type s: str | list[str] | ()->str | list[()->str] | ()->list[str] | ()->list[()->str]
   :rtype: list[str]
 
-  Parses `s` as shell like arguments (via shlex.split) and evaluates shell environment variables (eval_shell_env).
+  Parses `s` as shell like arguments (via shlex.split) and evaluates shell environment variables
+  (:func:`eval_shell_env`).
   `s` or its elements can also be callable. In those cases, they will be called and the returned value is used.
   """
   tokens = []
   if callable(s):
     s = s()
   if isinstance(s, (list, tuple)):
-    l = s
+    ls = s
   else:
     assert isinstance(s, (str, unicode))
-    l = shlex.split(s)
-  for token in l:
+    ls = shlex.split(s)
+  for token in ls:
     if callable(token):
       token = token()
     assert isinstance(token, (str, unicode))
@@ -281,7 +422,13 @@ def eval_shell_str(s):
       tokens += [token]
   return tokens
 
+
 def hdf5_dimension(filename, dimension):
+  """
+  :param str filename:
+  :param str dimension:
+  :rtype: numpy.ndarray|int
+  """
   fin = h5py.File(filename, "r")
   if '/' in dimension:
     res = fin['/'.join(dimension.split('/')[:-1])].attrs[dimension.split('/')[-1]]
@@ -290,30 +437,56 @@ def hdf5_dimension(filename, dimension):
   fin.close()
   return res
 
+
 def hdf5_group(filename, dimension):
+  """
+  :param str filename:
+  :param str dimension:
+  :rtype: dict[str]
+  """
   fin = h5py.File(filename, "r")
-  res = { k : fin[dimension].attrs[k] for k in fin[dimension].attrs }
+  res = {k: fin[dimension].attrs[k] for k in fin[dimension].attrs}
   fin.close()
   return res
 
+
 def hdf5_shape(filename, dimension):
+  """
+  :param str filename:
+  :param dimension:
+  :rtype: tuple[int]
+  """
   fin = h5py.File(filename, "r")
   res = fin[dimension].shape
   fin.close()
   return res
 
+
 def hdf5_strings(handle, name, data):
+  """
+  :param h5py.File handle:
+  :param str name:
+  :param numpy.ndarray|list[str] data:
+  """
+  # noinspection PyBroadException
   try:
-    S=max([len(d) for d in data])
-    dset = handle.create_dataset(name, (len(data),), dtype="S"+str(S))
+    s = max([len(d) for d in data])
+    dset = handle.create_dataset(name, (len(data),), dtype="S" + str(s))
     dset[...] = data
   except Exception:
+    # noinspection PyUnresolvedReferences
     dt = h5py.special_dtype(vlen=unicode)
     del handle[name]
     dset = handle.create_dataset(name, (len(data),), dtype=dt)
     dset[...] = data
 
+
 def model_epoch_from_filename(filename):
+  """
+  :param str filename:
+  :return: epoch number
+  :rtype: int
+  """
   if BackendEngine.is_theano_selected():
     return hdf5_dimension(filename, 'epoch')
   else:
@@ -322,7 +495,7 @@ def model_epoch_from_filename(filename):
     # once we save that in the model.
     # See TFNetwork.Network._create_saver().
     # For now, just parse it from filename.
-    m = re.match(".*\.([0-9]+)", filename)
+    m = re.match(".*\\.([0-9]+)", filename)
     assert m, "no match for %r" % filename
     return int(m.groups()[0])
 
@@ -343,8 +516,17 @@ def deep_update_dict_values(d, key, new_value):
     d[key] = new_value
 
 
-def terminal_size(file=sys.stdout):  # this will probably work on linux only
-  import os, sys, io
+def terminal_size(file=sys.stdout):
+  """
+  Returns the terminal size.
+  This will probably work on linux only.
+
+  :param io.File file:
+  :return: (columns, lines), or (-1,-1)
+  :rtype: (int,int)
+  """
+  import os
+  import io
   if not hasattr(file, "fileno"):
     return -1, -1
   try:
@@ -353,28 +535,43 @@ def terminal_size(file=sys.stdout):  # this will probably work on linux only
   except io.UnsupportedOperation:
     return -1, -1
   env = os.environ
-  def ioctl_GWINSZ(fd):
+
+  # noinspection PyShadowingNames
+  def ioctl_gwinsz(fd):
+    """
+    :param int fd: file descriptor
+    :rtype: tuple[int]
+    """
+    # noinspection PyBroadException
     try:
-      import fcntl, termios, struct, os
-      cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ, '1234'))
+      import fcntl
+      import termios
+      import struct
+      cr_ = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ, '1234'))
     except Exception:
-        return
-    return cr
-  cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+      return
+    return cr_
+
+  cr = ioctl_gwinsz(file.fileno) or ioctl_gwinsz(0) or ioctl_gwinsz(1) or ioctl_gwinsz(2)
   if not cr:
+    # noinspection PyBroadException
     try:
-        fd = os.open(os.ctermid(), os.O_RDONLY)
-        cr = ioctl_GWINSZ(fd)
-        os.close(fd)
+      fd = os.open(os.ctermid(), os.O_RDONLY)
+      cr = ioctl_gwinsz(fd)
+      os.close(fd)
     except Exception:
-        pass
+      pass
   if not cr:
     cr = (env.get('LINES', 25), env.get('COLUMNS', 80))
   return int(cr[1]), int(cr[0])
 
 
 def is_tty(file=sys.stdout):
-  terminal_width, _ = terminal_size()
+  """
+  :param io.File file:
+  :rtype: bool
+  """
+  terminal_width, _ = terminal_size(file=file)
   return terminal_width > 0
 
 
@@ -419,16 +616,32 @@ def hms_fraction(s, decimals=4):
 
 
 def human_size(n, factor=1000, frac=0.8, prec=1):
-  postfixs = ["", "K", "M", "G", "T"]
+  """
+  :param int|float n:
+  :param int factor: for each of the units K, M, G, T
+  :param float frac: when to go over to the next bigger unit
+  :param int prec: how much decimals after the dot
+  :return: human readable size, using K, M, G, T
+  :rtype: str
+  """
+  postfixes = ["", "K", "M", "G", "T"]
   i = 0
-  while i < len(postfixs) - 1 and n > (factor ** (i + 1)) * frac:
+  while i < len(postfixes) - 1 and n > (factor ** (i + 1)) * frac:
     i += 1
   if i == 0:
     return str(n)
-  return ("%." + str(prec) + "f") % (float(n) / (factor ** i)) + postfixs[i]
+  return ("%." + str(prec) + "f") % (float(n) / (factor ** i)) + postfixes[i]
 
 
 def human_bytes_size(n, factor=1024, frac=0.8, prec=1):
+  """
+  :param int|float n:
+  :param int factor: see :func:`human_size`. 1024 by default for bytes
+  :param float frac: see :func:`human_size`
+  :param int prec: how much decimals after the dot
+  :return: human readable byte size, using K, M, G, T, with "B" at the end
+  :rtype: str
+  """
   return human_size(n, factor=factor, frac=frac, prec=prec) + "B"
 
 
@@ -516,7 +729,7 @@ def pretty_print(obj, limit=None):
   if limit is None:
     limit = _pretty_print_limit
   if len(s) > limit:
-    s = s[:limit - 3]
+    s = s[:int(limit) - 3]
     s += "..."
   extra_info = _pp_extra_info(obj)
   if extra_info != "":
@@ -524,19 +737,32 @@ def pretty_print(obj, limit=None):
   return s
 
 
-def progress_bar(complete=1.0, prefix="", suffix="", file=sys.stdout):
-  import sys
+def progress_bar(complete=1.0, prefix="", suffix="", file=None):
+  """
+  Prints some progress bar.
+
+  :param float complete: from 0.0 to 1.0
+  :param str prefix:
+  :param str suffix:
+  :param io.TextIOWrapper|None file: where to print. stdout by default
+  :return: nothing, will print on ``file``
+  """
+  if file is None:
+    file = sys.stdout
   terminal_width, _ = terminal_size(file=file)
-  if terminal_width == -1: return
+  if terminal_width == -1:
+    return
   if complete == 1.0:
-    file.write("\r%s"%(terminal_width * ' '))
+    file.write("\r%s" % (terminal_width * ' '))
     file.flush()
     file.write("\r")
     file.flush()
     return
   progress = "%.02f%%" % (complete * 100)
-  if prefix != "": prefix = prefix + " "
-  if suffix != "": suffix = " " + suffix
+  if prefix != "":
+    prefix = prefix + " "
+  if suffix != "":
+    suffix = " " + suffix
   ntotal = terminal_width - len(progress) - len(prefix) - len(suffix) - 4
   bars = '|' * int(complete * ntotal)
   spaces = ' ' * (ntotal - int(complete * ntotal))
@@ -545,12 +771,24 @@ def progress_bar(complete=1.0, prefix="", suffix="", file=sys.stdout):
   file.flush()
 
 
-class _progress_bar_with_time_stats:
+class _ProgressBarWithTimeStats:
+  """
+  Global closure. Used by :func:`progress_bar_with_time`.
+  """
   start_time = None
   last_complete = None
 
+
 def progress_bar_with_time(complete=1.0, prefix="", **kwargs):
-  stats = _progress_bar_with_time_stats
+  """
+  :func:`progress_bar` with additional remaining time estimation.
+
+  :param float complete:
+  :param str prefix:
+  :param kwargs: passed to :func:`progress_bar`
+  :return: nothing
+  """
+  stats = _ProgressBarWithTimeStats
   if stats.start_time is None:
     stats.start_time = time.time()
     stats.last_complete = complete
@@ -569,54 +807,72 @@ def progress_bar_with_time(complete=1.0, prefix="", **kwargs):
   progress_bar(complete, prefix=prefix, **kwargs)
 
 
-def availablePhysicalMemoryInBytes():
+def available_physical_memory_in_bytes():
+  """
+  :rtype: int
+  """
+  # noinspection PyBroadException
   try:
     mem_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
   except Exception:
     mem_bytes = 1024 ** 4  # just some random number, 1TB
   return mem_bytes
 
-def defaultCacheSizeInGBytes(factor=0.7):
-  mem_gbytes = availablePhysicalMemoryInBytes() / (1024. ** 3)
+
+def default_cache_size_in_gbytes(factor=0.7):
+  """
+  :param float|int factor:
+  :rtype: int
+  """
+  mem_gbytes = available_physical_memory_in_bytes() / (1024. ** 3)
   return int(mem_gbytes * factor)
 
 
-def betterRepr(o):
+def better_repr(o):
   """
-  The main difference: this one is deterministic.
+  The main difference to :func:`repr`: this one is deterministic.
   The orig dict.__repr__ has the order undefined for dict or set.
   For big dicts/sets/lists, add "," at the end to make textual diffs nicer.
+
+  :param object o:
+  :rtype: str
   """
   if isinstance(o, list):
-    return "[\n%s]" % "".join(map(lambda v: betterRepr(v) + ",\n", o))
+    return "[\n%s]" % "".join(map(lambda v: better_repr(v) + ",\n", o))
   if isinstance(o, deque):
-    return "deque([\n%s])" % "".join(map(lambda v: betterRepr(v) + ",\n", o))
+    return "deque([\n%s])" % "".join(map(lambda v: better_repr(v) + ",\n", o))
   if isinstance(o, tuple):
     if len(o) == 1:
       return "(%s,)" % o[0]
-    return "(%s)" % ", ".join(map(betterRepr, o))
+    return "(%s)" % ", ".join(map(better_repr, o))
   if isinstance(o, dict):
-    l = [betterRepr(k) + ": " + betterRepr(v) for (k,v) in sorted(o.items())]
-    if sum([len(v) for v in l]) >= 40:
-      return "{\n%s}" % "".join([v + ",\n" for v in l])
+    ls = [better_repr(k) + ": " + better_repr(v) for (k, v) in sorted(o.items())]
+    if sum([len(v) for v in ls]) >= 40:
+      return "{\n%s}" % "".join([v + ",\n" for v in ls])
     else:
-      return "{%s}" % ", ".join(l)
+      return "{%s}" % ", ".join(ls)
   if isinstance(o, set):
-    return "set([\n%s])" % "".join(map(lambda v: betterRepr(v) + ",\n", o))
+    return "set([\n%s])" % "".join(map(lambda v: better_repr(v) + ",\n", o))
   # fallback
   return repr(o)
 
 
-def simpleObjRepr(obj):
+def simple_obj_repr(obj):
   """
-  All self.__init__ args.
+  :return: All self.__init__ args.
+  :rtype: str
   """
   return obj.__class__.__name__ + "(%s)" % \
-                                  ", ".join(["%s=%s" % (arg, betterRepr(getattr(obj, arg)))
-                                             for arg in inspect.getargspec(obj.__init__).args[1:]])
+                                  ", ".join(["%s=%s" % (arg, better_repr(getattr(obj, arg)))
+                                             for arg in getargspec(obj.__init__).args[1:]])
 
 
-class ObjAsDict:
+class ObjAsDict(typing.Mapping[str, object]):
+  """
+  Wraps up any object as a dict, where the attributes becomes the keys.
+  See also :class:`DictAsObj`.
+  """
+
   def __init__(self, obj):
     self.__obj = obj
 
@@ -628,16 +884,39 @@ class ObjAsDict:
     except AttributeError as e:
       raise KeyError(e)
 
+  def __len__(self):
+    return len(vars(self.__obj))
+
+  def __iter__(self):
+    return iter(vars(self.__obj))
+
   def items(self):
+    """
+    :return: vars(..).items()
+    :rtype: set[(str,object)]
+    """
     return vars(self.__obj).items()
 
 
 class DictAsObj:
+  """
+  Wraps up any dictionary as an object, where the keys becomes the attributes.
+  See also :class:`ObjAsDict`.
+  """
+
   def __init__(self, dikt):
+    """
+    :param dict[str] dikt:
+    """
     self.__dict__ = dikt
 
 
 def dict_joined(*ds):
+  """
+  :param dict[T,V] ds:
+  :return: all dicts joined together
+  :rtype: dict[T,V]
+  """
   res = {}
   for d in ds:
     res.update(d)
@@ -645,6 +924,12 @@ def dict_joined(*ds):
 
 
 def obj_diff_str(self, other):
+  """
+  :param object self:
+  :param object other:
+  :return: the difference described
+  :rtype: str
+  """
   if self is None and other is None:
     return "No diff."
   if self is None and other is not None:
@@ -654,11 +939,17 @@ def obj_diff_str(self, other):
   if self == other:
     return "No diff."
   s = []
+
   def _obj_attribs(obj):
+    """
+    :param object obj:
+    :rtype: list[str]|None
+    """
     d = getattr(obj, "__dict__", None)
     if d is not None:
       return d.keys()
     return None
+
   self_attribs = _obj_attribs(self)
   other_attribs = _obj_attribs(other)
   if self_attribs is None or other_attribs is None:
@@ -694,6 +985,12 @@ def obj_diff_str(self, other):
 
 
 def dict_diff_str(self, other):
+  """
+  :param dict self:
+  :param dict other:
+  :return: the difference described
+  :rtype: str
+  """
   return obj_diff_str(DictAsObj(self), DictAsObj(other))
 
 
@@ -720,12 +1017,18 @@ def find_ranges(l):
 _thread_join_hack_installed = False
 
 
-def initThreadJoinHack():
+def init_thread_join_hack():
+  """
+  ``threading.Thread.join`` and ``threading.Condition.wait`` would block signals when run in the main thread.
+  We never want to block signals.
+  Here we patch away that behavior.
+  """
   global _thread_join_hack_installed
   if _thread_join_hack_installed:  # don't install twice
     return
   _thread_join_hack_installed = True
   main_thread = threading.currentThread()
+  # noinspection PyUnresolvedReferences,PyProtectedMember
   assert isinstance(main_thread, threading._MainThread)
   main_thread_id = thread.get_ident()
 
@@ -757,12 +1060,22 @@ def initThreadJoinHack():
 
   # Mostly the same for Condition.wait().
   if PY3:
+    # https://youtrack.jetbrains.com/issue/PY-34983
+    # noinspection PyPep8Naming
     Condition = threading.Condition
   else:
+    # noinspection PyUnresolvedReferences,PyPep8Naming,PyProtectedMember
     Condition = threading._Condition
   cond_wait_orig = Condition.wait
 
+  # noinspection PyUnusedLocal
   def cond_wait_hacked(cond, timeout=None, *args):
+    """
+    :param Condition cond:
+    :param float|None timeout:
+    :param args:
+    :rtype: bool
+    """
     if thread.get_ident() == main_thread_id:
       if timeout is None:
         # Use a timeout anyway. This should not matter for the underlying code.
@@ -779,12 +1092,19 @@ def initThreadJoinHack():
   # And the same for Lock.acquire, very similar to Condition.wait.
   # However: can't set attributes of built-in/extension type 'thread.lock'.
   # We could wrap the whole threading.Lock, but that is too annoying for me now...
-  Lock = False
+  # noinspection PyPep8Naming
+  Lock = None
   if Lock:
     lock_acquire_orig = Lock.acquire
 
     # Note: timeout argument was introduced in Python 3.
     def lock_acquire_hacked(lock, blocking=True, timeout=-1):
+      """
+      :param threading.Lock lock:
+      :param bool blocking:
+      :param float timeout:
+      :rtype: bool
+      """
       if not blocking:
         return lock_acquire_orig(lock, blocking=False)  # no timeout if not blocking
       # Everything is blocking now.
@@ -809,20 +1129,37 @@ def initThreadJoinHack():
 
 
 def start_daemon_thread(target, args=()):
+  """
+  :param ()->None target:
+  :param tuple args:
+  :return: nothing
+  """
   from threading import Thread
   t = Thread(target=target, args=args)
   t.daemon = True
   t.start()
 
+
 def is_quitting():
+  """
+  :return: whether we are currently quitting (via :func:`rnn.finalize`)
+  :rtype: bool
+  """
   import rnn
-  if rnn.quit:  # via rnn.finalize()
+  if rnn.quit_returnn:  # via rnn.finalize()
     return True
   if getattr(sys, "exited", False):  # set via Debug module when an unexpected SIGINT occurs, or here
     return True
   return False
 
+
 def interrupt_main():
+  """
+  Sends :class:`KeyboardInterrupt` to the main thread.
+
+  :return: nothing
+  """
+  # noinspection PyProtectedMember,PyUnresolvedReferences
   is_main_thread = isinstance(threading.currentThread(), threading._MainThread)
   if is_quitting():  # ignore if we are already quitting
     if is_main_thread:  # strange to get again in main thread
@@ -830,6 +1167,7 @@ def interrupt_main():
     # Not main thread. This will just exit the thread.
     sys.exit(1)
   sys.exited = True  # Don't do it twice.
+  # noinspection PyProtectedMember
   sys.exited_frame = sys._getframe()
   if is_main_thread:
     raise KeyboardInterrupt
@@ -839,6 +1177,10 @@ def interrupt_main():
 
 
 class AsyncThreadRun(threading.Thread):
+  """
+  Daemon thread, wrapping some function ``func`` via :func:`wrap_async_func`.
+  """
+
   def __init__(self, name, func):
     """
     :param str name:
@@ -851,14 +1193,31 @@ class AsyncThreadRun(threading.Thread):
     self.start()
 
   def main(self):
+    """
+    Thread target function.
+
+    :return: nothing, will just set self.result
+    """
     self.result = wrap_async_func(self.func)
 
   def get(self):
+    """
+    :return: joins the thread, and then returns the result
+    :rtype: T
+    """
     self.join()
     return self.result
 
 
 def wrap_async_func(f):
+  """
+  Calls ``f()`` and returns the result.
+  Wrapped up with catching all exceptions, printing stack trace, and :func:`interrupt_main`.
+
+  :param ()->T f:
+  :rtype: T
+  """
+  # noinspection PyBroadException
   try:
     import better_exchook
     better_exchook.install()
@@ -869,6 +1228,15 @@ def wrap_async_func(f):
 
 
 def try_run(func, args=(), catch_exc=Exception, default=None):
+  """
+  :param ((X)->T) func:
+  :param tuple args:
+  :param type[Exception] catch_exc:
+  :param T2 default:
+  :return: either ``func()`` or ``default`` if there was some exception
+  :rtype: T|T2
+  """
+  # noinspection PyBroadException
   try:
     return func(*args)
   except catch_exc:
@@ -876,6 +1244,13 @@ def try_run(func, args=(), catch_exc=Exception, default=None):
 
 
 def class_idx_seq_to_1_of_k(seq, num_classes):
+  """
+  Basically one_hot.
+
+  :param list[int]|np.ndarray seq:
+  :param int num_classes:
+  :rtype: np.ndarray
+  """
   num_frames = len(seq)
   m = np.zeros((num_frames, num_classes))
   m[np.arange(num_frames), seq] = 1
@@ -885,6 +1260,7 @@ def class_idx_seq_to_1_of_k(seq, num_classes):
 def uniq(seq):
   """
   Like Unix tool uniq. Removes repeated entries.
+
   :param seq: numpy.array
   :return: seq
   """
@@ -951,6 +1327,7 @@ def random_orthogonal(shape, gain=1., seed=None):
 _have_inplace_increment = None
 _native_inplace_increment = None
 
+
 def inplace_increment(x, idx, y):
   """
   This basically does `x[idx] += y`.
@@ -961,8 +1338,10 @@ def inplace_increment(x, idx, y):
   global _have_inplace_increment, inplace_increment, _native_inplace_increment
   if _have_inplace_increment is None:
     native_inpl_incr = None
+    # noinspection PyPackageRequirements,PyUnresolvedReferences
     import theano
     if theano.config.cxx:
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
       import theano.gof.cutils  # needed to import cutils_ext
       try:
         from cutils_ext.cutils_ext import inplace_increment as native_inpl_incr
@@ -992,7 +1371,8 @@ def prod(ls):
   return x
 
 
-def parse_orthography_into_symbols(orthography, upper_case_special=True, word_based=False, square_brackets_for_specials=True):
+def parse_orthography_into_symbols(orthography, upper_case_special=True, word_based=False,
+                                   square_brackets_for_specials=True):
   """
   For Speech.
   Example:
@@ -1010,6 +1390,7 @@ def parse_orthography_into_symbols(orthography, upper_case_special=True, word_ba
   :param str orthography: example: "hello [HESITATION] there "
   :param bool upper_case_special: whether the special symbols are always made upper case
   :param bool word_based: whether we split on space and return full words
+  :param bool square_brackets_for_specials: handle "[...]"
   :rtype: list[str]
   """
   ret = []
@@ -1060,7 +1441,7 @@ def parse_orthography(orthography, prefix=(), postfix=("[END]",),
   :param str remove_chars: those chars will just be removed at the beginning
   :param bool collapse_spaces: whether multiple spaces and tabs are collapsed into a single space
   :param bool final_strip: whether we strip left and right
-  :param **kwargs: passed on to parse_orthography_into_symbols()
+  :param kwargs: passed on to parse_orthography_into_symbols()
   :rtype: list[str]
   """
   for c in remove_chars:
@@ -1075,12 +1456,13 @@ def parse_orthography(orthography, prefix=(), postfix=("[END]",),
 def json_remove_comments(string, strip_space=True):
   """
   :type string: str
+  :param bool strip_space:
   :rtype: str
 
   via https://github.com/getify/JSON.minify/blob/master/minify_json.py,
   by Gerald Storer, Pradyun S. Gedam, modified by us.
   """
-  tokenizer = re.compile('"|(/\*)|(\*/)|(//)|\n|\r')
+  tokenizer = re.compile('"|(/\\*)|(\\*/)|(//)|\n|\r')
   end_slashes_re = re.compile(r'(\\)*$')
 
   in_string = False
@@ -1108,7 +1490,7 @@ def json_remove_comments(string, strip_space=True):
       # start of string or unescaped quote character to end string
       if not in_string or (escaped is None or len(escaped.group()) % 2 == 0):
         in_string = not in_string
-      index -= 1 # include " character in next catch
+      index -= 1  # include " character in next catch
     elif not (in_string or in_multi or in_single):
       if val == '/*':
         in_multi = True
@@ -1125,18 +1507,31 @@ def json_remove_comments(string, strip_space=True):
   return ''.join(new_str)
 
 
-def unicode_to_str_recursive(s):
+def _py2_unicode_to_str_recursive(s):
+  """
+  This is supposed to be run with Python 2.
+  Also see :func:`as_str` and :func:`py2_utf8_str_to_unicode`.
+
+  :param str|unicode s: or any recursive structure such as dict, list, tuple
+  :return: Python 2 str (is like Python 3 UTF-8 formatted bytes)
+  :rtype: str
+  """
   if isinstance(s, dict):
-    return {unicode_to_str_recursive(key): unicode_to_str_recursive(value) for key, value in s.items()}
-  elif isinstance(s, list):
-    return [unicode_to_str_recursive(element) for element in s]
+    return {_py2_unicode_to_str_recursive(key): _py2_unicode_to_str_recursive(value) for key, value in s.items()}
+  elif isinstance(s, (list, tuple)):
+    return make_seq_of_type(type(s), [_py2_unicode_to_str_recursive(element) for element in s])
   elif isinstance(s, unicode):
-    return s.encode('utf-8')
+    return s.encode('utf-8')  # Python 2 str, Python 3 bytes
   else:
     return s
 
 
 def load_json(filename=None, content=None):
+  """
+  :param str|None filename:
+  :param str|None content:
+  :rtype: dict[str]
+  """
   if content:
     assert not filename
   else:
@@ -1148,7 +1543,7 @@ def load_json(filename=None, content=None):
   except ValueError as e:
     raise Exception("config looks like JSON but invalid json content, %r" % e)
   if not PY3:
-    json_content = unicode_to_str_recursive(json_content)
+    json_content = _py2_unicode_to_str_recursive(json_content)
   return json_content
 
 
@@ -1184,6 +1579,9 @@ class NumbersDict:
     self.max = self.__max_error
 
   def copy(self):
+    """
+    :rtype: NumbersDict
+    """
     return NumbersDict(self)
 
   @classmethod
@@ -1215,6 +1613,9 @@ class NumbersDict:
 
   @property
   def keys_set(self):
+    """
+    :rtype: set[str]
+    """
     return set(self.dict.keys())
 
   def __getitem__(self, key):
@@ -1229,10 +1630,20 @@ class NumbersDict:
     del self.dict[key]
 
   def get(self, key, default=None):
+    """
+    :param str key:
+    :param T default:
+    :rtype: object|T
+    """
     # Keep consistent with self.__get_item__. If self.value is set, this will always be the default value.
     return self.dict.get(key, self.value if self.value is not None else default)
 
   def pop(self, key, *args):
+    """
+    :param str key:
+    :param T args: default, or not
+    :rtype: object|T
+    """
     return self.dict.pop(key, *args)
 
   def __iter__(self):
@@ -1243,21 +1654,36 @@ class NumbersDict:
     raise Exception("%s.__iter__ is undefined" % self.__class__.__name__)
 
   def keys(self):
+    """
+    :rtype: set[str]
+    """
     return self.dict.keys()
 
   def values(self):
+    """
+    :rtype: list[object]
+    """
     return list(self.dict.values()) + ([self.value] if self.value is not None else [])
 
   def items(self):
     """
     :return: dict items. this excludes self.value
+    :rtype: str[(str,object)]
     """
     return self.dict.items()
 
   def has_values(self):
+    """
+    :rtype: bool
+    """
     return bool(self.dict) or self.value is not None
 
   def unary_op(self, op):
+    """
+    :param (T)->T2 op:
+    :return: new NumbersDict, where ``op`` is applied on all values
+    :rtype: NumbersDict
+    """
     res = NumbersDict()
     if self.value is not None:
       res.value = op(self.value)
@@ -1372,11 +1798,17 @@ class NumbersDict:
     :rtype: NumbersDict
     """
     def op(a, b):
+      """
+      :param a:
+      :param b:
+      :rtype: bool|None
+      """
       if a is None:
         return None
       if b is None:
         return None
       return a == b
+
     res = self.bin_op(self, other, op=op, zero=None)
     if not result_with_default:
       res.value = None
@@ -1528,9 +1960,16 @@ def collect_class_init_kwargs(cls, only_with_default=False):
 
 
 def getargspec(func):
+  """
+  :func:`inspect.getfullargspec` or `inspect.getargspec` (Python 2)
+
+  :param func:
+  :return: FullArgSpec
+  """
   if PY3:
     return inspect.getfullargspec(func)
   else:
+    # noinspection PyDeprecation
     return inspect.getargspec(func)
 
 
@@ -1568,6 +2007,13 @@ def help_on_type_error_wrong_args(cls, kwargs):
 
 
 def custom_exec(source, source_filename, user_ns, user_global_ns):
+  """
+  :param str source:
+  :param str source_filename:
+  :param dict[str] user_ns:
+  :param dict[str] user_global_ns:
+  :return: nothing
+  """
   if not source.endswith("\n"):
     source += "\n"
   co = compile(source, source_filename, "exec")
@@ -1576,6 +2022,10 @@ def custom_exec(source, source_filename, user_ns, user_global_ns):
 
 
 class FrozenDict(dict):
+  """
+  Frozen dict.
+  """
+
   def __setitem__(self, key, value):
     raise ValueError("FrozenDict cannot be modified")
 
@@ -1587,6 +2037,9 @@ def make_hashable(obj):
   """
   Theano needs hashable objects in some cases, e.g. the properties of Ops.
   This converts all objects as such, i.e. into immutable frozen types.
+
+  :param T|dict|list|tuple obj:
+  :rtype: T|FrozenDict|tuple
   """
   if isinstance(obj, dict):
     return FrozenDict([make_hashable(item) for item in obj.items()])
@@ -1601,6 +2054,11 @@ def make_hashable(obj):
 
 
 def make_dll_name(basename):
+  """
+  :param str basename:
+  :return: e.g. "lib%s.so" % basename, depending on sys.platform
+  :rtype: str
+  """
   if sys.platform == "darwin":
     return "lib%s.dylib" % basename
   elif sys.platform == "win32":
@@ -1610,10 +2068,21 @@ def make_dll_name(basename):
 
 
 def escape_c_str(s):
+  """
+  :param str s:
+  :return: C-escaped str
+  :rtype: str
+  """
   return '"%s"' % s.replace("\\\\", "\\").replace("\n", "\\n").replace("\"", "\\\"").replace("'", "\\'")
 
 
 def attr_chain(base, attribs):
+  """
+  :param object base:
+  :param list[str]|tuple[str]|str attribs:
+  :return: getattr(getattr(object, attribs[0]), attribs[1]) ...
+  :rtype: object
+  """
   if not isinstance(attribs, (list, tuple)):
     assert isinstance(attribs, str)
     attribs = [attribs]
@@ -1643,11 +2112,63 @@ def to_bool(v):
 
 
 def as_str(s):
+  """
+  :param str|unicode|bytes s:
+  :rtype: str|unicode
+  """
   if isinstance(s, str) or 'unicode' in str(type(s)):
     return s
   if isinstance(s, bytes) or isinstance(s, unicode):
+    # noinspection PyUnresolvedReferences
     return s.decode("utf8")
   assert False, "unknown type %s" % type(s)
+
+
+def py2_utf8_str_to_unicode(s):
+  """
+  :param str s: e.g. the string literal "äöü" in Python 3 is correct, but in Python 2 it should have been u"äöü",
+    but just using "äöü" will actually be the raw utf8 byte sequence.
+    This can happen when you eval() some string.
+    We assume that you are using Python 2, and got the string (not unicode object) "äöü", or maybe "abc".
+    Also see :func:`_py2_unicode_to_str_recursive` and :func:`as_str`.
+  :return: if it is indeed unicode, it will return the unicode object, otherwise it keeps the string
+  :rtype: str|unicode
+  """
+  assert not PY3
+  assert isinstance(s, str)
+  try:
+    # noinspection PyUnresolvedReferences
+    s.decode("ascii")
+    return s
+  except UnicodeDecodeError:
+    pass
+  # noinspection PyUnresolvedReferences
+  return s.decode("utf8")
+
+
+def unicode_to_str(s):
+  """
+  The behavior is different depending on Python 2 or Python 3. In all cases, the returned type is a str object.
+  Python 2:
+    We return the utf8 encoded str (which is like Python 3 bytes, or for ASCII, there is no difference).
+  Python 3:
+    We return a str object.
+  Note that this function probably does not make much sense.
+  It might be used when there is other code which expects a str object, no matter if Python 2 or Python 3.
+  In Python 2, a str object often holds UTF8 text, so the behavior of this function is fine then.
+  Also see :func:`as_str`.
+
+  :param str|unicode|bytes s:
+  :rtype: str
+  """
+  if PY3 and isinstance(s, bytes):
+    s = s.decode("utf8")
+    assert isinstance(s, str)
+  if not PY3 and isinstance(s, unicode):
+    s = s.encode("utf8")
+    assert isinstance(s, str)
+  assert isinstance(s, str)
+  return s
 
 
 def deepcopy(x):
@@ -1663,12 +2184,21 @@ def deepcopy(x):
   from TaskSystem import Pickler, Unpickler
 
   def pickle_dumps(obj):
+    """
+    :param object obj:
+    :rtype: bytes
+    """
     sio = BytesIO()
     p = Pickler(sio)
     p.dump(obj)
     return sio.getvalue()
 
+  # noinspection PyShadowingNames
   def pickle_loads(s):
+    """
+    :param bytes s:
+    :rtype: object
+    """
     p = Unpickler(BytesIO(s))
     return p.load()
 
@@ -1730,10 +2260,20 @@ class CollectionReadCheckCovered:
     return res
 
   def get(self, item, default=None):
+    """
+    :param str item:
+    :param T default:
+    :rtype: T|object|None
+    """
     try:
       return self[item]
     except KeyError:
       return default
+
+  def __bool__(self):  # Python 3
+    return self.truth_value
+
+  __nonzero__ = __bool__  # Python 2
 
   def __len__(self):
     return len(self.collection)
@@ -1743,6 +2283,9 @@ class CollectionReadCheckCovered:
       yield self[k]
 
   def assert_all_read(self):
+    """
+    Asserts that all items have been read.
+    """
     remaining = set(self.collection).difference(self.got_items)
     assert not remaining, "The keys %r were not read in the collection %r." % (remaining, self.collection)
 
@@ -1755,8 +2298,13 @@ def which(program):
   :return: full path, e.g. "/usr/bin/python", or None
   :rtype: str|None
   """
-  def is_exe(fpath):
-    return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+  # noinspection PyShadowingNames
+  def is_exe(path):
+    """
+    :param str path:
+    :rtype: str
+    """
+    return os.path.isfile(path) and os.access(path, os.X_OK)
 
   fpath, fname = os.path.split(program)
   if fpath:
@@ -1771,9 +2319,11 @@ def which(program):
 
   return None
 
+
 _original_execv = None
 _original_execve = None
 _original_execvpe = None
+
 
 def overwrite_os_exec(prefix_args):
   """
@@ -1785,21 +2335,37 @@ def overwrite_os_exec(prefix_args):
   if not _original_execve:
     _original_execve = os.execve
   if not _original_execvpe:
+    # noinspection PyProtectedMember
     _original_execvpe = os._execvpe
 
+  # noinspection PyUnusedLocal
   def wrapped_execvpe(file, args, env=None):
+    """
+    :param file:
+    :param list[str]|tuple[str] args:
+    :param dict[str] env:
+    """
     new_args = prefix_args + [which(args[0])] + args[1:]
     sys.stderr.write("$ %s\n" % " ".join(new_args))
     sys.stderr.flush()
     _original_execvpe(file=prefix_args[0], args=new_args, env=env)
 
   def execv(path, args):
+    """
+    :param str path:
+    :param list[str]|tuple[str] args:
+    """
     if args[:len(prefix_args)] == prefix_args:
       _original_execv(path, args)
     else:
       wrapped_execvpe(path, args)
 
   def execve(path, args, env):
+    """
+    :param str path:
+    :param list[str]|tuple[str] args:
+    :param dict[str] env:
+    """
     if args[:len(prefix_args)] == prefix_args:
       _original_execve(path, args, env)
     else:
@@ -1865,6 +2431,10 @@ def overwrite_os_exec(prefix_args):
 
 
 def get_lsb_release():
+  """
+  :return: ``/etc/lsb-release`` parsed as a dict
+  :rtype: dict[str,str]
+  """
   d = {}
   for l in open("/etc/lsb-release").read().splitlines():
     k, v = l.split("=", 1)
@@ -1912,7 +2482,12 @@ def cleanup_env_var_path(env_var, path_prefix):
   if env_var not in os.environ:
     return
   ps = os.environ[env_var].split(":")
+
   def f(p):
+    """
+    :param str p:
+    :rtype: bool
+    """
     if p == path_prefix or p.startswith(path_prefix + "/"):
       print("Removing %s from %s." % (p, env_var))
       return False
@@ -1948,6 +2523,10 @@ def get_temp_dir():
 
 
 class LockFile(object):
+  """
+  Simple lock file.
+  """
+
   def __init__(self, directory, name="lock_file", lock_timeout=1 * 60 * 60):
     """
     :param str directory:
@@ -1960,6 +2539,10 @@ class LockFile(object):
     self.lockfile = "%s/%s" % (directory, name)
 
   def is_old_lockfile(self):
+    """
+    :return: Whether there is an existing lock file and the existing lock file is old.
+    :rtype: bool
+    """
     try:
       mtime = os.path.getmtime(self.lockfile)
     except OSError:
@@ -1969,6 +2552,9 @@ class LockFile(object):
     return False
 
   def maybe_remove_old_lockfile(self):
+    """
+    Removes an existing old lockfile, if there is one.
+    """
     if not self.is_old_lockfile():
       return
     print("Removing old lockfile %r (probably crashed proc)." % self.lockfile)
@@ -1978,6 +2564,10 @@ class LockFile(object):
       print("Remove lockfile exception %r. Ignoring it." % exc)
 
   def is_locked(self):
+    """
+    :return: whether there is an active (not old) lockfile
+    :rtype: bool
+    """
     if self.is_old_lockfile():
       return False
     try:
@@ -1986,6 +2576,9 @@ class LockFile(object):
       return False
 
   def lock(self):
+    """
+    Acquires the lock.
+    """
     import time
     import errno
     wait_count = 0
@@ -2015,6 +2608,9 @@ class LockFile(object):
         print("Waiting for lock-file: %s" % self.lockfile)
 
   def unlock(self):
+    """
+    Releases the lock.
+    """
     os.close(self.fd)
     os.remove(self.lockfile)
 
@@ -2039,11 +2635,20 @@ def str_is_number(s):
 
 
 def sorted_values_from_dict(d):
+  """
+  :param dict[T,V] d:
+  :rtype: list[V]
+  """
   assert isinstance(d, dict)
   return [v for (k, v) in sorted(d.items())]
 
 
 def dict_zip(keys, values):
+  """
+  :param list[T] keys:
+  :param list[V] values:
+  :rtype: dict[T,V]
+  """
   assert len(keys) == len(values)
   return dict(zip(keys, values))
 
@@ -2051,23 +2656,24 @@ def dict_zip(keys, values):
 def parse_ld_conf_file(fn):
   """
   Via https://github.com/albertz/system-tools/blob/master/bin/find-lib-in-path.py.
+
   :param str fn: e.g. "/etc/ld.so.conf"
   :return: list of paths for libs
   :rtype: list[str]
   """
   from glob import glob
   paths = []
-  for l in open(fn).read().splitlines():
-    l = l.strip()
-    if not l:
+  for line in open(fn).read().splitlines():
+    line = line.strip()
+    if not line:
       continue
-    if l.startswith("#"):
+    if line.startswith("#"):
       continue
-    if l.startswith("include "):
-      for sub_fn in glob(l[len("include "):]):
+    if line.startswith("include "):
+      for sub_fn in glob(line[len("include "):]):
         paths.extend(parse_ld_conf_file(sub_fn))
       continue
-    paths.append(l)
+    paths.append(line)
   return paths
 
 
@@ -2137,11 +2743,11 @@ def read_sge_num_procs(job_id=None):
     if not job_id:
       return None
   from subprocess import Popen, PIPE, CalledProcessError
-  cmd = ["qstat", "-j", str(job_id)]
-  proc = Popen(cmd, stdout=PIPE)
+  sge_cmd = ["qstat", "-j", str(job_id)]
+  proc = Popen(sge_cmd, stdout=PIPE)
   stdout, _ = proc.communicate()
   if proc.returncode:
-    raise CalledProcessError(proc.returncode, cmd, stdout)
+    raise CalledProcessError(proc.returncode, sge_cmd, stdout)
   stdout = stdout.decode("utf8")
   ls = [l[len("hard resource_list:"):].strip() for l in stdout.splitlines() if l.startswith("hard resource_list:")]
   assert len(ls) == 1
@@ -2155,12 +2761,13 @@ def read_sge_num_procs(job_id=None):
 
 def get_number_available_cpus():
   """
-  :return: number of available GPUs, if we can figure it out
+  :return: number of available CPUs, if we can figure it out
   :rtype: int|None
   """
   if hasattr(os, "sched_getaffinity"):  # Python >=3.4
     return len(os.sched_getaffinity(0))
   try:
+    # noinspection PyPackageRequirements,PyUnresolvedReferences
     import psutil
     proc = psutil.Process()
     if hasattr(proc, "cpu_affinity"):
@@ -2175,6 +2782,11 @@ def get_number_available_cpus():
 
 
 def guess_requested_max_num_threads(log_file=None, fallback_num_cpus=True):
+  """
+  :param io.File log_file:
+  :param bool fallback_num_cpus:
+  :rtype: int|None
+  """
   try:
     sge_num_procs = read_sge_num_procs()
   except Exception as exc:
@@ -2196,12 +2808,121 @@ def guess_requested_max_num_threads(log_file=None, fallback_num_cpus=True):
   return None
 
 
-def try_and_ignore_exception(f):
+TheanoFlags = {
+  key: value for (key, value) in [s.split("=", 1) for s in os.environ.get("THEANO_FLAGS", "").split(",") if s]}
+
+
+def _consider_check_for_gpu():
+  """
+  There are cases where nvidia-smi could hang.
+  (Any read of /proc/modules might hang in that case, maybe caused
+   by trying to `modprobe nvidia` to check if there is a Nvidia card.)
+  This sometimes happens in our SGE cluster on nodes without Nvidia cards.
+  Maybe it's also a Linux Kernel bug.
+  Anyway, just avoid any such check if we don't asked for a GPU.
+
+  :rtype: bool
+  """
+  if "device" in TheanoFlags:
+    dev = TheanoFlags["device"]
+    if dev.startswith("gpu") or dev.startswith("cuda"):
+      return True
+    # THEANO_FLAGS will overwrite this config option. See rnn.initDevices().
+    return False
+  # noinspection PyBroadException
   try:
-    f()
+    from Config import get_global_config
+    config = get_global_config()
+  except Exception:
+    config = None
+  if config:
+    for dev in config.list('device', []):
+      if dev.startswith("gpu") or dev.startswith("cuda"):
+        return True
+      if dev == "all":
+        return True
+  return False
+
+
+def get_gpu_names():
+  """
+  :rtype: list[str]
+  """
+  if not _consider_check_for_gpu():
+    return []
+  if os.name == 'nt':
+    return "GeForce GTX 770"  # TODO
+  elif sys.platform == 'darwin':
+    # TODO parse via xml output
+    return cmd("system_profiler SPDisplaysDataType | "
+               "grep 'Chipset Model: NVIDIA' | "
+               "sed 's/.*Chipset Model: NVIDIA *//;s/ *$//'")
+  else:
+    try:
+      return cmd('nvidia-smi -L | cut -d \'(\' -f 1 | cut -d \' \' -f 3- | sed -e \'s/\\ $//\'')
+    except CalledProcessError:
+      return []
+
+
+def _get_num_gpu_devices():
+  """
+  :return: cpu,gpu
+  :rtype: (int,int)
+  """
+  if os.name == 'nt':
+    return 1, 1  # TODO
+  elif sys.platform == 'darwin':
+    return (
+      int(cmd("sysctl -a | grep machdep.cpu.core_count | awk '{print $2}'")[0]),
+      len(cmd("system_profiler SPDisplaysDataType | grep 'Chipset Model: NVIDIA' | cat")))
+  else:
+    num_cpus = len(cmd('cat /proc/cpuinfo | grep processor')) or 1
+    num_gpus = 0
+    if _consider_check_for_gpu():
+      try:
+        num_gpus = len(cmd('nvidia-smi -L'))
+      except CalledProcessError:
+        pass
+    return num_cpus, num_gpus
+
+
+_num_devices = None
+
+
+def get_num_gpu_devices():
+  """
+  :return: (cpu count, gpu count)
+  :rtype: (int, int)
+  """
+  global _num_devices
+  if _num_devices is not None:
+    return _num_devices
+  _num_devices = _get_num_gpu_devices()
+  return _num_devices
+
+
+def have_gpu():
+  """
+  :rtype: bool
+  """
+  cpus, gpus = get_num_gpu_devices()
+  return gpus > 0
+
+
+def try_and_ignore_exception(f):
+  """
+  Calls ``f``, and ignores any exception.
+
+  :param ()->T f:
+  :return: whatever ``f`` returns, or None
+  :rtype: T|None
+  """
+  try:
+    return f()
   except Exception as exc:
     print("try_and_ignore_exception: %r failed: %s" % (f, exc))
     sys.excepthook(*sys.exc_info())
+    return None
 
 
 def try_get_caller_name(depth=1, fallback=None):
@@ -2211,7 +2932,9 @@ def try_get_caller_name(depth=1, fallback=None):
   :rtype: str|None
   :return: caller function name. this is just for debugging
   """
+  # noinspection PyBroadException
   try:
+    # noinspection PyProtectedMember
     frame = sys._getframe(depth + 1)  # one more to count ourselves
     return frame.f_code.co_name
   except Exception:
@@ -2257,6 +2980,23 @@ def get_utc_start_time_filename_part():
   return time.strftime("%Y-%m-%d-%H-%M-%S", time.gmtime(start_time))
 
 
+def maybe_make_dirs(dirname):
+  """
+  Creates the directory if it does not yet exist.
+
+  :param str dirname: The path of the directory
+  """
+  import os
+  if not os.path.exists(dirname):
+    try:
+      os.makedirs(dirname)
+    except Exception as exc:
+      print("maybe_create_folder: exception creating dir:", exc)
+      # Maybe a concurrent process, e.g. tf.summary.FileWriter created it in the mean-while,
+      # so then it would be ok now if it exists, but fail if it does not exist.
+      assert os.path.exists(dirname)
+
+
 def log_runtime_info_to_dir(path, config):
   """
   This will write multiple logging information into the path.
@@ -2278,18 +3018,11 @@ def log_runtime_info_to_dir(path, config):
       "Path: %s" % (os.getcwd(),),
       "Hostname: %s" % get_hostname(),
       "PID: %i" % os.getpid(),
-      "Returnn: %s" % (describe_crnn_version(),),
+      "Returnn: %s" % (describe_returnn_version(),),
       "TensorFlow: %s" % (describe_tensorflow_version(),),
       "Config files: %s" % (config.files,),
     ]
-    if not os.path.exists(path):
-      try:
-        os.makedirs(path)
-      except Exception as exc:
-        print("log_runtime_info_to_dir: exception creating dir:", exc)
-        # Maybe a concurrent process, e.g. tf.summary.FileWriter created it in the mean-while,
-        # so then it would be ok now if it exists, but fail if it does not exist.
-        assert os.path.exists(path)
+    maybe_make_dirs(path)
     log_fn = "%s/returnn.%s.%s.%i.log" % (path, get_utc_start_time_filename_part(), hostname, os.getpid())
     if not os.path.exists(log_fn):
       with open(log_fn, "w") as f:
@@ -2327,7 +3060,7 @@ class NativeCodeCompiler(object):
   """
 
   CacheDirName = "returnn_native"
-  CollectedCompilers = None  # type: None|list[NativeCodeCompiler]
+  CollectedCompilers = None  # type: None|typing.List[NativeCodeCompiler]
 
   def __init__(self, base_name, code_version, code,
                is_cpp=True, c_macro_defines=None, ld_flags=None,
@@ -2438,15 +3171,23 @@ class NativeCodeCompiler(object):
       print("%s delete exception (%s). Will ignore and try to continue anyway." % (self.__class__.__name__, exc))
 
   def _load_info(self):
+    """
+    :rtype: dict[str]|None
+    """
     filename = self._info_filename
     if not os.path.exists(filename):
       return None
     s = open(filename).read()
-    return eval(s)
+    res = eval(s)
+    assert isinstance(res, dict)
+    return res
 
   _relevant_info_keys = ("code_version", "code_hash", "c_macro_defines", "ld_flags")
 
   def _make_info_dict(self):
+    """
+    :rtype: dict[str]
+    """
     return {
       "base_name": self.base_name,
       "include_paths": self._include_paths,
@@ -2458,25 +3199,28 @@ class NativeCodeCompiler(object):
 
   def _make_code_hash(self):
     import hashlib
-    hash = hashlib.md5()
-    hash.update(self.code.encode("utf8"))
-    return hash.hexdigest()
+    h = hashlib.md5()
+    h.update(self.code.encode("utf8"))
+    return h.hexdigest()
 
   def _make_hash(self):
     import hashlib
-    hash = hashlib.md5()
-    hash.update("{".encode("utf8"))
+    h = hashlib.md5()
+    h.update("{".encode("utf8"))
     for key in self._relevant_info_keys:
-      hash.update(("%s:{%s}" % (key, self._info_dict[key])).encode("utf8"))
-    hash.update("}".encode("utf8"))
-    return hash.hexdigest()
+      h.update(("%s:{%s}" % (key, self._info_dict[key])).encode("utf8"))
+    h.update("}".encode("utf8"))
+    return h.hexdigest()
 
   def _save_info(self):
     filename = self._info_filename
     with open(filename, "w") as f:
-      f.write("%s\n" % betterRepr(self._info_dict))
+      f.write("%s\n" % better_repr(self._info_dict))
 
   def _need_recompile(self):
+    """
+    :rtype: bool
+    """
     if not os.path.exists(self._so_filename):
       return True
     if self.include_deps:
@@ -2517,6 +3261,9 @@ class NativeCodeCompiler(object):
       self._maybe_compile_inner()
 
   def _get_compiler_bin(self):
+    """
+    :rtype: str
+    """
     if self.is_cpp:
       return "g++"
     return "gcc"
@@ -2573,6 +3320,9 @@ class NativeCodeCompiler(object):
     assert not self._need_recompile()
 
   def load_lib_ctypes(self):
+    """
+    :rtype: ctypes.CDLL
+    """
     if self._ctypes_lib:
       return self._ctypes_lib
     self._maybe_compile()
@@ -2581,6 +3331,9 @@ class NativeCodeCompiler(object):
     return self._ctypes_lib
 
   def get_lib_filename(self):
+    """
+    :rtype: str
+    """
     self._maybe_compile()
     return self._so_filename
 
@@ -2623,6 +3376,10 @@ void patch_atfork_init() {
 
 
 def get_patch_atfork_lib():
+  """
+  :return: path to our patch_atfork lib. see :func:`maybe_restart_returnn_with_atfork_patch`
+  :rtype: str
+  """
   native = NativeCodeCompiler(
     base_name="patch_atfork", code_version=2, code=_c_code_patch_atfork, is_cpp=False)
   fn = native.get_lib_filename()
@@ -2796,6 +3553,9 @@ def make_seq_of_type(cls, seq):
 
 @contextlib.contextmanager
 def dummy_noop_ctx():
+  """
+  Provides a no-op context manager.
+  """
   yield None
 
 
@@ -2862,7 +3622,7 @@ def compute_bleu(reference_corpus,
     for ngram in translation_ngram_counts:
       possible_matches_by_order[len(ngram) - 1] += translation_ngram_counts[ngram]
 
-  precisions = [0] * max_order
+  precisions = [0.0] * max_order
   smooth = 1.0
   for i in range(0, max_order):
     if possible_matches_by_order[i] > 0:
@@ -2905,6 +3665,7 @@ def monkeyfix_glib():
   try:
     from gi.repository import GLib
   except ImportError:
+    # noinspection PyUnresolvedReferences
     from gi.overrides import GLib
   # Do nothing.
   # The original behavior would install a SIGINT handler which calls GLib.MainLoop.quit(),
@@ -2930,14 +3691,17 @@ def monkeypatch_audioread():
   https://github.com/librosa/librosa/issues/681
   """
   try:
+    # noinspection PyPackageRequirements
     import audioread
   except ImportError:
     return
+  # noinspection PyProtectedMember
   res = audioread._ca_available()
   audioread._ca_available = lambda: res
 
 
 _cf_cache = {}
+
 
 def cf(filename):
   """
@@ -3025,9 +3789,14 @@ def generic_import_module(filename):
 
 
 def softmax(x, axis=None):
-    import numpy
-    e_x = numpy.exp(x - numpy.max(x, axis=axis, keepdims=True))
-    return e_x / numpy.sum(e_x, axis=axis, keepdims=True)
+  """
+  :param numpy.ndarray x:
+  :param int|None axis:
+  :rtype: numpy.ndarray
+  """
+  import numpy
+  e_x = numpy.exp(x - numpy.max(x, axis=axis, keepdims=True))
+  return e_x / numpy.sum(e_x, axis=axis, keepdims=True)
 
 
 def collect_proc_maps_exec_files():
@@ -3071,9 +3840,9 @@ def find_sym_in_exec(fn, sym):
   objdump = "objdump -T"
   if sys.platform == "darwin":
     objdump = "otool -IHGv"
-  cmd = "%s %s | grep %s" % (objdump, fn, sym)
+  shell_cmd = "%s %s | grep %s" % (objdump, fn, sym)
   try:
-    out = sysexecOut(cmd, shell=True)
+    out = sysexec_out(shell_cmd, shell=True)
   except CalledProcessError:  # none found
     return None
   assert isinstance(out, (str, unicode))
@@ -3086,6 +3855,10 @@ def find_sym_in_exec(fn, sym):
 
 
 def dummy_numpy_gemm_call():
+  """
+  Just performs some GEMM call via Numpy.
+  This makes sure that the BLAS library is loaded.
+  """
   import numpy
   a = numpy.random.randn(5, 3).astype(numpy.float32)
   b = numpy.random.randn(3, 7).astype(numpy.float32)

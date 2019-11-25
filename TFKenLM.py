@@ -11,7 +11,14 @@ import tensorflow as tf
 returnn_dir = os.path.dirname(os.path.abspath(__file__))
 kenlm_dir = returnn_dir + "/extern/kenlm"
 
-# https://www.tensorflow.org/extend/adding_an_op
+
+def kenlm_checked_out():
+  """
+  :rtype: bool
+  """
+  return os.path.exists("%s/lm/test.arpa" % kenlm_dir)
+
+# https://www.tensorflow.org/guide/extend/op
 # Also see TFUitl.TFArrayContainer for TF resources.
 # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/tensor.h
 # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/tensor_shape.h
@@ -335,6 +342,10 @@ _tf_mod = None
 
 
 def get_tf_mod(verbose=False):
+  """
+  :param bool verbose:
+  :return: module
+  """
   global _tf_mod
   if _tf_mod:
     return _tf_mod
@@ -347,6 +358,7 @@ def get_tf_mod(verbose=False):
   # https://github.com/kpu/kenlm/blob/master/compile_query_only.sh
 
   # Collect files.
+  assert kenlm_checked_out(), "submodule in %r not checked out?" % kenlm_dir
   files = glob('%s/util/*.cc' % kenlm_dir)
   files += glob('%s/lm/*.cc' % kenlm_dir)
   files += glob('%s/util/double-conversion/*.cc' % kenlm_dir)
@@ -447,4 +459,3 @@ if __name__ == "__main__":
     output_scores = session.run(output_scores_tf, feed_dict={input_strings_tf: input_strings})
     print("input strings:", input_strings, "(sys.argv[1:])")
     print("output scores:", output_scores)
-
