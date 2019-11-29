@@ -3577,6 +3577,7 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     if self.feature_extractor:
       self.num_outputs["data"] = [self.num_inputs, 2]
     self.transs = self._collect_trans()
+    print("DEBUG {}".format(len(self.transs)))
     self._reference_seq_order = sorted(self.transs.keys())
     if fixed_random_subset:
       if 0 < fixed_random_subset < 1:
@@ -3645,7 +3646,9 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
           if opts.get("subdirs") is not None:
             subdirs = opts.get("subdirs", None)
             assert isinstance(subdirs, list)
+            print("DEBUG Len of _seq_order {}".format(len(self._seq_order)))
             self._seq_order = [idx for idx in self._seq_order if self._reference_seq_order[idx][0] in subdirs]
+            print("DEBUG Len of _seq_order subdirs {} ".format(len(self._seq_order)))
             assert self._seq_order, "subdir filter %r invalid?" % (subdirs,)
           if opts.get("use_new_filter"):
             if "subdirs" in opts.collection:
@@ -3688,9 +3691,9 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
         continue
       subdir = os.path.basename(subdir)  # e.g. "train-clean-100"
       if self.prefix=="train":
-        fn_list = glob("%s/%s/*.trans.txt" % (self.path, subdir)) 
+        fn_list = glob("%s/%s/*trans.txt" % (self.path, subdir)) 
       elif self.prefix=="dev":
-        fn_list = glob("%s/%s/*.trans.txt" % (self.path, subdir))
+        fn_list = glob("%s/%s/*trans.txt" % (self.path, subdir))
       for fn in fn_list:
         subsubdir = os.path.basename(os.path.dirname(fn))
         for l in open(fn, encoding='utf-8').read().splitlines():
@@ -4115,8 +4118,6 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
       zero_padding = 0.2 #in seconds
       zero_pad = np.zeros((int(zero_padding*sample_rate),))
       audio_padded = np.append(audio, zero_pad)
-      print("DEBUG",type(audio), audio.shape, len(audio) ,sample_rate)
-      print("DEBUG",type(audio_padded), audio_padded.shape, len(audio_padded) ,sample_rate)
     #features = self.feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
     features = self.feature_extractor.get_audio_features(audio=audio_padded, sample_rate=sample_rate)
     bpe, txt = self._get_transcription(seq_idx)
