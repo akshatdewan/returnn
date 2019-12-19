@@ -544,9 +544,13 @@ def execute_main_task():
     print("Server Initiating", file=log.v1)
     server.run()
   elif task == "search_server":
+    import multiprocessing
     engine.use_search_flag = True
     engine.init_network_from_config(config)
-    engine.web_server(port=config.int("web_server_port", 12380))
+    p1 = multiprocessing.Process(name='p1', target=engine.web_server(port=config.int("web_server_port", 12380)))
+    p2 = multiprocessing.Process(name='p1', target=engine.web_server_http(port=config.int("web_server_port", 12382)))
+    #engine.web_server(port=config.int("web_server_port", 12380))
+    #engine.web_server_http(port=config.int("web_server_port", 12380))
   elif task.startswith("config:"):
     action = config.typed_dict[task[len("config:"):]]
     print("Task: %r" % action, file=log.v1)
