@@ -544,11 +544,26 @@ def execute_main_task():
     print("Server Initiating", file=log.v1)
     server.run()
   elif task == "search_server":
-    import multiprocessing
     engine.use_search_flag = True
     engine.init_network_from_config(config)
-    p1 = multiprocessing.Process(name='p1', target=engine.web_server(port=config.int("web_server_port", 12380)))
-    p2 = multiprocessing.Process(name='p1', target=engine.web_server_http(port=config.int("web_server_port", 12382)))
+    import threading
+    threads = []
+    t1 = threading.Thread(name='stream_server', target=engine.web_server, args=(12380,), daemon=True)
+    threads.append(t1)
+    t1.start()
+    t2 = threading.Thread(name='file_server', target=engine.web_server_http, args=(12382,), daemon=True)
+    threads.append(t2)
+    t2.start()
+    t1.join()
+    t2.join()
+    #import multiprocessing
+    #jobs = []
+    #p1 = multiprocessing.Process(name='p1', target=engine.web_server, args=(12380,)) #(port=config.int("web_server_port", 12380)))
+    #p2 = multiprocessing.Process(name='p2', target=engine.web_server_http, args=(12382,)) #(port=config.int("web_server_port", 12382)))
+    #jobs.append(p1)
+    #jobs.append(p2)
+    #p1.start()
+    #p2.start()
     #engine.web_server(port=config.int("web_server_port", 12380))
     #engine.web_server_http(port=config.int("web_server_port", 12380))
   elif task.startswith("config:"):
