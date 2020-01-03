@@ -2388,7 +2388,6 @@ class Engine(EngineBase):
         # we can now use e.g. readline() instead of raw recv() calls
         while True:
           try:
-            print("processing data")
             audio_bytes = self.rfile.read(MSGLEN)
             import struct
             byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
@@ -2406,9 +2405,9 @@ class Engine(EngineBase):
               "beam_scores": output_layer_beam_scores_t})
             delta_time = time.time() - start_time
             audio_len = float(len(audio)) / sample_rate
-            print("Took %.3f secs for decoding." % delta_time, file=log.v4)
-            if audio_len:
-              print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+            #print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+            #if audio_len:
+              #print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
             output = output_d["output"]
             seq_lens = output_d["seq_lens"]
             beam_scores = output_d["beam_scores"]
@@ -2516,10 +2515,13 @@ class Engine(EngineBase):
           sys.excepthook(*sys.exc_info())
           raise
 
+      def log_message(self, format, *args):
+          return
+
       def _do_POST_raw_audio(self):
         content_length = int(self.headers.get('Content-Length',0))
         if content_length is not None:
-            print(self.headers)
+            #print(self.headers)
             #print("HTTP server, got POST.", file=log.v3)
             audio_bytes = self.rfile.read(int(content_length))
             import struct
@@ -2538,9 +2540,9 @@ class Engine(EngineBase):
               "beam_scores": output_layer_beam_scores_t})
             delta_time = time.time() - start_time
             audio_len = float(len(audio)) / sample_rate
-            print("Took %.3f secs for decoding." % delta_time, file=log.v4)
-            if audio_len:
-              print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+            #print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+            #if audio_len:
+              #print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
             output = output_d["output"]
             seq_lens = output_d["seq_lens"]
             beam_scores = output_d["beam_scores"]
@@ -2557,10 +2559,10 @@ class Engine(EngineBase):
           fp=self.rfile,
           headers=self.headers,
           environ={'REQUEST_METHOD': 'POST'})
-        print("HTTP server, got POST.", file=log.v3)
+        #print("HTTP server, got POST.", file=log.v3)
         from io import BytesIO
         f = BytesIO(form["file"].file.read())
-        print("Input file size:", len(f.getbuffer().tobytes()), "bytes", file=log.v4)
+        #print("Input file size:", len(f.getbuffer().tobytes()), "bytes", file=log.v4)
         audio_len = None
         if input_audio_feature_extractor:
           try:
@@ -2573,15 +2575,15 @@ class Engine(EngineBase):
               exc, len(f.getbuffer().tobytes()), f.getbuffer().tobytes()[:20]), file=log.v2)
             raise
           audio_len = float(len(audio)) / sample_rate
-          print("audio len %i (%.1f secs), sample rate %i" % (len(audio), audio_len, sample_rate), file=log.v4)
+          #print("audio len %i (%.1f secs), sample rate %i" % (len(audio), audio_len, sample_rate), file=log.v4)
           if audio.ndim == 2:  # multiple channels:
             audio = numpy.mean(audio, axis=1)  # mix together
           features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
         else:
           sentence = f.read().decode("utf8").strip()
-          print("Input:", sentence, file=log.v4)
+          #print("Input:", sentence, file=log.v4)
           seq = input_vocab.get_seq(sentence)
-          print("Input seq:", input_vocab.get_seq_labels(seq), file=log.v4)
+          #print("Input seq:", input_vocab.get_seq_labels(seq), file=log.v4)
           features = numpy.array(seq, dtype="int32")
         targets = numpy.array([], dtype="int32")  # empty...
         dataset = StaticDataset(
@@ -2597,9 +2599,9 @@ class Engine(EngineBase):
           "seq_lens": output_seq_lens_t,
           "beam_scores": output_layer_beam_scores_t})
         delta_time = time.time() - start_time
-        print("Took %.3f secs for decoding." % delta_time, file=log.v4)
-        if audio_len:
-          print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+        #print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+        #if audio_len:
+          #print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
         output = output_d["output"]
         seq_lens = output_d["seq_lens"]
         beam_scores = output_d["beam_scores"]
@@ -2608,18 +2610,19 @@ class Engine(EngineBase):
           assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
 
         first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
-        print("Best output: %s" % first_best_txt, file=log.v4)
+        #print("Best output: %s" % first_best_txt, file=log.v4)
 
-        if out_beam_size:
-          self.wfile.write(b"[\n")
-          for i in range(out_beam_size):
-            txt = output_vocab.get_seq_labels(output[i][:seq_lens[i]])
-            score = beam_scores[0][i]
-            self.wfile.write(("(%r, %r)\n" % (score, txt)).encode("utf8"))
-          self.wfile.write(b"]\n")
+        #if out_beam_size:
+        #  self.wfile.write(b"[\n")
+        #  for i in range(out_beam_size):
+        #    txt = output_vocab.get_seq_labels(output[i][:seq_lens[i]])
+        #    score = beam_scores[0][i]
+        #    self.wfile.write(("(%r, %r)\n" % (score, txt)).encode("utf8"))
+        #  self.wfile.write(b"]\n")
 
-        else:
-          self.wfile(("%r\n" % first_best_txt).encode("utf8"))
+        #else:
+        #  self.wfile(("%r\n" % first_best_txt).encode("utf8"))
+        self.wfile.write(("%r\n" % first_best_txt).encode("utf8"))
 
     print("Simple search web server, listening on port %i." % port, file=log.v2)
     server_address = ('', port)
