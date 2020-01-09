@@ -2311,7 +2311,7 @@ class Engine(EngineBase):
       numpy.savetxt(f, log_average_posterior, delimiter=' ')
     print("Saved prior in %r in +log space." % output_file, file=log.v1)
   
-  def web_server(self, port):
+  def web_server_streaming_search(self, port):
     """
     Starts a socket server 
     (or search if the flag is set).
@@ -2345,7 +2345,6 @@ class Engine(EngineBase):
       import soundfile  # pip install pysoundfile
       bpe_opts = self.config.typed_dict["dev"]["bpe"]
       audio_opts = self.config.typed_dict["dev"]["audio"]
-      print(audio_opts)
       bpe = BytePairEncoding(**bpe_opts)
       assert output_data.sparse
       assert bpe.num_labels == output_data.dim
@@ -2382,56 +2381,149 @@ class Engine(EngineBase):
       """
 
       def handle(self):
-        print("received connection from {}".format(self.client_address))
-        MSGLEN=32000
-        # self.rfile is a file-like object created by the handler;
-        # we can now use e.g. readline() instead of raw recv() calls
-        while True:
-          try:
-            audio_bytes = self.rfile.read(MSGLEN)
-            import struct
-            byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
-            audio = struct.unpack(byte_pattern, audio_bytes)
-            sample_rate=16000
-            targets = numpy.array([], dtype="int32")  # empty...
-            features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
-            dataset = StaticDataset(
-              data=[{input_data.name: features, output_data.name: targets}], output_dim=num_outputs)
-            dataset.init_seq_order(epoch=1)
-            start_time = time.time()
-            output_d = engine.run_single(dataset=dataset, seq_idx=0, output_dict={
-              "output": output_t,
-              "seq_lens": output_seq_lens_t,
-              "beam_scores": output_layer_beam_scores_t})
-            delta_time = time.time() - start_time
-            audio_len = float(len(audio)) / sample_rate
-            #print("Took %.3f secs for decoding." % delta_time, file=log.v4)
-            #if audio_len:
-              #print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
-            output = output_d["output"]
-            seq_lens = output_d["seq_lens"]
-            beam_scores = output_d["beam_scores"]
-            assert len(output) == len(seq_lens) == (out_beam_size or 1)
-            if out_beam_size:
-              assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
-            first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
-            print("Best output: %s" % first_best_txt, file=log.v4)
+        print("Streaming search server received connection from {}".format(self.client_address))
+        MSGLEN = 32000
+        output_filename = '/data/s2t/streaming_output.txt'
+        with open(output_filename, 'w', encoding='utf-8') as op_fh:
+            # self.rfile is a file-like object created by the handler;
+            # we can now use e.g. readline() instead of raw recv() calls
+            while True:
+              try:
+                audio_bytes = self.rfile.read(MSGLEN)
+                import struct
+                byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
+                audio = struct.unpack(byte_pattern, audio_bytes)
+                sample_rate=16000
+                targets = numpy.array([], dtype="int32")  # empty...
+                features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+                dataset = StaticDataset(
+                  data=[{input_data.name: features, output_data.name: targets}], output_dim=num_outputs)
+                dataset.init_seq_order(epoch=1)
+                start_time = time.time()
+                output_d = engine.run_single(dataset=dataset, seq_idx=0, output_dict={
+                  "output": output_t,
+                  "seq_lens": output_seq_lens_t,
+                  "beam_scores": output_layer_beam_scores_t})
+                delta_time = time.time() - start_time
+                audio_len = float(len(audio)) / sample_rate
+                #print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+                #if audio_len:
+                  #print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+                output = output_d["output"]
+                seq_lens = output_d["seq_lens"]
+                beam_scores = output_d["beam_scores"]
+                assert len(output) == len(seq_lens) == (out_beam_size or 1)
+                if out_beam_size:
+                  assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
+                first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
+                first_best_txt_detokenized = first_best_txt.replace("@@ ","")
+                print("Best output: %s" % first_best_txt_detokenized, file=log.v4)
+                op_fh.write("{}\n".format(first_best_txt_detokenized))
 
-          except struct.error as err:
-            return
-          except:
-            raise
-            return
+              except struct.error as err:
+                return
+              except:
+                raise
+                return
     
     HOST, PORT = "0.0.0.0", port
 
     # Create the server, binding to localhost on specified port 
-    print("Socket server running on port no.  {}".format(PORT))
+    print("Streaming search server running on port no.  {}".format(PORT))
     server = socketserver.TCPServer((HOST, PORT), MyTCPHandler)
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
     server.serve_forever()
 
+
+  def web_server_batch_search(self, port):
+    """
+    Starts a web-server with a simple API to run search() on a given dataset
+
+    :param int port: for the http server
+    :return:
+    """
+    assert sys.version_info[0] >= 3, "only Python 3 supported"
+    # noinspection PyCompatibility
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from GeneratingDataset import StaticDataset, Vocabulary, BytePairEncoding, ExtractAudioFeatures
+
+    engine = self
+    config = self.config
+    soundfile = None
+    input_data = self.network.extern_data.get_default_input_data()
+    input_vocab = input_data.vocab
+    input_audio_feature_extractor = None
+    output_data = self.network.extern_data.get_default_target_data()
+    output_vocab = output_data.vocab
+    if (isinstance(self.config.typed_dict.get("dev", None), dict)
+            and self.config.typed_dict["dev"]["class"] == "LibriWipoEUCorpus"):
+      # A bit hacky. Assumes that this is a dataset description for e.g. LibriSpeechCorpus.
+      # noinspection PyPackageRequirements,PyUnresolvedReferences
+      import soundfile  # pip install pysoundfile
+      bpe_opts = self.config.typed_dict["dev"]["bpe"]
+      audio_opts = self.config.typed_dict["dev"]["audio"]
+      bpe = BytePairEncoding(**bpe_opts)
+      assert output_data.sparse
+      assert bpe.num_labels == output_data.dim
+      output_vocab = bpe
+      input_audio_feature_extractor = ExtractAudioFeatures(**audio_opts)
+    else:
+      assert isinstance(input_vocab, Vocabulary)
+    assert isinstance(output_vocab, Vocabulary)
+    num_outputs = {
+      input_data.name: [input_data.dim, input_data.ndim],
+      output_data.name: [output_data.dim, output_data.ndim]}
+
+    output_layer_name = self.config.value("search_output_layer", "output")
+    output_layer = self.network.layers[output_layer_name]
+    output_t = output_layer.output.get_placeholder_as_batch_major()
+    output_seq_lens_t = output_layer.output.get_sequence_lengths()
+    out_beam_size = output_layer.output.beam.beam_size
+    output_layer_beam_scores_t = None
+    if out_beam_size is None:
+      print("Given output %r is after decision (no beam)." % output_layer, file=log.v1)
+    else:
+      print("Given output %r has beam size %i." % (output_layer, out_beam_size), file=log.v1)
+      output_layer_beam_scores_t = output_layer.get_search_choices().beam_scores
+
+    class Handler(BaseHTTPRequestHandler):
+
+      def do_POST(self):
+        """
+        Handle POST request.
+        """
+        try:
+          self._do_post()
+        except Exception:
+          sys.excepthook(*sys.exc_info())
+          raise
+
+      #def log_message(self, format, *args):
+      #    return
+
+      def _do_post(self):
+        import json
+        content_len = int(self.headers.get('Content-Length'))
+        post_body = json.loads(self.rfile.read(content_len).decode('utf-8'))
+        print("HTTP server batch search, got POST.", file=log.v3)
+        engine.use_search_flag = True
+        from Dataset import init_dataset
+        data = init_dataset("config:get_dataset('demo')")
+        engine.search(
+          data,
+          do_eval=config.bool("search_do_eval", True),
+          output_layer_names=config.typed_value("search_output_layer", "output"),
+          output_file=config.value("search_output_file", ""),
+          output_file_format=config.value("search_output_file_format", "txt"))
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+
+    print("Batch search web server, listening on port %i." % port, file=log.v2)
+    server_address = ('', port)
+    self.httpd = HTTPServer(server_address, Handler)
+    self.httpd.serve_forever()
 
   def web_server_http(self, port):
     """
