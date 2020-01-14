@@ -2422,7 +2422,7 @@ class Engine(EngineBase):
                 command_line_1 = 'echo ' + first_best_txt_debpe
                 args_1 = shlex.split(command_line_1)
                 p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
-                command_line_2 = '/data/smt/bin/Detokenizer -en_c '
+                command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
                 args_2 = shlex.split(command_line_2)
                 p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
                 p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
