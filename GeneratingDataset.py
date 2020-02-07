@@ -2356,12 +2356,7 @@ class LibriSpeechCorpus(CachedDataset2):
         if not os.path.isdir(subdir):
           continue
         subdir = os.path.basename(subdir)  # e.g. "train-clean-100"
-        #for fn in glob("%s/%s/*/*/*.trans.txt" % (self.path, subdir)):
-        if self.prefix=="train":
-            fn_list = [self.path+'/'+subdir+'/libri/train/wav/libri_train.trans.txt']
-        elif self.prefix=="dev":
-            fn_list = [self.path+'/'+subdir+'/libri/val/wav/libri_dev.trans.txt']
-        for fn in fn_list:
+        for fn in glob("%s/%s/*trans.txt" % (self.path, subdir)):
             for l in open(fn).read().splitlines():
               seq_name, txt = l.split(" ", 1)
               speaker_id, chapter_id, seq_id = map(int, seq_name.split("-"))
@@ -2370,6 +2365,7 @@ class LibriSpeechCorpus(CachedDataset2):
               transs[(subdir, speaker_id, chapter_id, seq_id)] = txt
       assert transs, "did not found anything %s/%s*" % (self.path, self.prefix)
     assert transs
+    print(len(transs))
     return transs
 
   def init_seq_order(self, epoch=None, seq_list=None):
@@ -2535,10 +2531,10 @@ class LibriSpeechCorpus(CachedDataset2):
     import zipfile
     subdir, speaker_id, chapter_id, seq_id = self._reference_seq_order[self._get_ref_seq_idx(seq_idx)]
     if self.prefix=="train":
-        audio_fn = "%(sd)s/libri/train/wav/%(sp)i-%(ch)i-%(i)04i.wav" % {
+        audio_fn = "%(sd)s/%(sp)i-%(ch)i-%(i)04i.wav" % {
           "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
     if self.prefix=="dev":
-        audio_fn = "%(sd)s/libri/val/wav/%(sp)i-%(ch)i-%(i)04i.wav" % {
+        audio_fn = "%(sd)s/%(sp)i-%(ch)i-%(i)04i.wav" % {
           "sd": subdir, "sp": speaker_id, "ch": chapter_id, "i": seq_id}
     if self.use_ogg:
       audio_fn += ".ogg"
@@ -3548,7 +3544,7 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     self.path = path
     self.prefix = prefix
 
-    assert prefix.split("-")[0] in ["train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
+    assert prefix.split("-")[0] in ["train", "dev", "demo", "test", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern, test_ilo"]
 
     self.orth_post_process = None
     if orth_post_process:
@@ -3577,7 +3573,7 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     if self.feature_extractor:
       self.num_outputs["data"] = [self.num_inputs, 2]
     self.transs = self._collect_trans()
-    print("DEBUG {}".format(len(self.transs)))
+    #print("DEBUG {}".format(len(self.transs)))
     self._reference_seq_order = sorted(self.transs.keys())
     if fixed_random_subset:
       if 0 < fixed_random_subset < 1:
@@ -3646,9 +3642,9 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
           if opts.get("subdirs") is not None:
             subdirs = opts.get("subdirs", None)
             assert isinstance(subdirs, list)
-            print("DEBUG Len of _seq_order {}".format(len(self._seq_order)))
+            #print("DEBUG Len of _seq_order {}".format(len(self._seq_order)))
             self._seq_order = [idx for idx in self._seq_order if self._reference_seq_order[idx][0] in subdirs]
-            print("DEBUG Len of _seq_order subdirs {} ".format(len(self._seq_order)))
+            #print("DEBUG Len of _seq_order subdirs {} ".format(len(self._seq_order)))
             assert self._seq_order, "subdir filter %r invalid?" % (subdirs,)
           if opts.get("use_new_filter"):
             if "subdirs" in opts.collection:
@@ -3689,11 +3685,36 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     for subdir in glob("%s/%s*" % (self.path, self.prefix)):
       if not os.path.isdir(subdir):
         continue
+      #tagged=".tagged"
+      tagged=""
       subdir = os.path.basename(subdir)  # e.g. "train-clean-100"
       if self.prefix=="train":
-        fn_list = glob("%s/%s/*trans.txt" % (self.path, subdir)) 
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged)) 
       elif self.prefix=="dev":
-        fn_list = glob("%s/%s/*trans.txt" % (self.path, subdir))
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="demo":
+        fn_list = [self.path + '/' + subdir + '/demo.trans.txt']
+      elif self.prefix=="dev-cern":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="dev-unesco":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="dev-unog":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="dev-ilo":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="dev-wipo":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="test-cern":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="test-unesco":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="test-unog":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="test-wipo":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+      elif self.prefix=="test-ilo":
+        fn_list = glob("%s/%s/*trans.txt%s" % (self.path, subdir, tagged))
+
       for fn in fn_list:
         subsubdir = os.path.basename(os.path.dirname(fn))
         for l in open(fn, encoding='utf-8').read().splitlines():
@@ -3760,6 +3781,26 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     if self.prefix=="train" and "train" in subdir:
         audio_fn = "%s/%s" % (subdir, audio_fn)
     if self.prefix=="dev" and "dev" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev-cern" and "dev" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev-unesco" and "dev" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev-unog" and "dev" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev-wipo" and "dev" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev-ilo" and "dev" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="test-ilo" and "test" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="test-cern" and "test" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="test-wipo" and "test" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="test-unog" and "test" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="test-unesco" and "test" in subdir:
         audio_fn = "%s/%s" % (subdir, audio_fn)
     audio_fn = "%s/%s" % (self.path, audio_fn)
     assert os.path.exists(audio_fn.encode('utf-8')) #filenames with utf-8
@@ -3838,9 +3879,7 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     self.path = path
     self.prefix = prefix
 
-    assert prefix.split("-")[0] in ["train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
-    assert os.path.exists(path + "/train")
-    assert os.path.exists(path + "/dev")
+    assert prefix.split("-")[0] in ["test", "train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
 
     self.orth_post_process = None
     if orth_post_process:
@@ -3908,14 +3947,28 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
         fn_list = [self.path + '/dev_unog' + '/unog_dev.trans.txt']
       elif self.prefix=="dev_wipo":
         fn_list = [self.path + '/dev_wipo' + '/wipo_val.trans.txt']
+      elif self.prefix=="dev_ilo":
+        fn_list = [self.path + '/dev_ilo' + '/ilo_dev.trans.txt']
+      elif self.prefix=="dev-ilo":
+        fn_list = [self.path + '/dev-ilo' + '/ilo_dev.trans.txt']
       elif self.prefix=="test_cern":
         fn_list = [self.path + '/test_cern' + '/cern_test.trans.txt']
+      elif self.prefix=="test-cern":
+        fn_list = [self.path + '/test-cern' + '/cern_test.trans.txt']
       elif self.prefix=="test_unesco":
         fn_list = [self.path + '/test_unesco' + '/unesco_test.trans.txt']
+      elif self.prefix=="test-unesco":
+        fn_list = [self.path + '/test-unesco' + '/unesco_test.trans.txt']
       elif self.prefix=="test_unog":
         fn_list = [self.path + '/test_unog' + '/unog_test.trans.txt']
+      elif self.prefix=="test-unog":
+        fn_list = [self.path + '/test-unog' + '/unog_test.trans.txt']
       elif self.prefix=="test_wipo":
         fn_list = [self.path + '/test_wipo' + '/wipo_test.trans.txt']
+      elif self.prefix=="test-wipo":
+        fn_list = [self.path + '/test-wipo' + '/wipo_test.trans.txt']
+      elif self.prefix=="test-ilo":
+        fn_list = [self.path + '/test-ilo' + '/ilo_test.trans.txt']
       for fn in fn_list:
         subsubdir = os.path.basename(os.path.dirname(fn))
         for l in open(fn, encoding='utf-8').read().splitlines():
@@ -4086,6 +4139,10 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
       audio_fn = "%s/%s" % (subdir, audio_fn)
     if self.prefix=="dev_wipo":
       audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev_ilo":
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="dev-ilo":
+      audio_fn = "%s/%s" % (subdir, audio_fn)
     if self.prefix=="test_cern":
       audio_fn = "%s/%s" % (subdir, audio_fn)
     if self.prefix=="test_unog":
@@ -4093,6 +4150,10 @@ class CernEULibriUnescoUnogWipoCorpus(CachedDataset2):
     if self.prefix=="test_unesco":
       audio_fn = "%s/%s" % (subdir, audio_fn)
     if self.prefix=="test_wipo":
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="test-wipo":
+      audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="test-ilo":
       audio_fn = "%s/%s" % (subdir, audio_fn)
     audio_fn = "%s/%s" % (self.path, audio_fn)
     assert os.path.exists(audio_fn.encode('utf-8')) #filenames with utf-8
