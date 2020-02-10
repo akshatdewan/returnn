@@ -3802,6 +3802,8 @@ class SpecAugCernEULibriUnescoUnogWipoCorpus(CachedDataset2):
         audio_fn = "%s/%s" % (subdir, audio_fn)
     if self.prefix=="test-unesco" and "test" in subdir:
         audio_fn = "%s/%s" % (subdir, audio_fn)
+    if self.prefix=="demo" and "demo" in subdir:
+        audio_fn = "%s/%s" % (subdir, audio_fn)
     audio_fn = "%s/%s" % (self.path, audio_fn)
     assert os.path.exists(audio_fn.encode('utf-8')) #filenames with utf-8
     return open(audio_fn.encode('utf-8'), "rb")
