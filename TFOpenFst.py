@@ -70,6 +70,7 @@ _src_code = """
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/public/version.h"
 
 using namespace tensorflow;
 
@@ -114,7 +115,11 @@ struct OpenFstInstance : public ResourceBase {
     delete fst_;
   }
 
-  string DebugString() override {
+  string DebugString()
+#if (TF_MAJOR_VERSION == 1 && TF_MINOR_VERSION >= 14) || (TF_MAJOR_VERSION > 1)
+const
+#endif
+  override {
     return strings::StrCat("OpenFstInstance[", filename_, "]");
   }
 
@@ -310,10 +315,10 @@ def _demo():
   # Some demo.
   assert os.path.exists(args.fst)
   fst_tf = get_fst(filename=args.fst)
-  states_tf = tf.placeholder(tf.int32, [None])
-  inputs_tf = tf.placeholder(tf.int32, [None])
+  states_tf = tf.compat.v1.placeholder(tf.int32, [None])
+  inputs_tf = tf.compat.v1.placeholder(tf.int32, [None])
   output_tf = fst_transition(fst_handle=fst_tf, states=states_tf, inputs=inputs_tf)
-  with tf.Session() as session:
+  with tf.compat.v1.Session() as session:
     out_next_states, out_labels, out_scores = session.run(
       output_tf, feed_dict={
         states_tf: args.states, inputs_tf: args.inputs})

@@ -1,14 +1,15 @@
 
 """
-This is here so that whole RETURNN can be imported as a submodule.
+This is here so that whole RETURNN can be imported as a submodule,
+i.e. modules can be imported relatively (``import returnn.TFUtil`` or so).
+
+Currently all of RETURNN is written with absolute imports.
+This probably should be changed, see also: https://github.com/rwth-i6/returnn/issues/162
+If we change that to relative imports, for some of the scripts we might need some solution like this:
+https://stackoverflow.com/questions/54576879/
+
+Anyway, as a very ugly workaround, to make it possible to import RETURNN as a package, we have this hack:
 """
-
-# Currently all of RETURNN is written with absolute imports.
-# This probably should be changed, see also: https://github.com/rwth-i6/returnn/issues/162
-# If we change that to relative imports, for some of the scripts we might need some solution like this:
-# https://stackoverflow.com/questions/54576879/
-
-# Anyway, as a very ugly workaround, to make it possible to import RETURNN as a package, we have this hack:
 
 
 from __future__ import absolute_import
@@ -26,6 +27,10 @@ _my_dir = _os.path.dirname(_os.path.abspath(__file__))
 _mod_cache = {}  # mod_name -> mod
 
 
+from .setup import get_version_str as _get_version_str
+__version__ = _get_version_str(fallback="1.0.0")
+
+
 def _setup():
   """
   This does the setup, such that all the modules become available in the `returnn` package.
@@ -35,15 +40,21 @@ def _setup():
   import sys
 
   for fn in sorted(os.listdir(_my_dir)):
-    mod_name, ext = os.path.splitext(os.path.basename(fn))
-    if ext != ".py":
-      continue
+    if os.path.isdir("%s/%s" % (_my_dir, fn)) and os.path.exists("%s/%s/__init__.py" % (_my_dir, fn)):
+      mod_name = fn
+    else:
+      mod_name, ext = os.path.splitext(fn)
+      if ext != ".py":
+        continue
     if mod_name.startswith("__"):
       continue
     if mod_name in sys.modules:
       # This is difficult to get right.
       # We will just use the existing module. Print a warning.
-      print("RETURNN import warning: module %r already imported as an absolute module" % mod_name)
+      if int(os.environ.get("DEBUG_RETURNN_IMPORT", "0")):
+        print("RETURNN import warning: module %r already imported as an absolute module" % mod_name)
+        import better_exchook
+        better_exchook.print_tb(None)
       mod = sys.modules[mod_name]
     else:
       mod = _LazyLoader(mod_name)
@@ -58,8 +69,15 @@ class _LazyLoader(_types.ModuleType):
   Code borrowed from TensorFlow, and simplified, and extended.
   """
   def __init__(self, name):
+    """
+    :param str name:
+    """
     super(_LazyLoader, self).__init__(name)
-    self.__file__ = "%s/%s.py" % (_my_dir, name)
+    fn = "%s/%s.py" % (_my_dir, name)
+    if not _os.path.exists(fn):
+      fn = "%s/%s/__init__.py" % (_my_dir, name)
+      assert _os.path.exists(fn)
+    self.__file__ = fn
 
   def _load(self):
     name = self.__name__

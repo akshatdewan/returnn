@@ -11,6 +11,7 @@ import tensorflow as tf
 from threading import RLock
 
 import NativeOp
+import TFCompat
 import TFUtil
 from Util import camel_case_to_snake_case
 
@@ -209,7 +210,9 @@ class OpMaker(object):
       """
       if isinstance(c, tuple):
         in_idx_, in_dim = c
-        return "c->Dim(c->input(%i), %i)" % (in_idx_, in_dim)
+        dim_if_def = "c->Dim(c->input(%i), %i)" % (in_idx_, in_dim)
+        def_check = "c->RankKnown(c->input(%i))" % in_idx_
+        return "%s ? %s : c->UnknownDim()" % (def_check, dim_if_def)
       elif isinstance(c, int):
         return str(c)
       else:
@@ -227,6 +230,8 @@ class OpMaker(object):
         i, ", ".join([make_dim_str(c) for c in v["shape"]]))
     code_register_op_io += """
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
+      if(!c)
+        return errors::InvalidArgument("undefined context (mismatch in C++ ABI?)");
       if(c->num_inputs() != %(num_inputs)i)
         return errors::InvalidArgument("wrong number of inputs. required %(num_inputs)i but got ", c->num_inputs());
       if(c->num_outputs() != %(num_outputs)i)
@@ -243,7 +248,12 @@ class OpMaker(object):
     for in_idx, v in enumerate(in_info):
       out_idx = v.get("want_inplace", -1)
       if out_idx >= 0:
-        code_forward_io += "context->forward_ref_input_to_ref_output(%i, %i);\n" % (in_idx, out_idx)
+        code_forward_io += """
+          // Note: forward_ref_input_to_ref_output expects the input tensor to be a reference, and not a value;
+          //   otherwise it will trigger an assertion.
+          if (IsRefType(context->input_dtype({in_idx})))
+            context->forward_ref_input_to_ref_output({in_idx}, {out_idx});
+          """.format(in_idx=in_idx, out_idx=out_idx)
     code_set_io = ""
     for in_idx, v in enumerate(in_info):
       ndim = len(v["shape"])
@@ -385,7 +395,7 @@ class OpMaker(object):
     if self.description.cpu_support:
       code_cpu_op = """
       %(user_code_kernels)s
-  
+
       class %(op_name)sOp : public OpKernel {
       public:
         explicit %(op_name)sOp(OpKernelConstruction* context) : OpKernel(context) {}
@@ -393,7 +403,7 @@ class OpMaker(object):
           %(code_compute)s
         }
       };
-  
+
       REGISTER_KERNEL_BUILDER(Name("%(op_name)s").Device(DEVICE_CPU), %(op_name)sOp);
       """ % format_args
     else:
@@ -731,7 +741,7 @@ class NativeLstmCell(RecSeqCellOp):
     :returns: shape (time,batch,n_hidden), shape (batch,n_hidden)
     :rtype: (tf.Tensor, tf.Tensor)
     """
-    rec_weights = tf.get_variable(
+    rec_weights = TFCompat.v1.get_variable(
       name="W_re", shape=(self.n_hidden, self.n_hidden * 4), initializer=recurrent_weights_initializer)
     TFUtil.set_param_axes_split_info(rec_weights, [[self.n_hidden], [self.n_hidden] * 4])
     out, _, final_state = self.op(
@@ -791,9 +801,9 @@ class NativeLstmLowMemCell(RecSeqCellOp):
     :returns: shape (time,batch,n_hidden), shape (batch,n_hidden)
     :rtype: (tf.Tensor, tf.Tensor)
     """
-    weights = tf.get_variable(
+    weights = TFCompat.v1.get_variable(
       name="W", shape=(self.n_input_dim + self.n_hidden, self.n_hidden * 4), initializer=recurrent_weights_initializer)
-    b = tf.get_variable(name="b", shape=(self.n_hidden * 4,), initializer=tf.zeros_initializer())
+    b = TFCompat.v1.get_variable(name="b", shape=(self.n_hidden * 4,), initializer=tf.zeros_initializer())
     TFUtil.set_param_axes_split_info(weights, [[self.n_input_dim, self.n_hidden], [self.n_hidden] * 4])
     TFUtil.set_param_axes_split_info(b, [[self.n_hidden] * 4])
     out, _, final_state = self.op(
@@ -834,7 +844,7 @@ class NativeLstm2(RecSeqCellOp):
     :rtype: (tf.Tensor, tf.Tensor)
     """
     from tensorflow.python.ops.nn import rnn_cell
-    weights = tf.get_variable(
+    weights = TFCompat.v1.get_variable(
       name="W_re", shape=(self.n_hidden, self.n_hidden * 4), initializer=recurrent_weights_initializer)
     TFUtil.set_param_axes_split_info(weights, [[self.n_hidden], [self.n_hidden] * 4])
     if self.rec_weight_dropout:
@@ -954,11 +964,11 @@ class TwoDNativeLstmCell(RecSeqCellOp):
     :returns: shape (src_len, batch, n_hidden), shape(trg_len, src_len, batch, n_hidden), shape (trg_len, src_len, batch, n_hidden*5)
     :rtype: (tf.Tensor, tf.Tensor)
     """
-    Vh_re = tf.get_variable(
+    Vh_re = TFCompat.v1.get_variable(
       name="Vh_re", shape=(self.n_hidden, self.n_hidden * 5), initializer=recurrent_weights_initializer)
-    Vv_re = tf.get_variable(
+    Vv_re = TFCompat.v1.get_variable(
       name="Vv_re", shape=(self.n_hidden, self.n_hidden * 5), initializer=recurrent_weights_initializer)
-    W_re = tf.get_variable(
+    W_re = TFCompat.v1.get_variable(
       name="W_re", shape=(self.n_input_dim, self.n_hidden * 5), initializer=recurrent_weights_initializer)
     TFUtil.set_param_axes_split_info(W_re, [[self.n_input_dim], [self.n_hidden] * 5])
 
@@ -1020,7 +1030,7 @@ class TwoDNativeLstmCell(RecSeqCellOp):
 
     def weighted_pooling(src_mask, out_complete, target):
       trg_features = target.shape[2]
-      W_att = tf.get_variable(  # (trg_features, n_hidden)
+      W_att = TFCompat.v1.get_variable(  # (trg_features, n_hidden)
         name="W_att", shape=(trg_features, self.n_hidden), initializer=recurrent_weights_initializer)
 
       # if we assume the following shapes:
@@ -1210,7 +1220,7 @@ def tf_fast_bw_fsa_staircase(seq_lens, **opts):
       fsa.start_end_states.shape, len(seq_lens_), seq_lens_)
     return fsa.edges.astype("int32"), fsa.weights.astype("float32"), fsa.start_end_states.astype("int32")
 
-  edges, weights, start_end_states = tf.py_func(
+  edges, weights, start_end_states = TFCompat.v1.py_func(
     py_fast_bw_fsa_staircase_wrapper,
     [seq_lens],
     [tf.int32, tf.float32, tf.int32],
@@ -1224,7 +1234,7 @@ def tf_fast_bw_fsa_staircase(seq_lens, **opts):
   return edges, weights, start_end_states
 
 
-def get_ctc_fsa_fast_bw(targets, seq_lens, blank_idx):
+def get_ctc_fsa_fast_bw(targets, seq_lens, blank_idx, label_loop=True):
   """
   See :class:`NativeOp.GetCtcFsaFastBwOp`.
   Generates a FSA with CTC topology. The output format is compatible to :func:`fast_baum_welch`.
@@ -1232,6 +1242,7 @@ def get_ctc_fsa_fast_bw(targets, seq_lens, blank_idx):
   :param tf.Tensor targets: shape (batch,time), int32
   :param tf.Tensor seq_lens: shape (batch), int32
   :param int blank_idx:
+  :param bool label_loop: True -> normal CTC; False -> RNA-like
   :return: edges, weights, start_end_states;
     edges is (4,num_edges), int32, edges of the graph (from,to,emission_idx,sequence_idx).
     weights is (num_edges,), float32. all zero.
@@ -1240,13 +1251,14 @@ def get_ctc_fsa_fast_bw(targets, seq_lens, blank_idx):
   """
   assert targets.get_shape().ndims == 2
   targets_shape = tf.shape(targets)
+  targets = tf.cast(targets, tf.int32)
   n_batch = targets_shape[0]
   n_time = targets_shape[1]
   n_edges = n_batch * (5 * (n_time - 1) + 10)  # see op documentation
   weights = tf.zeros((n_edges,))
   maker = OpMaker(OpDescription.from_gen_base(NativeOp.GetCtcFsaFastBwOp))
   op = maker.make_op()
-  edges, start_end_states = op(targets, seq_lens, blank_idx, weights)
+  edges, start_end_states = op(targets, seq_lens, blank_idx, weights, label_loop)
   return edges, weights, start_end_states
 
 
@@ -1265,7 +1277,8 @@ def fast_baum_welch_staircase(am_scores, seq_lens, **opts):
     am_scores=am_scores, edges=edges, weights=weights, start_end_states=start_end_states, float_idx=float_idx)
 
 
-def ctc_loss(logits, logits_seq_lens, logits_time_major, targets, targets_seq_lens):
+def ctc_loss(logits, logits_seq_lens, logits_time_major, targets, targets_seq_lens,
+             ctc_merge_repeated=True, logits_normalize=True, grad_wrt_softmax_in=True):
   """
   Similar to :func:`tf.nn.ctc_loss`.
   We use our :func:`fast_baum_welch`.
@@ -1276,6 +1289,13 @@ def ctc_loss(logits, logits_seq_lens, logits_time_major, targets, targets_seq_le
   :param bool logits_time_major:
   :param tf.Tensor targets: batch-major, [batch,time]
   :param tf.Tensor targets_seq_lens: (batch,)
+  :param bool ctc_merge_repeated:
+  :param bool logits_normalize: apply log_softmax on logits (default).
+    if False, you might also set grad_wrt_softmax_in=False
+  :param bool grad_wrt_softmax_in: assume ``p(s|x) = softmax(logits)``, and define the gradient w.r.t. logits.
+    This is ``p(s|x) - bw``, where ``bw`` is the Baum-Welch soft alignment.
+    If logits are already normalized (e.g. we just use ``log p(s|x) = logits``),
+    the error signal to logits should be ``-bw``.
   :return: loss, shape (batch,)
   :rtype: tf.Tensor
   """
@@ -1283,19 +1303,26 @@ def ctc_loss(logits, logits_seq_lens, logits_time_major, targets, targets_seq_le
   dim = logits.get_shape().dims[-1].value
   if not logits_time_major:
     logits = tf.transpose(logits, [1, 0, 2])  # (time,batch,dim)
-  log_sm = tf.nn.log_softmax(logits)  # (time,batch,dim)
-  from TFUtil import sequence_mask_time_major
+  if logits_normalize:
+    log_sm = tf.nn.log_softmax(logits)  # (time,batch,dim)
+  else:
+    log_sm = logits
+  from TFUtil import sequence_mask_time_major, where_bc
   seq_mask = sequence_mask_time_major(logits_seq_lens)  # (time,batch)
 
   edges, weights, start_end_states = get_ctc_fsa_fast_bw(
-    targets=targets, seq_lens=targets_seq_lens, blank_idx=dim - 1)
+    targets=targets, seq_lens=targets_seq_lens, blank_idx=dim - 1, label_loop=ctc_merge_repeated)
   fwdbwd, obs_scores = fast_baum_welch(
     am_scores=-log_sm, float_idx=seq_mask,
     edges=edges, weights=weights, start_end_states=start_end_states)
   loss = obs_scores[0]  # (batch,)
   n_batch = tf.shape(loss)[0]
   bw = tf.exp(-fwdbwd)  # (time,batch,dim)
-  grad_x = (tf.exp(log_sm) - bw) * tf.cast(tf.expand_dims(seq_mask, 2), tf.float32)  # (time,batch,dim)
+  if grad_wrt_softmax_in:
+    grad_x = tf.exp(log_sm) - bw  # (time,batch,dim)
+  else:
+    grad_x = -bw  # (time,batch,dim)
+  grad_x = where_bc(seq_mask[:, :, None], grad_x, 0.0)
   from TFUtil import custom_gradient
   loss = tf.reshape(loss, [1, n_batch, 1])  # (1,batch,1), such that we can broadcast to logits/grad_x
   loss = custom_gradient.generic_loss_and_error_signal(loss=loss, x=logits, grad_x=grad_x)
@@ -1436,7 +1463,7 @@ def next_edit_distance_row(last_row, a, a_n, a_ended, b, b_len):
 
   :param tf.Tensor last_row: 2d (batch,b_time + 1), int32. last edit distances
   :param tf.Tensor a: symbols. 1d (batch,), int32. current.
-  :param tf.Tensor a_n: scalar, int32. current position
+  :param tf.Tensor a_n: scalar or 1d (batch,), int32. current position
   :param tf.Tensor a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
   :param tf.Tensor b: symbols. 2d (batch,b_time), int32
   :param tf.Tensor b_len: 1d (batch,), int32
@@ -1444,6 +1471,8 @@ def next_edit_distance_row(last_row, a, a_n, a_ended, b, b_len):
   :rtype: tf.Tensor
   """
   a_ended = tf.cast(a_ended, tf.int32)
+  if a_n.shape.ndims == 0:
+    a_n = tf.tile(tf.expand_dims(a_n, 0), tf.shape(a_ended))
   maker = OpMaker(OpDescription.from_gen_base(NativeOp.NextEditDistanceRowOp))
   op = maker.make_op()
   return op(last_row, a, a_n, a_ended, b, b_len)
@@ -1499,25 +1528,31 @@ def edit_distance_via_next_edit_distance_row(a, a_len, b, b_len, optimal_complet
       return tf.reduce_min(final_row, axis=1)
 
 
-def next_edit_distance_reduce(last_row, a, a_n, a_ended, b, b_len, optimal_completion=False):
+def next_edit_distance_reduce(last_row, a, a_n, a_ended, b, b_len, optimal_completion=False, a_blank_idx=None):
   """
   Wraps :class:`NativeOp.NextEditDistanceReduceOp`.
 
   :param tf.Tensor last_row: 2d (batch,b_time + 1), int32. last edit distances
   :param tf.Tensor a: symbols. 2d (batch|1,n_labels), int32. current.
-  :param tf.Tensor a_n: scalar, int32. current position
+  :param tf.Tensor a_n: scalar or 1d (batch,), int32. current position
   :param tf.Tensor a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
   :param tf.Tensor b: symbols. 2d (batch,b_time), int32
   :param tf.Tensor b_len: 1d (batch,), int32
+  :param tf.Tensor|int|None a_blank_idx: scalar, int32
   :param bool|tf.Tensor optimal_completion:
   :return: 2d (batch,n_labels), int32, next (unnormalized) (optimal completion) edit distance
   :rtype: tf.Tensor
   """
   optimal_completion = tf.cast(tf.convert_to_tensor(optimal_completion), tf.int32)
   a_ended = tf.cast(a_ended, tf.int32)
+  if a_n.shape.ndims == 0:
+    a_n = tf.tile(tf.expand_dims(a_n, 0), tf.shape(a_ended))
+  if a_blank_idx is None:
+    a_blank_idx = -1
+  a_blank_idx = tf.cast(a_blank_idx, tf.int32)
   maker = OpMaker(OpDescription.from_gen_base(NativeOp.NextEditDistanceReduceOp))
   op = maker.make_op()
-  return op(last_row, a, a_n, a_ended, b, b_len, optimal_completion)
+  return op(last_row, a, a_n, a_ended, b, b_len, optimal_completion, a_blank_idx)
 
 
 def optimal_completion_edit_distance_per_successor_via_next_edit_distance(a, a_len, b, b_len, successors):
@@ -1561,7 +1596,7 @@ def _debug_dumped_fast_baum_welch(prefix, postfix=".dump"):
   :rtype: (numpy.ndarray. numpy.ndarray)
   """
   with tf.Graph().as_default() as graph:
-    with tf.Session(graph=graph) as session:
+    with TFCompat.v1.Session(graph=graph) as session:
       arg_names = {
         "am_scores": None, "edges": None, "weights": None, "start_end_states": None, "float_idx": "index",
         "state_buffer": None}
@@ -1587,6 +1622,9 @@ def have_blocksparse_requirements():
     return False
   min_compute_capability = TFUtil.get_available_gpu_min_compute_capability()
   if min_compute_capability < 3.5:
+    return False
+  path = os.path.dirname(__file__) + "/extern/blocksparse/blocksparse"
+  if not os.path.exists(path):  # not checked out?
     return False
   return True
 
