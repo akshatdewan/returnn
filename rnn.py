@@ -555,8 +555,10 @@ def execute_main_task():
     engine.use_search_flag = True
     engine.init_network_from_config(config)
     import threading
+    port = config.int("port", 12380)
+    msglen = config.int("msglen", 32000)
     threads = []
-    t1 = threading.Thread(name='stream_server', target=engine.web_server_streaming_search, args=(12380,), daemon=True)
+    t1 = threading.Thread(name='stream_server', target=engine.web_server_streaming_search, args=(port,msglen), daemon=True)
     threads.append(t1)
     t1.start()
     #t2 = threading.Thread(name='batch_server', target=engine.web_server_batch_search, args=(12382,), daemon=True)

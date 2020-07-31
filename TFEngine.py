@@ -2434,7 +2434,7 @@ class Engine(EngineBase):
       numpy.savetxt(f, log_average_posterior, delimiter=' ')
     print("Saved prior in %r in +log space." % output_file, file=log.v1)
   
-  def web_server_streaming_search(self, port):
+  def web_server_streaming_search(self, port, msglen):
     """
     Starts a socket server 
     (or search if the flag is set).
@@ -2505,7 +2505,9 @@ class Engine(EngineBase):
 
       def handle(self):
         print("Streaming search server received connection from {}".format(self.client_address))
-        MSGLEN = 32000
+        sample_rate=16000
+        #MSGLEN = 32000
+        MSGLEN = msglen
         output_filename = '/data/s2t/streaming_output/op.txt'
         with open(output_filename, 'w', encoding='utf-8') as op_fh:
             # self.rfile is a file-like object created by the handler;
@@ -2517,7 +2519,6 @@ class Engine(EngineBase):
                 import shlex, subprocess
                 byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
                 audio = struct.unpack(byte_pattern, audio_bytes)
-                sample_rate=16000
                 targets = numpy.array([], dtype="int32")  # empty...
                 features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
                 dataset = StaticDataset(
