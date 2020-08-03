@@ -2507,7 +2507,7 @@ class Engine(EngineBase):
         print("Streaming search server received connection from {}".format(self.client_address))
         sample_rate=16000
         #MSGLEN = 32000
-        MSGLEN = msglen
+        MSGLEN = self.server.msglen
         output_filename = '/data/s2t/streaming_output/op.txt'
         with open(output_filename, 'w', encoding='utf-8') as op_fh:
             # self.rfile is a file-like object created by the handler;
@@ -2566,6 +2566,8 @@ class Engine(EngineBase):
     # Create the server, binding to localhost on specified port 
     print("Streaming search server running on port no.  {}".format(PORT))
     server = socketserver.TCPServer((HOST, PORT), MyTCPHandler)
+    server.msglen=msglen
+    print("MSGLEN is  {}".format(server.msglen))
     # Activate the server; this will keep running until you
     # interrupt the program with Ctrl-C
     server.serve_forever()
