@@ -2515,6 +2515,9 @@ class Engine(EngineBase):
             while True:
               try:
                 audio_bytes = self.rfile.read(MSGLEN)
+                print("{} bytes read".format(MSGLEN))
+                print("{} bytes left".format(self.rfile))
+                time.sleep(1)
                 import struct
                 import shlex, subprocess
                 byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
@@ -2541,7 +2544,7 @@ class Engine(EngineBase):
                 if out_beam_size:
                   assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
                 first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
-                first_best_txt_debpe = first_best_txt.replace("@@ ","")
+                first_best_txt_debpe = first_best_txt.replace("@@ ","").replace("'", "\\'")
                 print("Best output: %s" % first_best_txt_debpe, file=log.v4)
                 command_line_1 = 'echo ' + first_best_txt_debpe
                 args_1 = shlex.split(command_line_1)
