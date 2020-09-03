@@ -2515,8 +2515,8 @@ class Engine(EngineBase):
             while True:
               try:
                 audio_bytes = self.rfile.read(MSGLEN)
-                print("{} bytes read".format(MSGLEN))
-                print("{} bytes left".format(self.rfile))
+                #print("{} bytes read".format(MSGLEN))
+                #print("{} bytes left".format(self.rfile))
                 time.sleep(1)
                 import struct
                 import shlex, subprocess
@@ -2554,8 +2554,9 @@ class Engine(EngineBase):
                 p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
                 p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
                 first_best_txt_detokenized = p_2.communicate()[0]
-                op_fh.write("{}\n".format(first_best_txt_detokenized))
-                op_fh.flush()
+                if not first_best_txt_detokenized[:-1] == "Thank you":
+                    op_fh.write("{}\n".format(first_best_txt_detokenized))
+                    op_fh.flush()
                 
 
               except struct.error as err:
