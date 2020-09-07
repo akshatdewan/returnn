@@ -2545,16 +2545,16 @@ class Engine(EngineBase):
                   assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
                 first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
                 first_best_txt_debpe = first_best_txt.replace("@@ ","").replace("'", "\\'")
-                print("Best output: %s" % first_best_txt_debpe, file=log.v4)
-                command_line_1 = 'echo ' + first_best_txt_debpe
-                args_1 = shlex.split(command_line_1)
-                p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
-                command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
-                args_2 = shlex.split(command_line_2)
-                p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
-                p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
-                first_best_txt_detokenized = p_2.communicate()[0]
-                if not first_best_txt_detokenized[:-1] == "Thank you":
+                if not first_best_txt_debpe[:-1] == "Thank you ":
+                    print("Best output: %s" % first_best_txt_debpe, file=log.v4)
+                    command_line_1 = 'echo ' + first_best_txt_debpe
+                    args_1 = shlex.split(command_line_1)
+                    p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
+                    command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
+                    args_2 = shlex.split(command_line_2)
+                    p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
+                    p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+                    first_best_txt_detokenized = p_2.communicate()[0]
                     op_fh.write("{}\n".format(first_best_txt_detokenized))
                     op_fh.flush()
                 
