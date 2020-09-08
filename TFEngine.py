@@ -2555,7 +2555,8 @@ class Engine(EngineBase):
                     p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
                     p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
                     first_best_txt_detokenized = p_2.communicate()[0]
-                    op_fh.write("{}\n".format(first_best_txt_detokenized))
+                    op_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                    #op_fh.write("{}\n".format(first_best_txt_detokenized))
                     op_fh.flush()
                 
 
