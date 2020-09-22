@@ -2507,8 +2507,12 @@ class Engine(EngineBase):
         print("Streaming search server received connection from {}".format(self.client_address))
         sample_rate=16000
         #MSGLEN = 32000
+        #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
         MSGLEN = self.server.msglen
-        output_filename = '/data/s2t/streaming_output/op.txt'
+        from time import gmtime, strftime
+        time_string = strftime("%Y-%m-%d--%H-%M-%S--%Z", gmtime())
+
+        output_filename = '/data/s2t/streaming_output/'+str(self.client_address[0])+'--'+str(self.client_address[1]) + '--' + time_string + '.txt'
         with open(output_filename, 'w', encoding='utf-8') as op_fh:
             # self.rfile is a file-like object created by the handler;
             # we can now use e.g. readline() instead of raw recv() calls
@@ -2517,9 +2521,27 @@ class Engine(EngineBase):
                 audio_bytes = self.rfile.read(MSGLEN)
                 #print("{} bytes read".format(MSGLEN))
                 #print("{} bytes left".format(self.rfile))
-                time.sleep(1)
+                #time.sleep(1)
                 import struct
                 import shlex, subprocess
+                ###################
+                #import webrtcvad
+                #import s_nos
+                #aggressiveness=3
+                #vad = webrtcvad.Vad(aggressiveness)
+
+                #def pairwise(iterable):
+                #    "s -> (s0, s1), (s2, s3), (s4, s5), ..."
+                #    a = iter(iterable)
+                #    return zip(a, a)
+                
+                #samples=[]
+                #for i,audio_byte in enumerate(audio_bytes[::2]):
+                #    samples.append(int.from_bytes(audio_bytes[i:i+2],"big"))
+                #print(samples)
+                #is_speech =  vad.is_speech(audio_bytes, sample_rate)
+                #print('2 ' if is_speech else '0 ')
+
                 byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
                 audio = struct.unpack(byte_pattern, audio_bytes)
                 targets = numpy.array([], dtype="int32")  # empty...
@@ -2556,7 +2578,6 @@ class Engine(EngineBase):
                     p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
                     first_best_txt_detokenized = p_2.communicate()[0]
                     op_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                    #op_fh.write("{}\n".format(first_best_txt_detokenized))
                     op_fh.flush()
                 
 
