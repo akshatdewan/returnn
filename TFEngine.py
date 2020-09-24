@@ -2507,6 +2507,7 @@ class Engine(EngineBase):
         print("Streaming search server received connection from {}".format(self.client_address))
         sample_rate=16000
         #MSGLEN = 32000
+        #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
         MSGLEN = self.server.msglen
         output_filename_combined = '/data/s2t/streaming_output/op.txt'
         from time import gmtime, strftime
@@ -2525,6 +2526,24 @@ class Engine(EngineBase):
                 #time.sleep(1)
                 import struct
                 import shlex, subprocess
+                ###################
+                #import webrtcvad
+                #import s_nos
+                #aggressiveness=3
+                #vad = webrtcvad.Vad(aggressiveness)
+
+                #def pairwise(iterable):
+                #    "s -> (s0, s1), (s2, s3), (s4, s5), ..."
+                #    a = iter(iterable)
+                #    return zip(a, a)
+                
+                #samples=[]
+                #for i,audio_byte in enumerate(audio_bytes[::2]):
+                #    samples.append(int.from_bytes(audio_bytes[i:i+2],"big"))
+                #print(samples)
+                #is_speech =  vad.is_speech(audio_bytes, sample_rate)
+                #print('2 ' if is_speech else '0 ')
+
                 byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
                 audio = struct.unpack(byte_pattern, audio_bytes)
                 targets = numpy.array([], dtype="int32")  # empty...
@@ -2565,8 +2584,6 @@ class Engine(EngineBase):
                     #op_fh.write("{}\n".format(first_best_txt_detokenized))
                     op_ind_fh.flush()
                     op_com_fh.flush()
-                
-
               except struct.error as err:
                 return
               except:
