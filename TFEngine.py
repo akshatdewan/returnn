@@ -2508,8 +2508,13 @@ class Engine(EngineBase):
         sample_rate=16000
         #MSGLEN = 32000
         MSGLEN = self.server.msglen
-        output_filename = '/data/s2t/streaming_output/op.txt'
-        with open(output_filename, 'w', encoding='utf-8') as op_fh:
+        output_filename_combined = '/data/s2t/streaming_output/op.txt'
+        from time import gmtime, strftime
+        time_string = strftime("%Y-%m-%d--%H-%M-%S--%Z", gmtime())
+
+        output_filename_individual = '/data/s2t/streaming_output/'+str(self.client_address[0])+'--'+str(self.client_address[1]) + '--' + time_string + '.txt'
+
+        with open(output_filename_individual, 'w', encoding='utf-8') as op_ind_fh, open(output_filename_combined, 'a+', encoding='utf-8') as op_com_fh:
             # self.rfile is a file-like object created by the handler;
             # we can now use e.g. readline() instead of raw recv() calls
             while True:
@@ -2517,7 +2522,7 @@ class Engine(EngineBase):
                 audio_bytes = self.rfile.read(MSGLEN)
                 #print("{} bytes read".format(MSGLEN))
                 #print("{} bytes left".format(self.rfile))
-                time.sleep(1)
+                #time.sleep(1)
                 import struct
                 import shlex, subprocess
                 byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
@@ -2555,9 +2560,11 @@ class Engine(EngineBase):
                     p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
                     p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
                     first_best_txt_detokenized = p_2.communicate()[0]
-                    op_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                    op_ind_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                    op_com_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
                     #op_fh.write("{}\n".format(first_best_txt_detokenized))
-                    op_fh.flush()
+                    op_ind_fh.flush()
+                    op_com_fh.flush()
                 
 
               except struct.error as err:
