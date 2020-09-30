@@ -2509,7 +2509,8 @@ class Engine(EngineBase):
         #MSGLEN = 32000
         #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
         MSGLEN = self.server.msglen
-        output_filename_combined = '/data/s2t/streaming_output/op.txt'
+        #output_filename_combined = '/data/s2t/streaming_output/op.txt'
+        output_filename_combined = '/data/smt/webroot/s2t/s2t_live/data/op.txt'
         from time import gmtime, strftime
         time_string = strftime("%Y-%m-%d--%H-%M-%S--%Z", gmtime())
 
