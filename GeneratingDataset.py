@@ -3047,17 +3047,17 @@ class CernEULibriUnescoUnogWipoCorpus_with_domain_tags_op(CachedDataset2):
     self.prefix = prefix
 
     assert prefix.split("-")[0] in ["train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
-    assert os.path.exists(path + "/train/libri")
-    assert os.path.exists(path + "/train/wipo_train")
-    assert os.path.exists(path + "/train/eu_parl")
-    assert os.path.exists(path + "/train/cern")
-    assert os.path.exists(path + "/train/unog")
-    assert os.path.exists(path + "/train/unesco")
-    assert os.path.exists(path + "/dev/")
-    assert os.path.exists(path + "/dev/unog")
-    assert os.path.exists(path + "/dev/unesco")
-    assert os.path.exists(path + "/dev/wipo")
-    assert os.path.exists(path + "/dev/cern")
+    #assert os.path.exists(path + "/train/libri")
+    #assert os.path.exists(path + "/train/wipo_train")
+    #assert os.path.exists(path + "/train/eu_parl")
+    #assert os.path.exists(path + "/train/cern")
+    #assert os.path.exists(path + "/train/unog")
+    #assert os.path.exists(path + "/train/unesco")
+    #assert os.path.exists(path + "/dev/")
+    #assert os.path.exists(path + "/dev/unog")
+    #assert os.path.exists(path + "/dev/unesco")
+    #assert os.path.exists(path + "/dev/wipo")
+    #assert os.path.exists(path + "/dev/cern")
 
     self.orth_post_process = None
     if orth_post_process:
@@ -3357,17 +3357,17 @@ class CernEULibriUnescoUnogWipoCorpus_with_domain_tags_ip_and_op(CachedDataset2)
     self.prefix = prefix
 
     assert prefix.split("-")[0] in ["train", "dev", "demo", "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
-    assert os.path.exists(path + "/train/libri")
-    assert os.path.exists(path + "/train/wipo_train")
-    assert os.path.exists(path + "/train/eu_parl")
-    assert os.path.exists(path + "/train/cern")
-    assert os.path.exists(path + "/train/unog")
-    assert os.path.exists(path + "/train/unesco")
-    assert os.path.exists(path + "/dev/")
-    assert os.path.exists(path + "/dev/unog")
-    assert os.path.exists(path + "/dev/unesco")
-    assert os.path.exists(path + "/dev/wipo")
-    assert os.path.exists(path + "/dev/cern")
+    #assert os.path.exists(path + "/train/libri")
+    #assert os.path.exists(path + "/train/wipo_train")
+    #assert os.path.exists(path + "/train/eu_parl")
+    #assert os.path.exists(path + "/train/cern")
+    #assert os.path.exists(path + "/train/unog")
+    #assert os.path.exists(path + "/train/unesco")
+    #assert os.path.exists(path + "/dev/")
+    #assert os.path.exists(path + "/dev/unog")
+    #assert os.path.exists(path + "/dev/unesco")
+    #assert os.path.exists(path + "/dev/wipo")
+    #assert os.path.exists(path + "/dev/cern")
 
     self.orth_post_process = None
     if orth_post_process:
@@ -4998,10 +4998,10 @@ class LibriWipoEUCorpus(CachedDataset2):
     self._zip_files = None
 
     assert prefix.split("-")[0] in ["train", "dev", "test", "demo",  "dev_wipo", "dev_unesco", "dev_unog", "dev_cern", "test_wipo", "test_unesco", "test_unog", "test_cern"]
-    assert os.path.exists(path + "/train/libri")
-    assert os.path.exists(path + "/train/wipo_train")
-    assert os.path.exists(path + "/dev/") #wav_val
-    assert os.path.exists(path + "/train/eu_parl")
+    #assert os.path.exists(path + "/train/libri")
+    #assert os.path.exists(path + "/train/wipo_train")
+    #assert os.path.exists(path + "/dev/") #wav_val
+    #assert os.path.exists(path + "/train/eu_parl")
 
     #assert os.path.exists(path + "/train-clean-100" + (".zip" if use_zip else ""))
     self.orth_post_process = None
@@ -5326,8 +5326,8 @@ class CernCorpus(CachedDataset2):
     self._zip_files = None
 
     assert prefix.split("-")[0] in ["train", "dev", "test", "demo"]
-    assert os.path.exists(path + "/train/")
-    assert os.path.exists(path + "/dev/")
+    #assert os.path.exists(path + "/train/")
+    #assert os.path.exists(path + "/dev/")
 
     self.orth_post_process = None
     if orth_post_process:
