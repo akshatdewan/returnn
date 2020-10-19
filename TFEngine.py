@@ -2493,6 +2493,56 @@ class Engine(EngineBase):
       output_layer_beam_scores_t = output_layer.get_search_choices().beam_scores
     
     import socketserver
+    
+    class MyTCPHandler_test(socketserver.StreamRequestHandler):
+      """
+      The request handler class for our server.
+
+      It is instantiated once per connection to the server, and must
+      override the handle() method to implement communication to the
+      client.
+      """
+
+      def handle(self):
+        print("Streaming search server received connection from {}".format(self.client_address))
+        sample_rate=16000
+        #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
+        MSGLEN = self.server.msglen
+        output_filename_combined_legacy = '/data/s2t/streaming_output/op.txt'
+        output_filename_combined = '/data/smt/webroot/s2t/s2t_live/data/op.txt'
+        from time import gmtime, strftime
+        time_string = strftime("%Y-%m-%d--%H-%M-%S--%Z", gmtime())
+        output_filename_individual = '/data/s2t/streaming_output/'+str(self.client_address[0])+'--'+str(self.client_address[1]) + '--' + time_string + '.txt'
+        with open(output_filename_individual, 'w', encoding='utf-8') as op_ind_fh, open(output_filename_combined, 'a+', encoding='utf-8') as op_com_fh, open(output_filename_combined_legacy, 'a+', encoding='utf-8') as op_com_fh_legacy :
+            while True:
+              try:
+                audio_bytes = self.rfile.read(MSGLEN)
+                print("{} bytes read".format(MSGLEN))
+                print("{} bytes left".format(self.rfile))
+                import struct
+                import shlex, subprocess
+                ###################
+                import webrtcvad
+                import s_nos
+                aggressiveness=3
+                vad = webrtcvad.Vad(aggressiveness)
+
+                def pairwise(iterable):
+                    "s -> (s0, s1), (s2, s3), (s4, s5), ..."
+                    a = iter(iterable)
+                    return zip(a, a)
+                
+                samples=[]
+                for i,audio_byte in enumerate(audio_bytes[::2]):
+                    samples.append(int.from_bytes(audio_bytes[i:i+2],"big"))
+                print(samples)
+                is_speech =  vad.is_speech(audio_bytes, sample_rate)
+                print('2 ' if is_speech else '0 ')
+              except struct.error as err:
+                return
+              except:
+                raise
+                return
 
     class MyTCPHandler(socketserver.StreamRequestHandler):
       """
@@ -2506,45 +2556,21 @@ class Engine(EngineBase):
       def handle(self):
         print("Streaming search server received connection from {}".format(self.client_address))
         sample_rate=16000
-        #MSGLEN = 32000
         #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
         MSGLEN = self.server.msglen
-        #output_filename_combined = '/data/s2t/streaming_output/op.txt'
+        output_filename_combined_legacy = '/data/s2t/streaming_output/op.txt'
         output_filename_combined = '/data/smt/webroot/s2t/s2t_live/data/op.txt'
         from time import gmtime, strftime
+        import struct
+        import shlex, subprocess
         time_string = strftime("%Y-%m-%d--%H-%M-%S--%Z", gmtime())
-
         output_filename_individual = '/data/s2t/streaming_output/'+str(self.client_address[0])+'--'+str(self.client_address[1]) + '--' + time_string + '.txt'
-
-        with open(output_filename_individual, 'w', encoding='utf-8') as op_ind_fh, open(output_filename_combined, 'a+', encoding='utf-8') as op_com_fh:
+        with open(output_filename_individual, 'w', encoding='utf-8') as op_ind_fh, open(output_filename_combined, 'a+', encoding='utf-8') as op_com_fh, open(output_filename_combined_legacy, 'a+', encoding='utf-8') as op_com_fh_legacy :
             # self.rfile is a file-like object created by the handler;
             # we can now use e.g. readline() instead of raw recv() calls
             while True:
               try:
                 audio_bytes = self.rfile.read(MSGLEN)
-                #print("{} bytes read".format(MSGLEN))
-                #print("{} bytes left".format(self.rfile))
-                #time.sleep(1)
-                import struct
-                import shlex, subprocess
-                ###################
-                #import webrtcvad
-                #import s_nos
-                #aggressiveness=3
-                #vad = webrtcvad.Vad(aggressiveness)
-
-                #def pairwise(iterable):
-                #    "s -> (s0, s1), (s2, s3), (s4, s5), ..."
-                #    a = iter(iterable)
-                #    return zip(a, a)
-                
-                #samples=[]
-                #for i,audio_byte in enumerate(audio_bytes[::2]):
-                #    samples.append(int.from_bytes(audio_bytes[i:i+2],"big"))
-                #print(samples)
-                #is_speech =  vad.is_speech(audio_bytes, sample_rate)
-                #print('2 ' if is_speech else '0 ')
-
                 byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
                 audio = struct.unpack(byte_pattern, audio_bytes)
                 targets = numpy.array([], dtype="int32")  # empty...
@@ -2559,9 +2585,9 @@ class Engine(EngineBase):
                   "beam_scores": output_layer_beam_scores_t})
                 delta_time = time.time() - start_time
                 audio_len = float(len(audio)) / sample_rate
-                #print("Took %.3f secs for decoding." % delta_time, file=log.v4)
-                #if audio_len:
-                  #print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+                print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+                if audio_len:
+                  print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
                 output = output_d["output"]
                 seq_lens = output_d["seq_lens"]
                 beam_scores = output_d["beam_scores"]
@@ -2582,9 +2608,10 @@ class Engine(EngineBase):
                     first_best_txt_detokenized = p_2.communicate()[0]
                     op_ind_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
                     op_com_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                    #op_fh.write("{}\n".format(first_best_txt_detokenized))
+                    op_com_fh_legacy.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
                     op_ind_fh.flush()
                     op_com_fh.flush()
+                    op_com_fh_legacy.flush()
               except struct.error as err:
                 return
               except:
