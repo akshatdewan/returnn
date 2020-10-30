@@ -2508,22 +2508,26 @@ class Engine(EngineBase):
         sample_rate=16000
         #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
         MSGLEN = self.server.msglen
+        MSGLEN=960 #2 * 30 * 16000/1000 
         output_filename_combined_legacy = '/data/s2t/streaming_output/op.txt'
         output_filename_combined = '/data/smt/webroot/s2t/s2t_live/data/op.txt'
         from time import gmtime, strftime
         time_string = strftime("%Y-%m-%d--%H-%M-%S--%Z", gmtime())
         output_filename_individual = '/data/s2t/streaming_output/'+str(self.client_address[0])+'--'+str(self.client_address[1]) + '--' + time_string + '.txt'
         with open(output_filename_individual, 'w', encoding='utf-8') as op_ind_fh, open(output_filename_combined, 'a+', encoding='utf-8') as op_com_fh, open(output_filename_combined_legacy, 'a+', encoding='utf-8') as op_com_fh_legacy :
+            i=0
             while True:
               try:
+                #i+=1
+                #print(i)
                 audio_bytes = self.rfile.read(MSGLEN)
-                print("{} bytes read".format(MSGLEN))
-                print("{} bytes left".format(self.rfile))
+                #print("{} bytes read".format(MSGLEN))
+                #print("{} bytes left".format(self.rfile))
                 import struct
                 import shlex, subprocess
                 ###################
                 import webrtcvad
-                import s_nos
+                #import s_nos
                 aggressiveness=3
                 vad = webrtcvad.Vad(aggressiveness)
 
@@ -2533,9 +2537,9 @@ class Engine(EngineBase):
                     return zip(a, a)
                 
                 samples=[]
-                for i,audio_byte in enumerate(audio_bytes[::2]):
-                    samples.append(int.from_bytes(audio_bytes[i:i+2],"big"))
-                print(samples)
+                #for i,audio_byte in enumerate(audio_bytes[::2]):
+                #    samples.append(int.from_bytes(audio_bytes[i:i+2], byteorder="big", signed=False))
+                #print(samples)
                 is_speech =  vad.is_speech(audio_bytes, sample_rate)
                 print('2 ' if is_speech else '0 ')
               except struct.error as err:
@@ -2622,7 +2626,8 @@ class Engine(EngineBase):
 
     # Create the server, binding to localhost on specified port 
     print("Streaming search server running on port no.  {}".format(PORT))
-    server = socketserver.TCPServer((HOST, PORT), MyTCPHandler)
+    #server = socketserver.TCPServer((HOST, PORT), MyTCPHandler)
+    server = socketserver.TCPServer((HOST, PORT), MyTCPHandler_test)
     server.msglen=msglen
     print("MSGLEN is  {}".format(server.msglen))
     # Activate the server; this will keep running until you
