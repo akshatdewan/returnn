@@ -2494,10 +2494,35 @@ class Engine(EngineBase):
     
     import socketserver
     
+    class Frame(object):
+        """Represents a "frame" of audio data."""
+        def __init__(self, bytes, timestamp, duration):
+            self.bytes = bytes
+            self.timestamp = timestamp
+            self.duration = duration
+    
+    
+    def frame_generator(frame_duration_ms, audio, sample_rate):
+        """Generates audio frames from PCM audio data.
+    
+        Takes the desired frame duration in milliseconds, the PCM data, and
+        the sample rate.
+    
+        Yields Frames of the requested duration.
+        """
+        n = int(sample_rate * (frame_duration_ms / 1000.0) * 2)
+        offset = 0
+        timestamp = 0.0
+        duration = (float(n) / sample_rate) / 2.0
+        while offset + n < len(audio):
+            yield Frame(audio[offset:offset + n], timestamp, duration)
+            timestamp += duration
+            offset += n
+    
     class MyTCPHandler_test(socketserver.StreamRequestHandler):
       """
       The request handler class for our server.
-
+    
       It is instantiated once per connection to the server, and must
       override the handle() method to implement communication to the
       client.
@@ -2508,7 +2533,8 @@ class Engine(EngineBase):
         sample_rate=16000
         #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
         MSGLEN = self.server.msglen
-        MSGLEN=960 #2 * 30 * 16000/1000 
+        #MSGLEN=960 #2 * 30 * 16000/1000 
+        MSGLEN=320000 
         output_filename_combined_legacy = '/data/s2t/streaming_output/op.txt'
         output_filename_combined = '/data/smt/webroot/s2t/s2t_live/data/op.txt'
         from time import gmtime, strftime
@@ -2516,32 +2542,77 @@ class Engine(EngineBase):
         output_filename_individual = '/data/s2t/streaming_output/'+str(self.client_address[0])+'--'+str(self.client_address[1]) + '--' + time_string + '.txt'
         with open(output_filename_individual, 'w', encoding='utf-8') as op_ind_fh, open(output_filename_combined, 'a+', encoding='utf-8') as op_com_fh, open(output_filename_combined_legacy, 'a+', encoding='utf-8') as op_com_fh_legacy :
             i=0
+            import struct
+            import shlex, subprocess
+            ###################
+            import webrtcvad
+            import math
+            header = self.rfile.read(78)
             while True:
               try:
-                #i+=1
-                #print(i)
                 audio_bytes = self.rfile.read(MSGLEN)
-                #print("{} bytes read".format(MSGLEN))
-                #print("{} bytes left".format(self.rfile))
-                import struct
-                import shlex, subprocess
-                ###################
-                import webrtcvad
-                #import s_nos
+                frames = frame_generator(30, audio_bytes, sample_rate)
+                frames = list(frames)
                 aggressiveness=3
                 vad = webrtcvad.Vad(aggressiveness)
-
-                def pairwise(iterable):
-                    "s -> (s0, s1), (s2, s3), (s4, s5), ..."
-                    a = iter(iterable)
-                    return zip(a, a)
-                
-                samples=[]
-                #for i,audio_byte in enumerate(audio_bytes[::2]):
-                #    samples.append(int.from_bytes(audio_bytes[i:i+2], byteorder="big", signed=False))
-                #print(samples)
-                is_speech =  vad.is_speech(audio_bytes, sample_rate)
-                print('2 ' if is_speech else '0 ')
+                s_nos = []
+                for frame in frames:
+                    is_speech = vad.is_speech(frame.bytes, sample_rate)
+                    s_nos.append('2 ' if is_speech else '0 ')
+                s_nos_text = "livecap " + " ".join(s_nos)
+                try:
+                    command_line_2 = 'perl segmentation.pl --silence-proportion=0.4 --frame-shift=0.03 --max-segment-length 9.9 --hard-max-segment-length 10'
+                    args_2 = shlex.split(command_line_2)
+                    p_2 = subprocess.Popen(args_2, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                    segs_text = p_2.communicate((s_nos_text.encode("utf-8")))[0].decode("utf-8")
+                    segs = [(seg_text.split()[2], seg_text.split()[3]) for seg_text in segs_text.split('\n')[:-1]]
+                    #print(segs)
+                except IndexError:
+                    pass
+                #p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+                byte_pattern=str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
+                all_audio = struct.unpack(byte_pattern, audio_bytes)
+                for seg in segs:
+                    audio = all_audio[math.floor(float(seg[0]) * sample_rate): math.floor(float(seg[1]) * sample_rate)]
+                    targets = numpy.array([], dtype="int32")  # empty...
+                    features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
+                    dataset = StaticDataset(
+                      data=[{input_data.name: features, output_data.name: targets}], output_dim=num_outputs)
+                    dataset.init_seq_order(epoch=1)
+                    start_time = time.time()
+                    output_d = engine.run_single(dataset=dataset, seq_idx=0, output_dict={
+                      "output": output_t,
+                      "seq_lens": output_seq_lens_t,
+                      "beam_scores": output_layer_beam_scores_t})
+                    delta_time = time.time() - start_time
+                    audio_len = float(len(audio)) / sample_rate
+                    print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+                    if audio_len:
+                      print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+                    output = output_d["output"]
+                    seq_lens = output_d["seq_lens"]
+                    beam_scores = output_d["beam_scores"]
+                    assert len(output) == len(seq_lens) == (out_beam_size or 1)
+                    if out_beam_size:
+                      assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
+                    first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
+                    first_best_txt_debpe = first_best_txt.replace("@@ ","").replace("'", "\\'")
+                    if not first_best_txt_debpe[:-1] == "Thank you ":
+                        print("Best output: %s" % first_best_txt_debpe, file=log.v4)
+                        command_line_1 = 'echo ' + first_best_txt_debpe
+                        args_1 = shlex.split(command_line_1)
+                        p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
+                        command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
+                        args_2 = shlex.split(command_line_2)
+                        p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
+                        p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+                        first_best_txt_detokenized = p_2.communicate()[0]
+                        op_ind_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                        op_com_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                        op_com_fh_legacy.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                        op_ind_fh.flush()
+                        op_com_fh.flush()
+                        op_com_fh_legacy.flush()
               except struct.error as err:
                 return
               except:
@@ -2572,10 +2643,12 @@ class Engine(EngineBase):
         with open(output_filename_individual, 'w', encoding='utf-8') as op_ind_fh, open(output_filename_combined, 'a+', encoding='utf-8') as op_com_fh, open(output_filename_combined_legacy, 'a+', encoding='utf-8') as op_com_fh_legacy :
             # self.rfile is a file-like object created by the handler;
             # we can now use e.g. readline() instead of raw recv() calls
+            header = self.rfile.read(78)
             while True:
               try:
                 audio_bytes = self.rfile.read(MSGLEN)
-                byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
+                #byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
+                byte_pattern=str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
                 audio = struct.unpack(byte_pattern, audio_bytes)
                 targets = numpy.array([], dtype="int32")  # empty...
                 features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
