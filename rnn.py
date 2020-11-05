@@ -551,23 +551,35 @@ def execute_main_task():
   elif task == "server":
     print("Server Initiating", file=log.v1)
     server.run()
-  elif task == "search_server":
+  elif task == "streaming_search_server":
     engine.use_search_flag = True
     engine.init_network_from_config(config)
     import threading
     port = config.int("port", 12380)
     msglen = config.int("msglen", 32000)
     threads = []
-    t1 = threading.Thread(name='stream_server', target=engine.web_server_streaming_search, args=(port,msglen), daemon=True)
-    threads.append(t1)
-    t1.start()
-    #t2 = threading.Thread(name='batch_server', target=engine.web_server_batch_search, args=(12382,), daemon=True)
-    #threads.append(t2)
-    #t2.start()
-    t1.join()
-    #t2.join()
-    #engine.web_server_http(port=config.int("web_server_port", 12380))
-    #engine.web_server_batch_search(12382)
+    t = threading.Thread(name='stream_server', target=engine.web_server_streaming_search_tcp, args=(port,msglen), daemon=True)
+    threads.append(t)
+    t.start()
+    t.join()
+  elif task == "batch_search_server":
+    engine.use_search_flag = True
+    engine.init_network_from_config(config)
+    import threading
+    port = config.int("port", 12380)
+    msglen = config.int("msglen", 32000)
+    threads = []
+    t = threading.Thread(name='batch_server', target=engine.web_server_batch_search_http, args=(12382,), daemon=True)
+    threads.append(t)
+    t.start()
+    t.join()
+  elif task == "search_server":
+    engine.use_search_flag = True
+    engine.init_network_from_config(config)
+    import threading
+    port = config.int("port", 12380)
+    msglen = config.int("msglen", 32000)
+    engine.web_server_single_search_http(port=config.int("web_server_port", 12380))
   elif task.startswith("config:"):
     action = config.typed_dict[task[len("config:"):]]
     print("Task: %r" % action, file=log.v1)

@@ -2434,7 +2434,7 @@ class Engine(EngineBase):
       numpy.savetxt(f, log_average_posterior, delimiter=' ')
     print("Saved prior in %r in +log space." % output_file, file=log.v1)
   
-  def web_server_streaming_search(self, port, msglen):
+  def web_server_streaming_search_tcp(self, port, msglen):
     """
     Starts a socket server 
     (or search if the flag is set).
@@ -2548,12 +2548,15 @@ class Engine(EngineBase):
             import webrtcvad
             import math
             header = self.rfile.read(78)
+            prev_audio = []
             while True:
               try:
                 audio_bytes = self.rfile.read(MSGLEN)
                 frames = frame_generator(30, audio_bytes, sample_rate)
                 frames = list(frames)
                 aggressiveness=3
+                max_segment_length = 9.9
+                hard_max_segment_length = 10
                 vad = webrtcvad.Vad(aggressiveness)
                 s_nos = []
                 for frame in frames:
@@ -2561,19 +2564,26 @@ class Engine(EngineBase):
                     s_nos.append('2 ' if is_speech else '0 ')
                 s_nos_text = "livecap " + " ".join(s_nos)
                 try:
-                    command_line_2 = 'perl segmentation.pl --silence-proportion=0.4 --frame-shift=0.03 --max-segment-length 9.9 --hard-max-segment-length 10'
-                    args_2 = shlex.split(command_line_2)
-                    p_2 = subprocess.Popen(args_2, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                    segs_text = p_2.communicate((s_nos_text.encode("utf-8")))[0].decode("utf-8")
+                    command_line = 'perl segmentation.pl --silence-proportion=0.4 --frame-shift=0.03 --max-segment-length {} --hard-max-segment-length {}'.format(max_segment_length, hard_max_segment_length)
+                    args = shlex.split(command_line)
+                    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                    segs_text = p.communicate((s_nos_text.encode("utf-8")))[0].decode("utf-8")
                     segs = [(seg_text.split()[2], seg_text.split()[3]) for seg_text in segs_text.split('\n')[:-1]]
-                    #print(segs)
                 except IndexError:
                     pass
-                #p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
                 byte_pattern=str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
                 all_audio = struct.unpack(byte_pattern, audio_bytes)
-                for seg in segs:
+
+                if (len(segs) > 1) and (float(segs[-1][-1]) > max_segment_length):
+                    segs_updated = list(segs[:-1])
+                    next_audio = all_audio[math.floor(float(segs[-1][0]) * sample_rate): math.floor(float(segs[-1][1]) * sample_rate)]
+                else:
+                    segs_updated = list(segs)
+                    next_audio = []
+                for i,seg in enumerate(segs_updated):
                     audio = all_audio[math.floor(float(seg[0]) * sample_rate): math.floor(float(seg[1]) * sample_rate)]
+                    if i == 0:
+                        audio = tuple(list(prev_audio) + list(audio))
                     targets = numpy.array([], dtype="int32")  # empty...
                     features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
                     dataset = StaticDataset(
@@ -2586,9 +2596,9 @@ class Engine(EngineBase):
                       "beam_scores": output_layer_beam_scores_t})
                     delta_time = time.time() - start_time
                     audio_len = float(len(audio)) / sample_rate
-                    print("Took %.3f secs for decoding." % delta_time, file=log.v4)
-                    if audio_len:
-                      print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
+                    #print("Took %.3f secs for decoding." % delta_time, file=log.v4)
+                    #if audio_len:
+                      #print("Real-time-factor: %.3f" % (delta_time / audio_len), file=log.v4)
                     output = output_d["output"]
                     seq_lens = output_d["seq_lens"]
                     beam_scores = output_d["beam_scores"]
@@ -2613,6 +2623,7 @@ class Engine(EngineBase):
                         op_ind_fh.flush()
                         op_com_fh.flush()
                         op_com_fh_legacy.flush()
+                prev_audio = next_audio
               except struct.error as err:
                 return
               except:
@@ -2647,8 +2658,7 @@ class Engine(EngineBase):
             while True:
               try:
                 audio_bytes = self.rfile.read(MSGLEN)
-                #byte_pattern="!"+str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
-                byte_pattern=str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding
+                byte_pattern=str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding. Add a prefiix "!" to accept BE
                 audio = struct.unpack(byte_pattern, audio_bytes)
                 targets = numpy.array([], dtype="int32")  # empty...
                 features = input_audio_feature_extractor.get_audio_features(audio=audio, sample_rate=sample_rate)
@@ -2708,7 +2718,7 @@ class Engine(EngineBase):
     server.serve_forever()
 
 
-  def web_server_batch_search(self, port):
+  def web_server_batch_search_http(self, port):
     """
     Starts a web-server with a simple API to run search() on a given dataset
 
@@ -2797,7 +2807,7 @@ class Engine(EngineBase):
     self.httpd = HTTPServer(server_address, Handler)
     self.httpd.serve_forever()
 
-  def web_server_http(self, port):
+  def web_server_single_search_http(self, port):
     """
     Starts a web-server with a simple API to forward data through the network
     (or search if the flag is set).
