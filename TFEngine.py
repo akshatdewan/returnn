@@ -2519,7 +2519,7 @@ class Engine(EngineBase):
             timestamp += duration
             offset += n
     
-    class MyTCPHandler_test(socketserver.StreamRequestHandler):
+    class MyTCPHandler_soft(socketserver.StreamRequestHandler):
       """
       The request handler class for our server.
     
@@ -2630,7 +2630,7 @@ class Engine(EngineBase):
                 raise
                 return
 
-    class MyTCPHandler(socketserver.StreamRequestHandler):
+    class MyTCPHandler_hard(socketserver.StreamRequestHandler):
       """
       The request handler class for our server.
 
@@ -2638,6 +2638,20 @@ class Engine(EngineBase):
       override the handle() method to implement communication to the
       client.
       """
+      def handle_test(self):
+        sample_rate=16000
+        print("Streaming search server received connection from {}".format(self.client_address))
+        MSGLEN = self.server.msglen
+        with open('received.audio','wb') as f:
+          while True:
+            try:
+              audio_bytes = self.rfile.read(MSGLEN)
+              f.write(audio_bytes)
+            except struct.error as err:
+              return
+            except:
+              raise
+              return
 
       def handle(self):
         print("Streaming search server received connection from {}".format(self.client_address))
@@ -2709,8 +2723,8 @@ class Engine(EngineBase):
 
     # Create the server, binding to localhost on specified port 
     print("Streaming search server running on port no.  {}".format(PORT))
-    #server = socketserver.TCPServer((HOST, PORT), MyTCPHandler)
-    server = socketserver.TCPServer((HOST, PORT), MyTCPHandler_test)
+    #server = socketserver.TCPServer((HOST, PORT), MyTCPHandler_hard)
+    server = socketserver.TCPServer((HOST, PORT), MyTCPHandler_soft)
     server.msglen=msglen
     print("MSGLEN is  {}".format(server.msglen))
     # Activate the server; this will keep running until you
