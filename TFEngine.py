@@ -2607,22 +2607,21 @@ class Engine(EngineBase):
                       assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
                     first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
                     first_best_txt_debpe = first_best_txt.replace("@@ ","").replace("'", "\\'")
-                    if not first_best_txt_debpe[:-1] == "Thank you ":
-                        print("Best output: %s" % first_best_txt_debpe, file=log.v4)
-                        command_line_1 = 'echo ' + first_best_txt_debpe
-                        args_1 = shlex.split(command_line_1)
-                        p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
-                        command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
-                        args_2 = shlex.split(command_line_2)
-                        p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
-                        p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
-                        first_best_txt_detokenized = p_2.communicate()[0]
-                        op_ind_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                        op_com_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                        op_com_fh_legacy.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                        op_ind_fh.flush()
-                        op_com_fh.flush()
-                        op_com_fh_legacy.flush()
+                    print("Best output: %s" % first_best_txt_debpe, file=log.v4)
+                    command_line_1 = 'echo ' + first_best_txt_debpe
+                    args_1 = shlex.split(command_line_1)
+                    p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
+                    command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
+                    args_2 = shlex.split(command_line_2)
+                    p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
+                    p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+                    first_best_txt_detokenized = p_2.communicate()[0]
+                    op_ind_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                    op_com_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                    op_com_fh_legacy.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                    op_ind_fh.flush()
+                    op_com_fh.flush()
+                    op_com_fh_legacy.flush()
                 prev_audio = next_audio
               except struct.error as err:
                 return
@@ -2642,7 +2641,7 @@ class Engine(EngineBase):
         sample_rate=16000
         print("Streaming search server received connection from {}".format(self.client_address))
         MSGLEN = self.server.msglen
-        with open('received.audio','wb') as f:
+        with open('received.audio{}'.format(self.client_address[1]),'wb') as f:
           while True:
             try:
               audio_bytes = self.rfile.read(MSGLEN)
@@ -2658,6 +2657,7 @@ class Engine(EngineBase):
         sample_rate=16000
         #MSGLEN is the length of message in bytes (pcm_s16le) means 1 sample is 2 bytes
         MSGLEN = self.server.msglen
+        #MSGLEN=960 #2 * 30 * 16000/1000 
         output_filename_combined_legacy = '/data/s2t/streaming_output/op.txt'
         output_filename_combined = '/data/smt/webroot/s2t/s2t_live/data/op.txt'
         from time import gmtime, strftime
@@ -2671,6 +2671,7 @@ class Engine(EngineBase):
             header = self.rfile.read(78)
             while True:
               try:
+                out_start_time = time.time()
                 audio_bytes = self.rfile.read(MSGLEN)
                 byte_pattern=str(int(int(MSGLEN)/2))+"h" #content_length bytes with pcm_s16le encoding. Add a prefiix "!" to accept BE
                 audio = struct.unpack(byte_pattern, audio_bytes)
@@ -2697,22 +2698,23 @@ class Engine(EngineBase):
                   assert beam_scores.shape == (1, out_beam_size)  # (batch, beam)
                 first_best_txt = output_vocab.get_seq_labels(output[0][:seq_lens[0]])
                 first_best_txt_debpe = first_best_txt.replace("@@ ","").replace("'", "\\'")
-                if not first_best_txt_debpe[:-1] == "Thank you ":
-                    print("Best output: %s" % first_best_txt_debpe, file=log.v4)
-                    command_line_1 = 'echo ' + first_best_txt_debpe
-                    args_1 = shlex.split(command_line_1)
-                    p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
-                    command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
-                    args_2 = shlex.split(command_line_2)
-                    p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
-                    p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
-                    first_best_txt_detokenized = p_2.communicate()[0]
-                    op_ind_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                    op_com_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                    op_com_fh_legacy.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
-                    op_ind_fh.flush()
-                    op_com_fh.flush()
-                    op_com_fh_legacy.flush()
+                print("Best output: %s" % first_best_txt_debpe, file=log.v4)
+                command_line_1 = 'echo ' + first_best_txt_debpe
+                args_1 = shlex.split(command_line_1)
+                p_1 = subprocess.Popen(args_1, stdout=subprocess.PIPE)
+                command_line_2 = '/data/smt/bin/Detokenizer.sh en_c '
+                args_2 = shlex.split(command_line_2)
+                p_2 = subprocess.Popen(args_2, stdin=p_1.stdout, stdout=subprocess.PIPE)
+                p_1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+                first_best_txt_detokenized = p_2.communicate()[0]
+                op_ind_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                op_com_fh.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                op_com_fh_legacy.write("{}".format(first_best_txt_detokenized.decode("utf-8")))
+                op_ind_fh.flush()
+                op_com_fh.flush()
+                op_com_fh_legacy.flush()
+                out_delta_time = time.time() - out_start_time
+                print("Time to process one segment of length {} is {}".format(audio_len, out_delta_time), file=log.v4)
               except struct.error as err:
                 return
               except:
@@ -2723,8 +2725,8 @@ class Engine(EngineBase):
 
     # Create the server, binding to localhost on specified port 
     print("Streaming search server running on port no.  {}".format(PORT))
-    #server = socketserver.TCPServer((HOST, PORT), MyTCPHandler_hard)
-    server = socketserver.TCPServer((HOST, PORT), MyTCPHandler_soft)
+    server = socketserver.ThreadingTCPServer((HOST, PORT), MyTCPHandler_hard)
+    #server = socketserver.ThreadingTCPServer((HOST, PORT), MyTCPHandler_soft)
     server.msglen=msglen
     print("MSGLEN is  {}".format(server.msglen))
     # Activate the server; this will keep running until you
