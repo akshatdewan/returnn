@@ -2104,7 +2104,9 @@ class Engine(EngineBase):
       max_seqs=self.config.int('max_seqs', -1),
       max_seq_length=max_seq_length,
       used_data_keys=self.network.get_used_data_keys())
-
+    ##### TODO
+    output_layer_names = ["decision", "ctc"]
+    ##### TODO
     output_is_dict = isinstance(output_layer_names, list)
     if not output_is_dict:
       output_layer_names = [output_layer_names]
@@ -2145,6 +2147,41 @@ class Engine(EngineBase):
     if not log.verbose[4]:
       print("Set log_verbosity to level 4 or higher to see seq info on stdout.", file=log.v2)
 
+    def extra_fetches_callback_test(seq_idx, seq_tag, **kwargs):
+      """
+      :param list[int] seq_idx: of length batch (without beam)
+      :param list[str] seq_tag: of length batch (without beam)
+
+      In addition, for each output layer, we expect the following parameters in kwargs:
+        list[numpy.ndarray] output_<layer name>
+        list[numpy.ndarray] beam_scores_<layer name>
+        list[numpy.ndarray] target_<target key>
+      """
+      from ctc_segmentation import ctc_segmentation
+      from ctc_segmentation import CtcSegmentationParameters
+      from ctc_segmentation import determine_utterance_segments
+      from ctc_segmentation import prepare_text
+      config = CtcSegmentationParameters()
+
+      print("kwargs : {}".format(kwargs.keys()))
+      outputs, beam_scores, targets = [], [], []
+      # noinspection PyShadowingNames
+      for target_idx in range(num_targets):
+        outputs.append(kwargs["output_" + output_layer_names[target_idx]])
+        beam_scores.append(kwargs["beam_scores_" + output_layer_names[target_idx]])
+        targets.append(kwargs["target_" + target_keys[target_idx]])
+      
+      print("len outputs: {}".format(len(outputs)))
+      print("outputs: {}".format(outputs[0][0].shape))
+      n_batch = len(seq_idx)  # without beam
+      assert n_batch == len(seq_tag)
+      for output in outputs[0]:
+          lpz = output
+          pass
+          timings, char_probs, state_list = ctc_segmentation(
+            config, lpz, ground_truth_mat
+          )
+
     def extra_fetches_callback(seq_idx, seq_tag, **kwargs):
       """
       :param list[int] seq_idx: of length batch (without beam)
@@ -2155,14 +2192,17 @@ class Engine(EngineBase):
         list[numpy.ndarray] beam_scores_<layer name>
         list[numpy.ndarray] target_<target key>
       """
-
+      print("kwargs : {}".format(kwargs.keys()))
       outputs, beam_scores, targets = [], [], []
       # noinspection PyShadowingNames
       for target_idx in range(num_targets):
         outputs.append(kwargs["output_" + output_layer_names[target_idx]])
         beam_scores.append(kwargs["beam_scores_" + output_layer_names[target_idx]])
         targets.append(kwargs["target_" + target_keys[target_idx]])
-
+      
+      print("len outputs: {}".format(len(outputs)))
+      print("len outputs[0]: {}".format(len(outputs[0])))
+      print("outputs: {}".format(outputs[0][0].shape))
       n_batch = len(seq_idx)  # without beam
       assert n_batch == len(seq_tag)
 
@@ -2191,6 +2231,7 @@ class Engine(EngineBase):
         # noinspection PyShadowingNames
         for target_idx in range(num_targets):
           if out_beam_sizes[target_idx] is None:
+            print("batch_idx : {}, out_beam_sizes : {}, out_beam_sizes {}".format(batch_idx,out_beam_sizes[target_idx],out_beam_sizes[target_idx]))
             print("seq_idx: %i, seq_tag: %r, output %r: %r" % (
               seq_idx[batch_idx], seq_tag[batch_idx], target_keys[target_idx], outputs[target_idx][batch_idx]),
                   file=log.v4)
