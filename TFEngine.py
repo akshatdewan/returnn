@@ -2105,7 +2105,7 @@ class Engine(EngineBase):
       max_seq_length=max_seq_length,
       used_data_keys=self.network.get_used_data_keys())
     ##### TODO
-    output_layer_names = ["decision", "ctc"]
+    #output_layer_names = ["decision", "ctc"]
     ##### TODO
     output_is_dict = isinstance(output_layer_names, list)
     if not output_is_dict:
