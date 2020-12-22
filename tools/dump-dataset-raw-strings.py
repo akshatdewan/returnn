@@ -111,7 +111,7 @@ def generic_open(filename, mode="r"):
     if "b" not in mode:
       mode += "t"
     return gzip.open(filename, mode)
-  return open(filename, mode)
+  return open(filename, mode, encoding='utf-8')
 
 
 def main(argv):
@@ -137,7 +137,7 @@ def main(argv):
   dataset.init_seq_order(epoch=1)
 
   try:
-    with generic_open(args.out, "w",encoding='utf-8') as output_file:
+    with generic_open(args.out, "w") as output_file:
       refs = get_raw_strings(dataset=dataset, options=args)
       output_file.write("{\n")
       for seq_tag, ref in refs:
